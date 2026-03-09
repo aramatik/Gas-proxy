@@ -1,5 +1,5 @@
-# Используем легковесный образ Node.js
-FROM node:18-alpine
+# Используем Node.js 20 вместо 18
+FROM node:20-alpine
 
 # Создаем директорию приложения
 WORKDIR /usr/src/app
@@ -16,4 +16,3 @@ EXPOSE 8080
 
 # Команда для запуска
 CMD [ "npm", "start" ]
-  
