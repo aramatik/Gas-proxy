@@ -10,8 +10,9 @@ const crypto = require('crypto');
 const app = express();
 app.use(compression());
 
-const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100 МБ
-const CHUNK_SIZE = 34 * 1024 * 1024;    // 34 МБ
+// Лимиты: максимум 100 МБ на скачивание, части по 34 МБ для GAS
+const MAX_FILE_SIZE = 100 * 1024 * 1024;
+const CHUNK_SIZE = 34 * 1024 * 1024;
 const TMP_DIR = '/tmp';
 
 app.get('/', async (req, res) => {
@@ -30,7 +31,7 @@ app.get('/', async (req, res) => {
         const filePath = path.join(TMP_DIR, `${partId}.bin`);
         if (!fs.existsSync(filePath)) {
             res.set('Content-Type', 'text/html; charset=utf-8');
-            return res.status(404).send("<meta charset='utf-8'><h3>⏳ Ошибка: Кэш файла истек.</h3><p>Начните скачивание заново.</p>");
+            return res.status(404).send("<meta charset='utf-8'><h3>⏳ Ошибка: Кэш файла истек.</h3><p>Файл был удален с серверов Northflank. Начните скачивание заново.</p>");
         }
         
         const stats = fs.statSync(filePath);
@@ -61,7 +62,7 @@ app.get('/', async (req, res) => {
             validateStatus: () => true 
         });
         
-        // Перехват защиты
+        // Перехват защиты (Cloudflare, Qrator и т.д.)
         if ([401, 403, 406, 429, 503].includes(response.status)) {
             res.set('Content-Type', 'text/html; charset=utf-8');
             return res.status(200).send(`
@@ -70,7 +71,7 @@ app.get('/', async (req, res) => {
                 <div style="background:white; padding:30px; border-top:5px solid #dc3545; border-radius:10px; box-shadow:0 4px 10px rgba(0,0,0,0.1); text-align:center;">
                     <h2 style="color:#dc3545; margin-top:0;">🚫 Доступ заблокирован</h2>
                     <p>Сайт <b>${parsedTarget.hostname}</b> отклонил автоматический запрос (Код: ${response.status}).</p>
-                    <p style="font-size:13px; color:#666;">Сработала защита от ботов, требующая реального браузера.</p>
+                    <p style="font-size:13px; color:#666;">Сработала защита от ботов, требующая прохождения проверки в реальном браузере.</p>
                 </div>
             </body></html>`);
         }
@@ -96,6 +97,7 @@ app.get('/', async (req, res) => {
             const $ = cheerio.load(html);
             const baseUrl = parsedTarget.origin;
 
+            // Инлайним CSS
             const stylesheets = $('link[rel="stylesheet"]').toArray();
             for (let i = 0; i < Math.min(stylesheets.length, 5); i++) {
                 let href = $(stylesheets[i]).attr('href');
@@ -108,6 +110,7 @@ app.get('/', async (req, res) => {
                 }
             }
 
+            // Инлайним картинки
             const images = $('img').toArray();
             for (let i = 0; i < Math.min(images.length, 10); i++) {
                 let src = $(images[i]).attr('src');
@@ -161,9 +164,12 @@ app.get('/', async (req, res) => {
                     <div style="background:white; padding:30px; border-top:5px solid #ff9800; border-radius:10px; text-align:center;">
                         <h2>🐘 Файл слишком большой</h2>
                         <p>Установлен жесткий лимит на скачивание: <b>100 МБ</b>.</p>
+                        <p style="color:#666;">Это необходимо для защиты серверов от перегрузки.</p>
                     </div>
                 </body></html>`);
             }
+
+            console.log(`[SUCCESS] Файл скачан на NF. Размер: ${(downloadedBytes/1024/1024).toFixed(2)} МБ`);
 
             let fileName = 'download.bin';
             const cd = response.headers['content-disposition'];
@@ -173,11 +179,13 @@ app.get('/', async (req, res) => {
                 fileName = path.basename(parsedTarget.pathname) || 'download.bin';
             }
 
+            // Если файл МЕНЬШЕ 34 МБ -> отдаем целиком в GAS
             if (downloadedBytes <= CHUNK_SIZE) {
                 res.set('Content-Type', contentType);
                 res.set('Content-Disposition', `attachment; filename="${fileName}"`);
                 return fs.createReadStream(filePath).pipe(res);
             } 
+            // Если файл БОЛЬШЕ 34 МБ -> генерируем интерфейс с кнопками
             else {
                 const partsCount = Math.ceil(downloadedBytes / CHUNK_SIZE);
                 let buttonsHtml = '';
@@ -189,12 +197,11 @@ app.get('/', async (req, res) => {
                     
                     const partSize = (i === partsCount - 1) ? (downloadedBytes - (i * CHUNK_SIZE)) : CHUNK_SIZE;
                     buttonsHtml += `
-                        <a href="${parsedTarget.toString()}" style="display:block; margin-bottom:10px; padding:12px; background:#1a73e8; color:white; text-decoration:none; border-radius:5px; font-weight:bold;">
+                        <a href="${parsedTarget.toString()}" target="_blank" style="display:block; margin-bottom:10px; padding:12px; background:#1a73e8; color:white; text-decoration:none; border-radius:5px; font-weight:bold;">
                             📥 Скачать часть ${i + 1} <span style="font-weight:normal; font-size:12px; opacity:0.8;">(${(partSize/1024/1024).toFixed(1)} МБ)</span>
                         </a>`;
                 }
 
-                // Указываем кодировку UTF-8 чтобы русский текст отображался правильно
                 res.set('Content-Type', 'text/html; charset=utf-8');
                 return res.status(200).send(`
                 <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
@@ -202,7 +209,7 @@ app.get('/', async (req, res) => {
                     <div style="background:white; padding:25px; border-top:5px solid #1a73e8; border-radius:10px; text-align:center; width:100%; max-width:400px; box-shadow:0 4px 10px rgba(0,0,0,0.1); margin-top:20px;">
                         <h2 style="margin-top:0;">📦 Объемный архив</h2>
                         <p style="font-size:14px; color:#333;">Файл <b>${fileName}</b> весит ${(downloadedBytes/1024/1024).toFixed(1)} МБ. Лимиты Google не позволяют передать его целиком.</p>
-                        <p style="font-size:12px; color:#666; margin-bottom:20px;">Мы разделили его на ${partsCount} части. Скачайте их по очереди, а затем распакуйте архиватором (7-Zip, WinRAR).</p>
+                        <p style="font-size:12px; color:#666; margin-bottom:20px;">Мы разделили его на ${partsCount} части. Скачайте их по очереди, не закрывая эту вкладку. Затем объедините части архиватором.</p>
                         ${buttonsHtml}
                     </div>
                 </body></html>`);
@@ -219,4 +226,4 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
     console.log(`Proxy server running on port ${PORT}`);
 });
-                 
+        
