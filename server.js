@@ -13,9 +13,9 @@ const execPromise = util.promisify(exec);
 const app = express();
 app.use(compression());
 
-// Лимиты: максимум 100 МБ на скачивание, части по 34 МБ
-const MAX_FILE_SIZE = 100 * 1024 * 1024;
-const CHUNK_SIZE_MB = 34; 
+// Лимиты: максимум 130 МБ на скачивание, части по 15 МБ для стабильности GAS
+const MAX_FILE_SIZE = 130 * 1024 * 1024;
+const CHUNK_SIZE_MB = 15; 
 const TMP_DIR = '/tmp';
 
 app.get('/', async (req, res) => {
@@ -30,7 +30,6 @@ app.get('/', async (req, res) => {
     const nfPartName = parsedTarget.searchParams.get('nf_partName');
 
     if (nfFileId && nfPartName) {
-        // Проверка безопасности пути
         if (nfPartName.includes('/') || nfPartName.includes('\\') || nfFileId.includes('/')) {
             return res.status(400).send("Недопустимый путь к файлу.");
         }
@@ -66,7 +65,6 @@ app.get('/', async (req, res) => {
             validateStatus: () => true 
         });
         
-        // Перехват защиты Cloudflare/Qrator
         if ([401, 403, 406, 429, 503].includes(response.status)) {
             res.set('Content-Type', 'text/html; charset=utf-8');
             return res.status(200).send(`
@@ -136,12 +134,10 @@ app.get('/', async (req, res) => {
         else {
             console.log(`[INFO] Обнаружен файл (${contentType}). Стримим на диск NF...`);
             
-            // Создаем уникальную папку для этого скачивания
             const fileId = crypto.randomUUID();
             const fileDir = path.join(TMP_DIR, fileId);
             fs.mkdirSync(fileDir, { recursive: true });
 
-            // Парсим имя файла
             let fileName = 'download.bin';
             const cd = response.headers['content-disposition'];
             if (cd && cd.includes('filename=')) {
@@ -150,7 +146,6 @@ app.get('/', async (req, res) => {
                 fileName = path.basename(parsedTarget.pathname) || 'download.bin';
             }
             
-            // Очищаем имя файла от опасных символов (важно для консольной команды zip)
             let safeName = fileName.replace(/[^a-zA-Z0-9.\-_]/g, '_');
             if (!safeName) safeName = "app.bin";
 
@@ -160,7 +155,6 @@ app.get('/', async (req, res) => {
             let downloadedBytes = 0;
             let isTooLarge = false;
 
-            // Качаем файл
             await new Promise((resolve, reject) => {
                 response.data.pipe(writer);
                 response.data.on('data', (chunk) => {
@@ -176,7 +170,6 @@ app.get('/', async (req, res) => {
                 writer.on('error', reject);
             }).catch(err => { if (err.message !== "FILE_TOO_LARGE") throw err; });
 
-            // Удаляем папку и выдаем ошибку, если больше 100 МБ
             if (isTooLarge) {
                 fs.rmSync(fileDir, { recursive: true, force: true });
                 res.set('Content-Type', 'text/html; charset=utf-8');
@@ -184,14 +177,13 @@ app.get('/', async (req, res) => {
                 <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
                 <body style="background:#f0f2f5; display:flex; justify-content:center; align-items:center; min-height:80vh; margin:0; font-family:sans-serif;">
                     <div style="background:white; padding:30px; border-top:5px solid #ff9800; border-radius:10px; text-align:center;">
-                        <h2>🐘 Файл слишком большой</h2><p>Установлен жесткий лимит на скачивание: <b>100 МБ</b>.</p>
+                        <h2>🐘 Файл слишком большой</h2><p>Установлен жесткий лимит на скачивание: <b>130 МБ</b>.</p>
                     </div>
                 </body></html>`);
             }
 
             console.log(`[SUCCESS] Файл ${safeName} скачан. Размер: ${(downloadedBytes/1024/1024).toFixed(2)} МБ`);
 
-            // Таймер: удаляем папку с кэшем через 2 часа, чтобы не забить диск Northflank
             setTimeout(() => {
                 try {
                     fs.rmSync(fileDir, { recursive: true, force: true });
@@ -199,20 +191,17 @@ app.get('/', async (req, res) => {
                 } catch(e) {}
             }, 2 * 60 * 60 * 1000);
 
-            // Если файл МЕНЬШЕ лимита -> отдаем целиком
             if (downloadedBytes <= CHUNK_SIZE_MB * 1024 * 1024) {
                 res.set('Content-Type', contentType);
-                res.set('Content-Disposition', `attachment; filename="${fileName}"`); // Отдаем с оригинальным именем
+                res.set('Content-Disposition', `attachment; filename="${fileName}"`);
                 return fs.createReadStream(filePath).pipe(res);
             } 
             
-            // Если файл БОЛЬШЕ лимита -> АРХИВИРУЕМ
             else {
                 console.log(`[INFO] Запускаем системный zip для создания многотомного архива...`);
                 const zipBaseName = safeName + '.zip';
                 
                 try {
-                    // Команда: перейти в папку и создать архив с разбиением (например, app.apk.z01, app.apk.zip)
                     await execPromise(`cd "${fileDir}" && zip -s ${CHUNK_SIZE_MB}m "${zipBaseName}" "${safeName}"`);
                     console.log(`[SUCCESS] Архив успешно создан!`);
                 } catch (zipErr) {
@@ -220,14 +209,12 @@ app.get('/', async (req, res) => {
                     return res.status(500).send("Внутренняя ошибка сервера при создании архива.");
                 }
 
-                // Удаляем исходный большой файл, оставляем только части архива
                 fs.unlinkSync(filePath);
 
-                // Получаем список созданных файлов (.z01, .z02, ... .zip)
                 const filesInDir = fs.readdirSync(fileDir);
                 const archiveParts = filesInDir
                     .filter(f => f.startsWith(safeName + '.'))
-                    .sort(); // .z01, .z02... и .zip встанет в конец, так как 'z' > 'z0'
+                    .sort(); 
 
                 let buttonsHtml = '';
                 archiveParts.forEach((partName) => {
@@ -269,3 +256,4 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
     console.log(`Proxy server running on port ${PORT}`);
 });
+                            
