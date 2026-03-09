@@ -10,22 +10,18 @@ const crypto = require('crypto');
 const app = express();
 app.use(compression());
 
-// Константы для загрузки
 const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100 МБ
-const CHUNK_SIZE = 34 * 1024 * 1024;    // 34 МБ (чтобы Base64 в GAS точно влез в 50 МБ)
-const TMP_DIR = '/tmp';                 // Временная папка Linux контейнера
+const CHUNK_SIZE = 34 * 1024 * 1024;    // 34 МБ
+const TMP_DIR = '/tmp';
 
 app.get('/', async (req, res) => {
     const targetUrl = req.query.url;
-    if (!targetUrl) {
-        return res.status(400).send('Укажите URL: ?url=https://example.com');
-    }
+    if (!targetUrl) return res.status(400).send('Укажите URL: ?url=https://example.com');
 
     console.log(`\n[${new Date().toISOString()}] [START] Запрос URL: ${targetUrl}`);
     const parsedTarget = new URL.URL(targetUrl);
 
     // --- БЛОК 1: ОТДАЧА ГОТОВЫХ ЧАСТЕЙ (CHUNKS) ---
-    // Если в URL есть наши секретные параметры, значит юзер кликнул по кнопке "Скачать часть X"
     const partId = parsedTarget.searchParams.get('nf_partId');
     const partIndex = parseInt(parsedTarget.searchParams.get('nf_partIndex'));
     const nfFileName = parsedTarget.searchParams.get('nf_filename') || 'download.bin';
@@ -33,7 +29,8 @@ app.get('/', async (req, res) => {
     if (partId) {
         const filePath = path.join(TMP_DIR, `${partId}.bin`);
         if (!fs.existsSync(filePath)) {
-            return res.status(404).send("<h3>⏳ Ошибка: Кэш файла истек.</h3><p>Файл был удален с серверов Northflank. Начните скачивание заново.</p>");
+            res.set('Content-Type', 'text/html; charset=utf-8');
+            return res.status(404).send("<meta charset='utf-8'><h3>⏳ Ошибка: Кэш файла истек.</h3><p>Начните скачивание заново.</p>");
         }
         
         const stats = fs.statSync(filePath);
@@ -46,15 +43,12 @@ app.get('/', async (req, res) => {
         res.set('Content-Disposition', `attachment; filename="${nfFileName}.part${partIndex + 1}"`);
         res.set('Content-Length', endBytes - startBytes + 1);
         
-        const readStream = fs.createReadStream(filePath, { start: startBytes, end: endBytes });
-        return readStream.pipe(res);
+        return fs.createReadStream(filePath, { start: startBytes, end: endBytes }).pipe(res);
     }
 
     // --- БЛОК 2: ОБРАБОТКА НОВОГО ЗАПРОСА ---
     try {
         console.log(`[INFO] Стучимся на целевой сайт...`);
-        
-        // ВНИМАНИЕ: Используем stream, чтобы не забить оперативную память Northflank!
         const response = await axios.get(targetUrl, { 
             responseType: 'stream',
             headers: { 
@@ -67,17 +61,15 @@ app.get('/', async (req, res) => {
             validateStatus: () => true 
         });
         
-        console.log(`[INFO] Статус код: ${response.status}`);
-
-        // Перехват защиты (Cloudflare и т.д.)
+        // Перехват защиты
         if ([401, 403, 406, 429, 503].includes(response.status)) {
-            const host = parsedTarget.hostname;
+            res.set('Content-Type', 'text/html; charset=utf-8');
             return res.status(200).send(`
-            <!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
+            <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
             <body style="background:#f0f2f5; display:flex; justify-content:center; align-items:center; min-height:80vh; margin:0; padding:20px; font-family:sans-serif;">
                 <div style="background:white; padding:30px; border-top:5px solid #dc3545; border-radius:10px; box-shadow:0 4px 10px rgba(0,0,0,0.1); text-align:center;">
                     <h2 style="color:#dc3545; margin-top:0;">🚫 Доступ заблокирован</h2>
-                    <p>Сайт <b>${host}</b> отклонил автоматический запрос (Код: ${response.status}).</p>
+                    <p>Сайт <b>${parsedTarget.hostname}</b> отклонил автоматический запрос (Код: ${response.status}).</p>
                     <p style="font-size:13px; color:#666;">Сработала защита от ботов, требующая реального браузера.</p>
                 </div>
             </body></html>`);
@@ -94,7 +86,7 @@ app.get('/', async (req, res) => {
             for await (const chunk of response.data) {
                 chunks.push(chunk);
                 htmlBytes += chunk.length;
-                if (htmlBytes > 20 * 1024 * 1024) { // Предохранитель: HTML не может весить больше 20 МБ
+                if (htmlBytes > 20 * 1024 * 1024) {
                     response.data.destroy();
                     return res.status(400).send("Страница слишком тяжелая для обработки.");
                 }
@@ -104,7 +96,6 @@ app.get('/', async (req, res) => {
             const $ = cheerio.load(html);
             const baseUrl = parsedTarget.origin;
 
-            // Инлайним ресурсы (упрощенно для экономии места)
             const stylesheets = $('link[rel="stylesheet"]').toArray();
             for (let i = 0; i < Math.min(stylesheets.length, 5); i++) {
                 let href = $(stylesheets[i]).attr('href');
@@ -132,14 +123,13 @@ app.get('/', async (req, res) => {
                 }
             }
 
-            console.log(`[SUCCESS] Упаковка завершена. Отправляем в GAS.`);
+            res.set('Content-Type', 'text/html; charset=utf-8');
             return res.send($.html());
         } 
         
         // --- ВЕТВЬ Б: ЭТО БИНАРНЫЙ ФАЙЛ (СКАЧИВАНИЕ НА ДИСК) ---
         else {
-            console.log(`[INFO] Обнаружен файл (${contentType}). Стримим на жесткий диск Northflank...`);
-            
+            console.log(`[INFO] Обнаружен файл (${contentType}). Стримим на жесткий диск...`);
             const fileId = crypto.randomUUID();
             const filePath = path.join(TMP_DIR, `${fileId}.bin`);
             const writer = fs.createWriteStream(filePath);
@@ -147,44 +137,34 @@ app.get('/', async (req, res) => {
             let downloadedBytes = 0;
             let isTooLarge = false;
 
-            // Асинхронно ждем завершения скачивания на диск NF
             await new Promise((resolve, reject) => {
                 response.data.pipe(writer);
-                
                 response.data.on('data', (chunk) => {
                     downloadedBytes += chunk.length;
                     if (downloadedBytes > MAX_FILE_SIZE && !isTooLarge) {
                         isTooLarge = true;
-                        console.log(`[WARN] Файл превысил 100 МБ. Обрываем соединение.`);
-                        response.data.destroy(); // Обрываем скачивание с целевого сайта
+                        response.data.destroy(); 
                         writer.close();
-                        fs.unlink(filePath, () => {}); // Удаляем огрызок с диска
+                        fs.unlink(filePath, () => {}); 
                         reject(new Error("FILE_TOO_LARGE"));
                     }
                 });
-                
                 writer.on('finish', resolve);
                 writer.on('error', reject);
-            }).catch(err => {
-                if (err.message !== "FILE_TOO_LARGE") throw err;
-            });
+            }).catch(err => { if (err.message !== "FILE_TOO_LARGE") throw err; });
 
-            // Если превысили лимит 100 МБ
             if (isTooLarge) {
+                res.set('Content-Type', 'text/html; charset=utf-8');
                 return res.status(200).send(`
-                <!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
+                <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
                 <body style="background:#f0f2f5; display:flex; justify-content:center; align-items:center; min-height:80vh; margin:0; font-family:sans-serif;">
                     <div style="background:white; padding:30px; border-top:5px solid #ff9800; border-radius:10px; text-align:center;">
                         <h2>🐘 Файл слишком большой</h2>
                         <p>Установлен жесткий лимит на скачивание: <b>100 МБ</b>.</p>
-                        <p style="color:#666;">Это необходимо для защиты серверов от перегрузки.</p>
                     </div>
                 </body></html>`);
             }
 
-            console.log(`[SUCCESS] Файл скачан на NF. Размер: ${(downloadedBytes/1024/1024).toFixed(2)} МБ`);
-
-            // Ищем оригинальное имя файла
             let fileName = 'download.bin';
             const cd = response.headers['content-disposition'];
             if (cd && cd.includes('filename=')) {
@@ -193,19 +173,12 @@ app.get('/', async (req, res) => {
                 fileName = path.basename(parsedTarget.pathname) || 'download.bin';
             }
 
-            // Если файл МЕНЬШЕ 34 МБ -> отдаем целиком в GAS
             if (downloadedBytes <= CHUNK_SIZE) {
-                console.log(`[INFO] Файл помещается в лимиты GAS. Отдаем целиком.`);
                 res.set('Content-Type', contentType);
                 res.set('Content-Disposition', `attachment; filename="${fileName}"`);
-                
-                // Перенаправляем поток с жесткого диска прямо в ответ GAS
                 return fs.createReadStream(filePath).pipe(res);
             } 
-            
-            // Если файл БОЛЬШЕ 34 МБ -> генерируем интерфейс с кнопками частей
             else {
-                console.log(`[INFO] Файл большой. Генерируем интерфейс для скачивания по частям.`);
                 const partsCount = Math.ceil(downloadedBytes / CHUNK_SIZE);
                 let buttonsHtml = '';
                 
@@ -214,18 +187,17 @@ app.get('/', async (req, res) => {
                     parsedTarget.searchParams.set('nf_partIndex', i);
                     parsedTarget.searchParams.set('nf_filename', fileName);
                     
-                    const partSize = (i === partsCount - 1) 
-                        ? (downloadedBytes - (i * CHUNK_SIZE)) 
-                        : CHUNK_SIZE;
-                        
+                    const partSize = (i === partsCount - 1) ? (downloadedBytes - (i * CHUNK_SIZE)) : CHUNK_SIZE;
                     buttonsHtml += `
                         <a href="${parsedTarget.toString()}" style="display:block; margin-bottom:10px; padding:12px; background:#1a73e8; color:white; text-decoration:none; border-radius:5px; font-weight:bold;">
                             📥 Скачать часть ${i + 1} <span style="font-weight:normal; font-size:12px; opacity:0.8;">(${(partSize/1024/1024).toFixed(1)} МБ)</span>
                         </a>`;
                 }
 
+                // Указываем кодировку UTF-8 чтобы русский текст отображался правильно
+                res.set('Content-Type', 'text/html; charset=utf-8');
                 return res.status(200).send(`
-                <!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
+                <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
                 <body style="background:#f0f2f5; display:flex; justify-content:center; align-items:flex-start; min-height:100vh; margin:0; padding:20px; font-family:sans-serif; box-sizing:border-box;">
                     <div style="background:white; padding:25px; border-top:5px solid #1a73e8; border-radius:10px; text-align:center; width:100%; max-width:400px; box-shadow:0 4px 10px rgba(0,0,0,0.1); margin-top:20px;">
                         <h2 style="margin-top:0;">📦 Объемный архив</h2>
@@ -247,3 +219,4 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
     console.log(`Proxy server running on port ${PORT}`);
 });
+                 
