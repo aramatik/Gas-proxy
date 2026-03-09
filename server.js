@@ -13,12 +13,22 @@ const execPromise = util.promisify(exec);
 const app = express();
 app.use(compression());
 
-// Лимиты: максимум 130 МБ на скачивание, части по 15 МБ для стабильности GAS
+// Лимиты: максимум 130 МБ на скачивание, части по 15 МБ
 const MAX_FILE_SIZE = 130 * 1024 * 1024;
 const CHUNK_SIZE_MB = 15; 
 const TMP_DIR = '/tmp';
 
+// Подхватываем пароль из переменных окружения (Environment Variables)
+const PROXY_SECRET = process.env.PROXY_SECRET || "MySecretToken123";
+
 app.get('/', async (req, res) => {
+    // --- ЗАЩИТА ОТ БОТОВ ---
+    const reqToken = req.query.token;
+    if (reqToken !== PROXY_SECRET) {
+        console.warn(`[AUTH FAILED] Блокировка бота. Неверный токен: ${reqToken}`);
+        return res.status(403).send('Forbidden: Access Denied. Invalid or missing token.');
+    }
+
     const targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).send('Укажите URL: ?url=https://example.com');
 
@@ -202,7 +212,6 @@ app.get('/', async (req, res) => {
                 const zipBaseName = safeName + '.zip';
                 
                 try {
-                    // Убрали флаг -0. Теперь архиватор снова сжимает данные на полную!
                     await execPromise(`cd "${fileDir}" && zip -s ${CHUNK_SIZE_MB}m "${zipBaseName}" "${safeName}"`);
                     console.log(`[SUCCESS] Архив успешно создан и сжат!`);
                 } catch (zipErr) {
@@ -210,7 +219,7 @@ app.get('/', async (req, res) => {
                     return res.status(500).send("Внутренняя ошибка сервера при разделении файла.");
                 }
 
-                fs.unlinkSync(filePath); // Удаляем исходный тяжелый файл
+                fs.unlinkSync(filePath);
 
                 const filesInDir = fs.readdirSync(fileDir);
                 const archiveParts = filesInDir
@@ -218,14 +227,14 @@ app.get('/', async (req, res) => {
                     .sort(); 
 
                 let buttonsHtml = '';
-                let totalCompressedBytes = 0; // Переменная для подсчета итогового веса
+                let totalCompressedBytes = 0; 
 
                 archiveParts.forEach((partName) => {
                     parsedTarget.searchParams.set('nf_fileId', fileId);
                     parsedTarget.searchParams.set('nf_partName', partName);
                     
                     const stat = fs.statSync(path.join(fileDir, partName));
-                    totalCompressedBytes += stat.size; // Суммируем вес частей
+                    totalCompressedBytes += stat.size; 
                     const mbSize = (stat.size / 1024 / 1024).toFixed(1);
                     
                     buttonsHtml += `
@@ -234,7 +243,6 @@ app.get('/', async (req, res) => {
                         </a>`;
                 });
 
-                // Формируем красивую статистику сжатия
                 const origMB = (downloadedBytes / 1024 / 1024).toFixed(1);
                 const compMB = (totalCompressedBytes / 1024 / 1024).toFixed(1);
                 const savedMB = ((downloadedBytes - totalCompressedBytes) / 1024 / 1024).toFixed(1);
@@ -273,4 +281,4 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
     console.log(`Proxy server running on port ${PORT}`);
 });
-                    
+                                 
