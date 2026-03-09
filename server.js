@@ -166,7 +166,7 @@ app.get('/', async (req, res) => {
                         reject(new Error("FILE_TOO_LARGE"));
                     }
                 });
-                writer.on('finish', resolve);
+                writer.on('close', resolve);
                 writer.on('error', reject);
             }).catch(err => { if (err.message !== "FILE_TOO_LARGE") throw err; });
 
@@ -177,7 +177,7 @@ app.get('/', async (req, res) => {
                 <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
                 <body style="background:#f0f2f5; display:flex; justify-content:center; align-items:center; min-height:80vh; margin:0; font-family:sans-serif;">
                     <div style="background:white; padding:30px; border-top:5px solid #ff9800; border-radius:10px; text-align:center;">
-                        <h2>🐘 Файл слишком большой</h2><p>Установлен жесткий лимит на скачивание: <b>130 МБ</b>.</p>
+                        <h2>🐘 Файл слишком большой</h2><p>Установлен жесткий лимит на скачивание: <b>${MAX_FILE_SIZE/1024/1024} МБ</b>.</p>
                     </div>
                 </body></html>`);
             }
@@ -198,18 +198,19 @@ app.get('/', async (req, res) => {
             } 
             
             else {
-                console.log(`[INFO] Запускаем системный zip для создания многотомного архива...`);
+                console.log(`[INFO] Запускаем системный zip со сжатием...`);
                 const zipBaseName = safeName + '.zip';
                 
                 try {
+                    // Убрали флаг -0. Теперь архиватор снова сжимает данные на полную!
                     await execPromise(`cd "${fileDir}" && zip -s ${CHUNK_SIZE_MB}m "${zipBaseName}" "${safeName}"`);
-                    console.log(`[SUCCESS] Архив успешно создан!`);
+                    console.log(`[SUCCESS] Архив успешно создан и сжат!`);
                 } catch (zipErr) {
                     console.error(`[ERROR] Ошибка при архивации:`, zipErr);
-                    return res.status(500).send("Внутренняя ошибка сервера при создании архива.");
+                    return res.status(500).send("Внутренняя ошибка сервера при разделении файла.");
                 }
 
-                fs.unlinkSync(filePath);
+                fs.unlinkSync(filePath); // Удаляем исходный тяжелый файл
 
                 const filesInDir = fs.readdirSync(fileDir);
                 const archiveParts = filesInDir
@@ -217,11 +218,14 @@ app.get('/', async (req, res) => {
                     .sort(); 
 
                 let buttonsHtml = '';
+                let totalCompressedBytes = 0; // Переменная для подсчета итогового веса
+
                 archiveParts.forEach((partName) => {
                     parsedTarget.searchParams.set('nf_fileId', fileId);
                     parsedTarget.searchParams.set('nf_partName', partName);
                     
                     const stat = fs.statSync(path.join(fileDir, partName));
+                    totalCompressedBytes += stat.size; // Суммируем вес частей
                     const mbSize = (stat.size / 1024 / 1024).toFixed(1);
                     
                     buttonsHtml += `
@@ -230,13 +234,26 @@ app.get('/', async (req, res) => {
                         </a>`;
                 });
 
+                // Формируем красивую статистику сжатия
+                const origMB = (downloadedBytes / 1024 / 1024).toFixed(1);
+                const compMB = (totalCompressedBytes / 1024 / 1024).toFixed(1);
+                const savedMB = ((downloadedBytes - totalCompressedBytes) / 1024 / 1024).toFixed(1);
+                
+                let savingsHtml = '';
+                if (downloadedBytes > totalCompressedBytes) {
+                    savingsHtml = `<span style="color:#28a745; font-weight:bold;">Сжато до ${compMB} МБ (вы экономите ${savedMB} МБ трафика)</span>`;
+                } else {
+                    savingsHtml = `Размер архива: ${compMB} МБ`;
+                }
+
                 res.set('Content-Type', 'text/html; charset=utf-8');
                 return res.status(200).send(`
                 <!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"></head>
                 <body style="background:#f0f2f5; display:flex; justify-content:center; align-items:flex-start; min-height:100vh; margin:0; padding:20px; font-family:sans-serif; box-sizing:border-box;">
                     <div style="background:white; padding:25px; border-top:5px solid #1a73e8; border-radius:10px; text-align:center; width:100%; max-width:400px; box-shadow:0 4px 10px rgba(0,0,0,0.1); margin-top:20px;">
                         <h2 style="margin-top:0;">📦 Объемный архив</h2>
-                        <p style="font-size:14px; color:#333;">Оригинальный файл <b>${fileName}</b> весит ${(downloadedBytes/1024/1024).toFixed(1)} МБ.</p>
+                        <p style="font-size:14px; color:#333; margin-bottom: 5px;">Оригинал <b>${fileName}</b>: ${origMB} МБ</p>
+                        <p style="font-size:14px; margin-top: 0; margin-bottom: 15px;">${savingsHtml}</p>
                         <div style="background:#fff3cd; color:#856404; padding:10px; border-radius:5px; font-size:12px; text-align:left; margin-bottom:15px; border:1px solid #ffeeba;">
                             <b>Как распаковать:</b><br>1. Скачайте все части в одну папку на вашем устройстве.<br>2. Откройте файл с расширением <b>.zip</b> в архиваторе (например, ZArchiver). Он сам найдет остальные части и извлечет ваш файл.
                         </div>
@@ -256,4 +273,4 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
     console.log(`Proxy server running on port ${PORT}`);
 });
-                            
+                    
