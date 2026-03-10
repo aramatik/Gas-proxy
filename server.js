@@ -1,3 +1,6 @@
+// Устанавливаем часовой пояс сервера (Киевское время)
+process.env.TZ = 'Europe/Kyiv';
+
 const express = require('express');
 const compression = require('compression');
 const axios = require('axios');
@@ -31,19 +34,59 @@ if (GEMINI_API_KEY) {
 }
 
 // ==========================================
-// СИСТЕМА ЛОГИРОВАНИЯ
+// СИСТЕМА ЛОГИРОВАНИЯ (Киевское время)
 // ==========================================
 const MAX_LOG_LINES = 100;
 let serverLogs = [];
+
+function getKyivTime() {
+    return new Date().toLocaleTimeString('ru-RU', { timeZone: 'Europe/Kyiv', hour12: false });
+}
+
 function captureLog(msg) {
-    const time = new Date().toISOString().substring(11, 19); 
-    serverLogs.push(`[${time}] ${msg}`);
+    serverLogs.push(`[${getKyivTime()}] ${msg}`);
     if (serverLogs.length > MAX_LOG_LINES) serverLogs.shift();
 }
 const origLog = console.log; console.log = function(...args) { origLog.apply(console, args); captureLog(util.format(...args)); };
 const origErr = console.error; console.error = function(...args) { origErr.apply(console, args); captureLog("ERROR: " + util.format(...args)); };
 
-console.log("[SYSTEM] Сервер запущен. Система логирования активна.");
+console.log("[SYSTEM] Сервер запущен. Часовой пояс: Europe/Kyiv");
+
+// ==========================================
+// ТЕЛЕМЕТРИЯ: ПЕРЕХВАТЧИК ЛИМИТОВ GEMINI API
+// ==========================================
+const LIMITS_FILE = path.join(TMP_DIR, 'gemini_limits.json');
+let geminiLimits = {};
+
+if (fs.existsSync(LIMITS_FILE)) {
+    try { geminiLimits = JSON.parse(fs.readFileSync(LIMITS_FILE, 'utf8')); } catch(e){}
+}
+
+const originalFetch = global.fetch;
+global.fetch = async (...args) => {
+    const response = await originalFetch(...args);
+    const url = args[0];
+    
+    // Если запрос летит к Google API, ловим заголовки
+    if (typeof url === 'string' && url.includes('generativelanguage.googleapis.com/v1beta/models/')) {
+        const match = url.match(/models\/([^:]+):/);
+        if (match && match[1]) {
+            const modelId = match[1];
+            const limitReq = response.headers.get('x-ratelimit-limit-requests');
+            const remainingReq = response.headers.get('x-ratelimit-remaining-requests');
+            
+            if (limitReq || remainingReq) {
+                geminiLimits[modelId] = {
+                    limit: limitReq || '?',
+                    remaining: remainingReq || '?',
+                    lastUpdated: getKyivTime()
+                };
+                fs.writeFileSync(LIMITS_FILE, JSON.stringify(geminiLimits, null, 2));
+            }
+        }
+    }
+    return response;
+};
 
 // ==========================================
 // МАРШРУТ УПРАВЛЕНИЯ И GEMINI
@@ -70,6 +113,7 @@ app.post('/gemini', async (req, res) => {
     if (userText === '/help') {
         const respHtml = `🤖 <b>СИСТЕМА CHATOPS:</b><br><br>
         <code>/status</code> — Состояние сервера<br>
+        <code>/limit</code> — Квоты API Gemini<br>
         <code>/logs</code> — Логи Northflank<br>
         <code>/download [путь]</code> — Скачать файл (до 15 МБ)<br>
         <code>/upload</code> — Загрузить файл на сервер<br><br>
@@ -77,6 +121,31 @@ app.post('/gemini', async (req, res) => {
         <code>! [команда]</code> — Консоль Linux<br>
         <i>Пример: <code>!ls -la /tmp</code></i>`;
         return res.json({ ok: true, text: respHtml });
+    }
+
+    // --- НОВАЯ КОМАНДА: ТАБЛИЦА ЛИМИТОВ ---
+    if (userText === '/limit') {
+        if (Object.keys(geminiLimits).length === 0) {
+            return res.json({ ok: true, text: `📊 <b>Квоты Gemini:</b><br><br>Пока нет данных. Сделайте хотя бы один запрос к ИИ, чтобы сервер перехватил заголовки с вашими лимитами.` });
+        }
+        let tableHtml = `<table style="width:100%; border-collapse:collapse; font-size:11px; margin-top:5px; background:#fff; color:#333;">
+            <tr style="background:#1a73e8; color:white;">
+                <th style="padding:4px; border:1px solid #ccc;">Модель</th>
+                <th style="padding:4px; border:1px solid #ccc;">Лимит</th>
+                <th style="padding:4px; border:1px solid #ccc;">Остаток</th>
+                <th style="padding:4px; border:1px solid #ccc;">Обновление</th>
+            </tr>`;
+        for (const [model, data] of Object.entries(geminiLimits)) {
+            const remColor = parseInt(data.remaining) < 10 ? '#dc3545' : '#28a745'; // Красный если мало, зеленый если много
+            tableHtml += `<tr>
+                <td style="padding:4px; border:1px solid #ccc; font-weight:bold;">${model}</td>
+                <td style="padding:4px; border:1px solid #ccc; text-align:center;">${data.limit}</td>
+                <td style="padding:4px; border:1px solid #ccc; text-align:center; font-weight:bold; color:${remColor};">${data.remaining}</td>
+                <td style="padding:4px; border:1px solid #ccc; text-align:center; color:#666;">${data.lastUpdated}</td>
+            </tr>`;
+        }
+        tableHtml += `</table>`;
+        return res.json({ ok: true, text: `📊 <b>Ваши квоты Gemini (API):</b><br>${tableHtml}` });
     }
 
     if (userText.startsWith('/download ')) {
@@ -276,12 +345,11 @@ app.get('/', async (req, res) => {
                 }
             }
             
-            // --- НОВОЕ: ЕСЛИ ЗАПРОШЕНО СКАЧИВАНИЕ HTML-СТРАНИЦЫ ---
             if (req.query.nf_dl_html === 'true') {
                 console.log(`[PROXY] Формирование HTML-страницы для оффлайн скачивания: ${parsedTarget.hostname}`);
                 $('head').prepend(`<base href="${parsedTarget.origin}">`);
                 const hostSafe = parsedTarget.hostname.replace(/[^a-zA-Z0-9.-]/g, '_');
-                res.set('Content-Type', 'application/octet-stream'); // Это заставит GAS скачать ее как файл
+                res.set('Content-Type', 'application/octet-stream'); 
                 res.set('Content-Disposition', `attachment; filename="page_${hostSafe}.html"`);
                 return res.send($.html());
             }
