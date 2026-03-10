@@ -395,4 +395,109 @@ app.get('/', async (req, res) => {
             for (let i = 0; i < Math.min(images.length, 10); i++) {
                 let src = $(images[i]).attr('src');
                 if (src && !src.startsWith('data:') && src.startsWith('/')) src = baseUrl + src;
-     
+                if (src && !src.startsWith('data:')) {
+                    try { const imgRes = await axios.get(src, { responseType: 'arraybuffer', timeout: 3000 });
+                        const b64 = Buffer.from(imgRes.data, 'binary').toString('base64');
+                        $(images[i]).attr('src', `data:${imgRes.headers['content-type']};base64,${b64}`).removeAttr('srcset'); 
+                    } catch (e) {}
+                }
+            }
+            
+            if (req.query.nf_dl_html === 'true') {
+                console.log(`[PROXY] Формирование HTML-страницы для оффлайн скачивания: ${parsedTarget.hostname}`);
+                $('head').prepend(`<base href="${parsedTarget.origin}">`);
+                const hostSafe = parsedTarget.hostname.replace(/[^a-zA-Z0-9.-]/g, '_');
+                res.set('Content-Type', 'application/octet-stream'); 
+                res.set('Content-Disposition', `attachment; filename="page_${hostSafe}.html"`);
+                return res.send($.html());
+            }
+
+            console.log(`[PROXY] Страница ${parsedTarget.hostname} успешно обработана и отправлена клиенту.`);
+            res.set('Content-Type', 'text/html; charset=utf-8');
+            return res.send($.html());
+        } 
+        
+        else {
+            console.log(`[PROXY] Обнаружен файл (${contentType}). Начинается загрузка на жесткий диск...`);
+            const fileId = crypto.randomUUID();
+            const fileDir = path.join(TMP_DIR, fileId);
+            fs.mkdirSync(fileDir, { recursive: true });
+
+            let fileName = 'download.bin';
+            const cd = response.headers['content-disposition'];
+            if (cd && cd.includes('filename=')) fileName = cd.split('filename=')[1].replace(/["']/g, '');
+            else fileName = path.basename(parsedTarget.pathname) || 'download.bin';
+            
+            let safeName = fileName.replace(/[^a-zA-Z0-9.\-_]/g, '_') || "app.bin";
+            const filePath = path.join(fileDir, safeName);
+            const writer = fs.createWriteStream(filePath);
+            
+            let downloadedBytes = 0; let isTooLarge = false;
+
+            await new Promise((resolve, reject) => {
+                response.data.pipe(writer);
+                response.data.on('data', (chunk) => {
+                    downloadedBytes += chunk.length;
+                    if (downloadedBytes > MAX_FILE_SIZE && !isTooLarge) { 
+                        isTooLarge = true; 
+                        response.data.destroy(); 
+                        writer.close(); 
+                        reject(new Error("FILE_TOO_LARGE")); 
+                    }
+                });
+                writer.on('close', resolve);
+                writer.on('error', reject);
+            }).catch(err => { if (err.message !== "FILE_TOO_LARGE") throw err; });
+
+            if (isTooLarge) {
+                console.warn(`[PROXY] Файл превысил жесткий лимит скачивания (${MAX_FILE_SIZE/1024/1024} МБ). Операция прервана.`);
+                fs.rmSync(fileDir, { recursive: true, force: true });
+                res.set('Content-Type', 'text/html; charset=utf-8');
+                return res.status(200).send(`<h2>🐘 Файл больше ${MAX_FILE_SIZE/1024/1024} МБ.</h2>`);
+            }
+
+            console.log(`[PROXY] Файл успешно скачан. Размер: ${(downloadedBytes/1024/1024).toFixed(2)} MB`);
+            setTimeout(() => { try { fs.rmSync(fileDir, { recursive: true, force: true }); } catch(e) {} }, 2 * 60 * 60 * 1000);
+
+            if (downloadedBytes <= CHUNK_SIZE_MB * 1024 * 1024) {
+                console.log(`[PROXY] Файл маленький, стримим напрямую клиенту.`);
+                res.set('Content-Type', contentType);
+                res.set('Content-Disposition', `attachment; filename="${fileName}"`);
+                return fs.createReadStream(filePath).pipe(res);
+            } else {
+                console.log(`[PROXY] Файл больше ${CHUNK_SIZE_MB} МБ. Запущена упаковка в ZIP архив...`);
+                const zipBaseName = safeName + '.zip';
+                try { await execPromise(`cd "${fileDir}" && zip -s ${CHUNK_SIZE_MB}m "${zipBaseName}" "${safeName}"`); } 
+                catch (zipErr) { 
+                    console.error(`[PROXY ERROR] Ошибка создания ZIP архива: ${zipErr.message}`);
+                    return res.status(500).send("Ошибка архивации"); 
+                }
+                
+                fs.unlinkSync(filePath);
+                const filesInDir = fs.readdirSync(fileDir);
+                const archiveParts = filesInDir.filter(f => f.startsWith(safeName + '.')).sort(); 
+                
+                console.log(`[PROXY] Архив успешно создан. Состоит из ${archiveParts.length} частей.`);
+
+                let buttonsHtml = ''; let totalCompressedBytes = 0; 
+                archiveParts.forEach((partName) => {
+                    parsedTarget.searchParams.set('nf_fileId', fileId); parsedTarget.searchParams.set('nf_partName', partName);
+                    const stat = fs.statSync(path.join(fileDir, partName)); totalCompressedBytes += stat.size; 
+                    buttonsHtml += `<a href="${parsedTarget.toString()}" target="_blank" style="display:block; margin-bottom:10px; padding:12px; background:#1a73e8; color:white; text-decoration:none; border-radius:5px; font-weight:bold;">📥 Скачать ${partName} <span style="font-weight:normal; font-size:12px;">(${(stat.size/1024/1024).toFixed(1)} МБ)</span></a>`;
+                });
+
+                const origMB = (downloadedBytes/1024/1024).toFixed(1); const compMB = (totalCompressedBytes/1024/1024).toFixed(1);
+                let savingsHtml = downloadedBytes > totalCompressedBytes ? `<span style="color:#28a745; font-weight:bold;">Сжато до ${compMB} МБ (вы экономите ${((downloadedBytes - totalCompressedBytes)/1024/1024).toFixed(1)} МБ)</span>` : `Размер: ${compMB} МБ`;
+
+                res.set('Content-Type', 'text/html; charset=utf-8');
+                return res.status(200).send(`<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"></head><body style="background:#f0f2f5; display:flex; justify-content:center; padding:20px; font-family:sans-serif;"><div style="background:white; padding:25px; border-top:5px solid #1a73e8; border-radius:10px; text-align:center; width:100%; max-width:400px; box-shadow:0 4px 10px rgba(0,0,0,0.1);"><h2 style="margin-top:0;">📦 Объемный архив</h2><p style="font-size:14px; margin-bottom:5px;">Оригинал: ${origMB} МБ</p><p style="font-size:14px; margin-top:0; margin-bottom:15px;">${savingsHtml}</p><div style="background:#fff3cd; color:#856404; padding:10px; border-radius:5px; font-size:12px; text-align:left; margin-bottom:15px;">Распакуйте файл <b>.zip</b> в ZArchiver.</div>${buttonsHtml}</div></body></html>`);
+            }
+        }
+    } catch (error) { 
+        console.error(`[PROXY ERROR] Ошибка шлюза при обработке ${targetUrl}:`, error.message);
+        res.status(500).send(`Ошибка шлюза: ${error.message}`); 
+    }
+});
+
+app.listen(process.env.PORT || 8080);
+                
