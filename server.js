@@ -53,7 +53,7 @@ const origErr = console.error; console.error = function(...args) { origErr.apply
 console.log("[SYSTEM] Сервер запущен. Часовой пояс: Europe/Kyiv");
 
 // ==========================================
-// ТЕЛЕМЕТРИЯ: ПЕРЕХВАТЧИК ЛИМИТОВ GEMINI API
+// ТЕЛЕМЕТРИЯ: ПЕРЕХВАТЧИК ЛИМИТОВ (JSON ERROR PARSER)
 // ==========================================
 const LIMITS_FILE = path.join(TMP_DIR, 'gemini_limits.json');
 let geminiLimits = {};
@@ -66,29 +66,59 @@ const originalFetch = global.fetch;
 global.fetch = async (input, init) => {
     const response = await originalFetch(input, init);
     
-    // Безопасно достаем URL из аргументов fetch
     let url = '';
     if (typeof input === 'string') url = input;
     else if (input && input.url) url = input.url; 
     else if (input && input.href) url = input.href; 
 
-    // Если запрос летит к Google API, ловим заголовки
+    // Ловим запросы генерации к Google API
     if (url && url.includes('generativelanguage.googleapis.com/v1beta/models/')) {
         const match = url.match(/models\/([^:]+)(?::generateContent|:streamGenerateContent)/);
         if (match && match[1]) {
             const modelId = match[1];
-            const limitReq = response.headers.get('x-ratelimit-limit-requests');
-            const remainingReq = response.headers.get('x-ratelimit-remaining-requests');
-            const resetReq = response.headers.get('x-ratelimit-reset-requests');
             
-            if (limitReq || remainingReq) {
-                geminiLimits[modelId] = {
-                    limit: limitReq || '?',
-                    remaining: remainingReq || '?',
-                    reset: resetReq || '?',
-                    lastUpdated: getKyivTime()
-                };
-                fs.writeFileSync(LIMITS_FILE, JSON.stringify(geminiLimits, null, 2));
+            // Если словили 429 - лимиты исчерпаны, парсим JSON
+            if (response.status === 429) {
+                try {
+                    const clonedRes = response.clone();
+                    const data = await clonedRes.json();
+                    
+                    let limit = '?';
+                    let reset = '?';
+                    
+                    if (data.error && data.error.details) {
+                        const quotaFailure = data.error.details.find(d => d['@type'] === 'type.googleapis.com/google.rpc.QuotaFailure');
+                        const retryInfo = data.error.details.find(d => d['@type'] === 'type.googleapis.com/google.rpc.RetryInfo');
+                        
+                        if (quotaFailure && quotaFailure.violations && quotaFailure.violations.length > 0) {
+                            limit = quotaFailure.violations[0].quotaValue || '?';
+                        }
+                        if (retryInfo) {
+                            reset = retryInfo.retryDelay || '?';
+                        }
+                    }
+                    
+                    geminiLimits[modelId] = {
+                        status: 'БЛОКИРОВКА (429)',
+                        limit: limit,
+                        reset: reset,
+                        lastUpdated: getKyivTime()
+                    };
+                    fs.writeFileSync(LIMITS_FILE, JSON.stringify(geminiLimits, null, 2));
+                } catch(e) {
+                    console.error("[FETCH INTERCEPTOR] Ошибка парсинга 429:", e.message);
+                }
+            } else if (response.status === 200) {
+                // Если запрос прошел успешно, снимаем статус блокировки
+                if (!geminiLimits[modelId] || geminiLimits[modelId].status !== 'OK') {
+                    geminiLimits[modelId] = {
+                        status: 'OK',
+                        limit: geminiLimits[modelId] ? geminiLimits[modelId].limit : 'Скрыто',
+                        reset: '-',
+                        lastUpdated: getKyivTime()
+                    };
+                    fs.writeFileSync(LIMITS_FILE, JSON.stringify(geminiLimits, null, 2));
+                }
             }
         }
     }
@@ -120,7 +150,7 @@ app.post('/gemini', async (req, res) => {
     if (userText === '/help') {
         const respHtml = `🤖 <b>СИСТЕМА CHATOPS:</b><br><br>
         <code>/status</code> — Состояние сервера<br>
-        <code>/limit</code> — Квоты API Gemini<br>
+        <code>/limit</code> — Состояние моделей (Блокировки)<br>
         <code>/logs</code> — Логи Northflank<br>
         <code>/download [путь]</code> — Скачать файл (до 15 МБ)<br>
         <code>/upload</code> — Загрузить файл на сервер<br><br>
@@ -132,28 +162,28 @@ app.post('/gemini', async (req, res) => {
 
     if (userText === '/limit') {
         if (Object.keys(geminiLimits).length === 0) {
-            return res.json({ ok: true, text: `📊 <b>Квоты Gemini:</b><br><br>Пока нет данных. Сделайте хотя бы один запрос к ИИ, чтобы сервер перехватил заголовки с вашими лимитами.` });
+            return res.json({ ok: true, text: `📊 <b>Состояние API-моделей:</b><br><br>Google больше не передает остаток лимитов заранее. Сервер узнает точный лимит только при достижении потолка (ошибке 429). Сделайте запрос к ИИ, чтобы начать отслеживание статуса.` });
         }
         let tableHtml = `<table style="width:100%; border-collapse:collapse; font-size:11px; margin-top:5px; background:#fff; color:#333;">
             <tr style="background:#1a73e8; color:white;">
                 <th style="padding:4px; border:1px solid #ccc;">Модель</th>
-                <th style="padding:4px; border:1px solid #ccc;">Лимит</th>
-                <th style="padding:4px; border:1px solid #ccc;">Остаток</th>
-                <th style="padding:4px; border:1px solid #ccc;">Сброс (сек)</th>
-                <th style="padding:4px; border:1px solid #ccc;">Обновление</th>
+                <th style="padding:4px; border:1px solid #ccc;">Статус</th>
+                <th style="padding:4px; border:1px solid #ccc;">Макс.</th>
+                <th style="padding:4px; border:1px solid #ccc;">Сброс</th>
+                <th style="padding:4px; border:1px solid #ccc;">Обновлено</th>
             </tr>`;
         for (const [model, data] of Object.entries(geminiLimits)) {
-            const remColor = parseInt(data.remaining) < 10 ? '#dc3545' : '#28a745'; 
+            const statusColor = data.status === 'OK' ? '#28a745' : '#dc3545'; 
             tableHtml += `<tr>
                 <td style="padding:4px; border:1px solid #ccc; font-weight:bold;">${model}</td>
+                <td style="padding:4px; border:1px solid #ccc; text-align:center; font-weight:bold; color:${statusColor};">${data.status}</td>
                 <td style="padding:4px; border:1px solid #ccc; text-align:center;">${data.limit}</td>
-                <td style="padding:4px; border:1px solid #ccc; text-align:center; font-weight:bold; color:${remColor};">${data.remaining}</td>
                 <td style="padding:4px; border:1px solid #ccc; text-align:center;">${data.reset}</td>
                 <td style="padding:4px; border:1px solid #ccc; text-align:center; color:#666;">${data.lastUpdated}</td>
             </tr>`;
         }
         tableHtml += `</table>`;
-        return res.json({ ok: true, text: `📊 <b>Ваши квоты Gemini (API):</b><br>${tableHtml}` });
+        return res.json({ ok: true, text: `📊 <b>Мониторинг блокировок:</b><br>${tableHtml}` });
     }
 
     if (userText.startsWith('/download ')) {
@@ -210,17 +240,20 @@ app.post('/gemini', async (req, res) => {
             const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_API_KEY}`;
             const response = await axios.get(url);
             
-            // Список моделей с нулевыми лимитами (на бесплатном тарифе)
+            // Жесткий список "мертвых" моделей и устаревших
             const zeroLimitModels = [
                 'gemini-2.5-pro',
                 'gemini-2-flash', 
-                'gemini-3.1-pro'
+                'gemini-3.1-pro',
+                'bison',
+                'gecko'
             ];
 
             const models = response.data.models
                 .filter(m => m.supportedGenerationMethods.includes('generateContent'))
                 .filter(m => {
                     const id = m.name.replace('models/', '');
+                    // Если ID модели содержит строку из черного списка - выбрасываем
                     return !zeroLimitModels.some(zeroId => id.includes(zeroId));
                 })
                 .map(m => ({ id: m.name.replace('models/', ''), name: m.displayName }));
@@ -258,7 +291,7 @@ app.post('/gemini', async (req, res) => {
         const isGemma = modelName.toLowerCase().includes('gemma');
         const modelConfig = { model: modelName };
         
-        // Модели Gemma не поддерживают systemInstruction, поэтому применяем только для Gemini
+        // Модели Gemma не поддерживают systemInstruction
         if (!isGemma) {
             modelConfig.systemInstruction = "Ты — полезный ИИ-ассистент. Если пользователь присылает тебе аудиофайл или голосовое сообщение, просто выслушай вопрос/информацию, которая там содержится, и дай прямой ответ. НИКОГДА не делай технический или структурный анализ аудиофайла (не пиши про длительность, шумы, пол спикера, перевод и транскрипцию), если только тебя не попросили об этом напрямую. Также используй удобное форматирование Markdown.";
         }
@@ -362,109 +395,4 @@ app.get('/', async (req, res) => {
             for (let i = 0; i < Math.min(images.length, 10); i++) {
                 let src = $(images[i]).attr('src');
                 if (src && !src.startsWith('data:') && src.startsWith('/')) src = baseUrl + src;
-                if (src && !src.startsWith('data:')) {
-                    try { const imgRes = await axios.get(src, { responseType: 'arraybuffer', timeout: 3000 });
-                        const b64 = Buffer.from(imgRes.data, 'binary').toString('base64');
-                        $(images[i]).attr('src', `data:${imgRes.headers['content-type']};base64,${b64}`).removeAttr('srcset'); 
-                    } catch (e) {}
-                }
-            }
-            
-            if (req.query.nf_dl_html === 'true') {
-                console.log(`[PROXY] Формирование HTML-страницы для оффлайн скачивания: ${parsedTarget.hostname}`);
-                $('head').prepend(`<base href="${parsedTarget.origin}">`);
-                const hostSafe = parsedTarget.hostname.replace(/[^a-zA-Z0-9.-]/g, '_');
-                res.set('Content-Type', 'application/octet-stream'); 
-                res.set('Content-Disposition', `attachment; filename="page_${hostSafe}.html"`);
-                return res.send($.html());
-            }
-
-            console.log(`[PROXY] Страница ${parsedTarget.hostname} успешно обработана и отправлена клиенту.`);
-            res.set('Content-Type', 'text/html; charset=utf-8');
-            return res.send($.html());
-        } 
-        
-        else {
-            console.log(`[PROXY] Обнаружен файл (${contentType}). Начинается загрузка на жесткий диск...`);
-            const fileId = crypto.randomUUID();
-            const fileDir = path.join(TMP_DIR, fileId);
-            fs.mkdirSync(fileDir, { recursive: true });
-
-            let fileName = 'download.bin';
-            const cd = response.headers['content-disposition'];
-            if (cd && cd.includes('filename=')) fileName = cd.split('filename=')[1].replace(/["']/g, '');
-            else fileName = path.basename(parsedTarget.pathname) || 'download.bin';
-            
-            let safeName = fileName.replace(/[^a-zA-Z0-9.\-_]/g, '_') || "app.bin";
-            const filePath = path.join(fileDir, safeName);
-            const writer = fs.createWriteStream(filePath);
-            
-            let downloadedBytes = 0; let isTooLarge = false;
-
-            await new Promise((resolve, reject) => {
-                response.data.pipe(writer);
-                response.data.on('data', (chunk) => {
-                    downloadedBytes += chunk.length;
-                    if (downloadedBytes > MAX_FILE_SIZE && !isTooLarge) { 
-                        isTooLarge = true; 
-                        response.data.destroy(); 
-                        writer.close(); 
-                        reject(new Error("FILE_TOO_LARGE")); 
-                    }
-                });
-                writer.on('close', resolve);
-                writer.on('error', reject);
-            }).catch(err => { if (err.message !== "FILE_TOO_LARGE") throw err; });
-
-            if (isTooLarge) {
-                console.warn(`[PROXY] Файл превысил жесткий лимит скачивания (${MAX_FILE_SIZE/1024/1024} МБ). Операция прервана.`);
-                fs.rmSync(fileDir, { recursive: true, force: true });
-                res.set('Content-Type', 'text/html; charset=utf-8');
-                return res.status(200).send(`<h2>🐘 Файл больше ${MAX_FILE_SIZE/1024/1024} МБ.</h2>`);
-            }
-
-            console.log(`[PROXY] Файл успешно скачан. Размер: ${(downloadedBytes/1024/1024).toFixed(2)} MB`);
-            setTimeout(() => { try { fs.rmSync(fileDir, { recursive: true, force: true }); } catch(e) {} }, 2 * 60 * 60 * 1000);
-
-            if (downloadedBytes <= CHUNK_SIZE_MB * 1024 * 1024) {
-                console.log(`[PROXY] Файл маленький, стримим напрямую клиенту.`);
-                res.set('Content-Type', contentType);
-                res.set('Content-Disposition', `attachment; filename="${fileName}"`);
-                return fs.createReadStream(filePath).pipe(res);
-            } else {
-                console.log(`[PROXY] Файл больше ${CHUNK_SIZE_MB} МБ. Запущена упаковка в ZIP архив...`);
-                const zipBaseName = safeName + '.zip';
-                try { await execPromise(`cd "${fileDir}" && zip -s ${CHUNK_SIZE_MB}m "${zipBaseName}" "${safeName}"`); } 
-                catch (zipErr) { 
-                    console.error(`[PROXY ERROR] Ошибка создания ZIP архива: ${zipErr.message}`);
-                    return res.status(500).send("Ошибка архивации"); 
-                }
-                
-                fs.unlinkSync(filePath);
-                const filesInDir = fs.readdirSync(fileDir);
-                const archiveParts = filesInDir.filter(f => f.startsWith(safeName + '.')).sort(); 
-                
-                console.log(`[PROXY] Архив успешно создан. Состоит из ${archiveParts.length} частей.`);
-
-                let buttonsHtml = ''; let totalCompressedBytes = 0; 
-                archiveParts.forEach((partName) => {
-                    parsedTarget.searchParams.set('nf_fileId', fileId); parsedTarget.searchParams.set('nf_partName', partName);
-                    const stat = fs.statSync(path.join(fileDir, partName)); totalCompressedBytes += stat.size; 
-                    buttonsHtml += `<a href="${parsedTarget.toString()}" target="_blank" style="display:block; margin-bottom:10px; padding:12px; background:#1a73e8; color:white; text-decoration:none; border-radius:5px; font-weight:bold;">📥 Скачать ${partName} <span style="font-weight:normal; font-size:12px;">(${(stat.size/1024/1024).toFixed(1)} МБ)</span></a>`;
-                });
-
-                const origMB = (downloadedBytes/1024/1024).toFixed(1); const compMB = (totalCompressedBytes/1024/1024).toFixed(1);
-                let savingsHtml = downloadedBytes > totalCompressedBytes ? `<span style="color:#28a745; font-weight:bold;">Сжато до ${compMB} МБ (вы экономите ${((downloadedBytes - totalCompressedBytes)/1024/1024).toFixed(1)} МБ)</span>` : `Размер: ${compMB} МБ`;
-
-                res.set('Content-Type', 'text/html; charset=utf-8');
-                return res.status(200).send(`<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"></head><body style="background:#f0f2f5; display:flex; justify-content:center; padding:20px; font-family:sans-serif;"><div style="background:white; padding:25px; border-top:5px solid #1a73e8; border-radius:10px; text-align:center; width:100%; max-width:400px; box-shadow:0 4px 10px rgba(0,0,0,0.1);"><h2 style="margin-top:0;">📦 Объемный архив</h2><p style="font-size:14px; margin-bottom:5px;">Оригинал: ${origMB} МБ</p><p style="font-size:14px; margin-top:0; margin-bottom:15px;">${savingsHtml}</p><div style="background:#fff3cd; color:#856404; padding:10px; border-radius:5px; font-size:12px; text-align:left; margin-bottom:15px;">Распакуйте файл <b>.zip</b> в ZArchiver.</div>${buttonsHtml}</div></body></html>`);
-            }
-        }
-    } catch (error) { 
-        console.error(`[PROXY ERROR] Ошибка шлюза при обработке ${targetUrl}:`, error.message);
-        res.status(500).send(`Ошибка шлюза: ${error.message}`); 
-    }
-});
-
-app.listen(process.env.PORT || 8080);
-                
+     
