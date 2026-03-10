@@ -43,7 +43,6 @@ const origErr = console.error; console.error = function(...args) { origErr.apply
 app.post('/gemini', async (req, res) => {
     if (req.query.token !== PROXY_SECRET) return res.status(403).json({ok: false, error: "Auth failed"});
 
-    // --- ЗАГРУЗКА НА СЕРВЕР (Кнопка 💻) ---
     if (req.body.action === 'upload') {
         try {
             const filename = req.body.filename.replace(/[^a-zA-Z0-9.\-_]/g, '_');
@@ -51,7 +50,7 @@ app.post('/gemini', async (req, res) => {
             const savePath = path.join(TMP_DIR, filename);
             fs.writeFileSync(savePath, buffer);
             console.log(`[UPLOAD] Файл сохранен: ${savePath} (${(buffer.length/1024/1024).toFixed(2)} MB)`);
-            return res.json({ok: true, text: `✅ Файл <b>${filename}</b> загружен на сервер!<br>Путь: <code>${savePath}</code>`});
+            return res.json({ok: true, text: `✅ Файл <b>${filename}</b> загружен!<br>Путь: <code>${savePath}</code>`});
         } catch (err) {
             console.error("[UPLOAD ERROR]", err.message);
             return res.status(500).json({ok: false, error: err.message});
@@ -64,10 +63,8 @@ app.post('/gemini', async (req, res) => {
         const respHtml = `🤖 <b>СИСТЕМА CHATOPS:</b><br><br>
         <code>/status</code> — Состояние сервера<br>
         <code>/logs</code> — Логи Northflank<br>
-        <code>/download [путь]</code> — Скачать файл (до 15 МБ)<br><br>
-        📁 <b>Работа с файлами:</b><br>
-        Кнопка [💻] — Загрузить файл на диск сервера.<br>
-        Кнопка [📎] — Отправить файл в чат (Telegram или Gemini на анализ).<br><br>
+        <code>/download [путь]</code> — Скачать файл (до 15 МБ)<br>
+        <code>/upload</code> — Загрузить файл на сервер<br><br>
         💻 <b>Терминал:</b><br>
         <code>! [команда]</code> — Консоль Linux<br>
         <i>Пример: <code>!ls -la /tmp</code></i>`;
@@ -81,7 +78,6 @@ app.post('/gemini', async (req, res) => {
         if (stat.isDirectory()) return res.json({ok: true, text: `❌ Это папка. Сначала запакуйте её:<br><code>!zip -r /tmp/dir.zip ${targetPath}</code>`});
 
         const mb = (stat.size / 1024 / 1024).toFixed(2);
-        
         if (stat.size > 15 * 1024 * 1024) {
             return res.json({ok: true, text: `⚠️ Файл слишком большой для прокси Google (${mb} МБ). Максимум 15 МБ.<br>Разрежьте его на части:<br><code>!zip -s 14m /tmp/archive.zip ${targetPath}</code>`});
         }
@@ -121,7 +117,6 @@ app.post('/gemini', async (req, res) => {
         }
     }
 
-    // --- ОБРАЩЕНИЕ К ИИ (ТЕПЕРЬ С ПОДДЕРЖКОЙ ФАЙЛОВ) ---
     if (!GEMINI_API_KEY) return res.status(500).json({ok: false, error: "Отсутствует GEMINI_API_KEY на сервере"});
 
     if (req.body.action === 'get_models') {
@@ -142,7 +137,6 @@ app.post('/gemini', async (req, res) => {
 
     const modelName = req.body.model || "gemini-2.5-flash"; 
     
-    // Формируем запрос (собираем текст + файл, если есть)
     const msgParts = [];
     if (userText) msgParts.push(userText);
     
@@ -153,7 +147,7 @@ app.post('/gemini', async (req, res) => {
                 mimeType: req.body.mimeType
             }
         });
-        console.log(`[GEMINI] Прикреплен файл: ${req.body.mimeType}`);
+        console.log(`[GEMINI] Прикреплен медиафайл: ${req.body.mimeType}`);
     }
 
     if (msgParts.length === 0) return res.status(400).json({ok: false, error: "Пустой запрос"});
@@ -161,10 +155,13 @@ app.post('/gemini', async (req, res) => {
     console.log(`[GEMINI] Сообщение. Модель: [${modelName}]. Контекст: [${geminiHistory.length}]`);
 
     try {
-        const model = genAI.getGenerativeModel({ model: modelName });
-        const chat = model.startChat({ history: geminiHistory });
+        // ИСПРАВЛЕНО: ЖЕСТКАЯ СИСТЕМНАЯ ИНСТРУКЦИЯ
+        const model = genAI.getGenerativeModel({ 
+            model: modelName,
+            systemInstruction: "Ты — полезный ИИ-ассистент. Если пользователь присылает тебе аудиофайл или голосовое сообщение, просто выслушай вопрос/информацию, которая там содержится, и дай прямой ответ. НИКОГДА не делай технический или структурный анализ аудиофайла (не пиши про длительность, шумы, пол спикера, перевод и транскрипцию), если только тебя не попросили об этом напрямую. Также используй удобное форматирование Markdown."
+        });
         
-        // Отправляем массив частей (текст + файл)
+        const chat = model.startChat({ history: geminiHistory });
         const result = await chat.sendMessage(msgParts);
         const responseText = result.response.text();
         geminiHistory = await chat.getHistory();
@@ -186,16 +183,13 @@ app.get('/', async (req, res) => {
         res.set('Content-Type', 'application/octet-stream');
         res.set('Content-Disposition', `attachment; filename="${path.basename(nfDlPath)}"`);
         res.set('Content-Length', stats.size);
-        console.log(`[DOWNLOAD] Отдача файла для Google Proxy: ${nfDlPath}`);
         return fs.createReadStream(nfDlPath).pipe(res);
     }
 
     const targetUrl = req.query.url;
-    if (!targetUrl) return res.status(400).send('Укажите URL: ?url=https://example.com');
+    if (!targetUrl) return res.status(400).send('Укажите URL: ?url=[https://example.com](https://example.com)');
 
-    console.log(`\n[START] Запрос URL: ${targetUrl}`);
     const parsedTarget = new URL.URL(targetUrl);
-
     const nfFileId = parsedTarget.searchParams.get('nf_fileId');
     const nfPartName = parsedTarget.searchParams.get('nf_partName');
 
@@ -327,3 +321,4 @@ app.get('/', async (req, res) => {
 });
 
 app.listen(process.env.PORT || 8080);
+                                                                 
