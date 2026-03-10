@@ -63,22 +63,29 @@ if (fs.existsSync(LIMITS_FILE)) {
 }
 
 const originalFetch = global.fetch;
-global.fetch = async (...args) => {
-    const response = await originalFetch(...args);
-    const url = args[0];
+global.fetch = async (input, init) => {
+    const response = await originalFetch(input, init);
     
+    // Безопасно достаем URL из аргументов fetch
+    let url = '';
+    if (typeof input === 'string') url = input;
+    else if (input && input.url) url = input.url; 
+    else if (input && input.href) url = input.href; 
+
     // Если запрос летит к Google API, ловим заголовки
-    if (typeof url === 'string' && url.includes('generativelanguage.googleapis.com/v1beta/models/')) {
-        const match = url.match(/models\/([^:]+):/);
+    if (url && url.includes('generativelanguage.googleapis.com/v1beta/models/')) {
+        const match = url.match(/models\/([^:]+)(?::generateContent|:streamGenerateContent)/);
         if (match && match[1]) {
             const modelId = match[1];
             const limitReq = response.headers.get('x-ratelimit-limit-requests');
             const remainingReq = response.headers.get('x-ratelimit-remaining-requests');
+            const resetReq = response.headers.get('x-ratelimit-reset-requests');
             
             if (limitReq || remainingReq) {
                 geminiLimits[modelId] = {
                     limit: limitReq || '?',
                     remaining: remainingReq || '?',
+                    reset: resetReq || '?',
                     lastUpdated: getKyivTime()
                 };
                 fs.writeFileSync(LIMITS_FILE, JSON.stringify(geminiLimits, null, 2));
@@ -123,7 +130,6 @@ app.post('/gemini', async (req, res) => {
         return res.json({ ok: true, text: respHtml });
     }
 
-    // --- НОВАЯ КОМАНДА: ТАБЛИЦА ЛИМИТОВ ---
     if (userText === '/limit') {
         if (Object.keys(geminiLimits).length === 0) {
             return res.json({ ok: true, text: `📊 <b>Квоты Gemini:</b><br><br>Пока нет данных. Сделайте хотя бы один запрос к ИИ, чтобы сервер перехватил заголовки с вашими лимитами.` });
@@ -133,14 +139,16 @@ app.post('/gemini', async (req, res) => {
                 <th style="padding:4px; border:1px solid #ccc;">Модель</th>
                 <th style="padding:4px; border:1px solid #ccc;">Лимит</th>
                 <th style="padding:4px; border:1px solid #ccc;">Остаток</th>
+                <th style="padding:4px; border:1px solid #ccc;">Сброс (сек)</th>
                 <th style="padding:4px; border:1px solid #ccc;">Обновление</th>
             </tr>`;
         for (const [model, data] of Object.entries(geminiLimits)) {
-            const remColor = parseInt(data.remaining) < 10 ? '#dc3545' : '#28a745'; // Красный если мало, зеленый если много
+            const remColor = parseInt(data.remaining) < 10 ? '#dc3545' : '#28a745'; 
             tableHtml += `<tr>
                 <td style="padding:4px; border:1px solid #ccc; font-weight:bold;">${model}</td>
                 <td style="padding:4px; border:1px solid #ccc; text-align:center;">${data.limit}</td>
                 <td style="padding:4px; border:1px solid #ccc; text-align:center; font-weight:bold; color:${remColor};">${data.remaining}</td>
+                <td style="padding:4px; border:1px solid #ccc; text-align:center;">${data.reset}</td>
                 <td style="padding:4px; border:1px solid #ccc; text-align:center; color:#666;">${data.lastUpdated}</td>
             </tr>`;
         }
@@ -201,9 +209,22 @@ app.post('/gemini', async (req, res) => {
         try {
             const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_API_KEY}`;
             const response = await axios.get(url);
+            
+            // Список моделей с нулевыми лимитами (на бесплатном тарифе)
+            const zeroLimitModels = [
+                'gemini-2.5-pro',
+                'gemini-2-flash', 
+                'gemini-3.1-pro'
+            ];
+
             const models = response.data.models
                 .filter(m => m.supportedGenerationMethods.includes('generateContent'))
+                .filter(m => {
+                    const id = m.name.replace('models/', '');
+                    return !zeroLimitModels.some(zeroId => id.includes(zeroId));
+                })
                 .map(m => ({ id: m.name.replace('models/', ''), name: m.displayName }));
+                
             return res.json({ ok: true, models: models });
         } catch (err) { return res.status(500).json({ ok: false, error: err.message }); }
     }
@@ -234,11 +255,15 @@ app.post('/gemini', async (req, res) => {
     console.log(`[GEMINI] Запрос к ИИ. Модель: [${modelName}]. Контекст в памяти: [${geminiHistory.length} сообщений]`);
 
     try {
-        const model = genAI.getGenerativeModel({ 
-            model: modelName,
-            systemInstruction: "Ты — полезный ИИ-ассистент. Если пользователь присылает тебе аудиофайл или голосовое сообщение, просто выслушай вопрос/информацию, которая там содержится, и дай прямой ответ. НИКОГДА не делай технический или структурный анализ аудиофайла (не пиши про длительность, шумы, пол спикера, перевод и транскрипцию), если только тебя не попросили об этом напрямую. Также используй удобное форматирование Markdown."
-        });
+        const isGemma = modelName.toLowerCase().includes('gemma');
+        const modelConfig = { model: modelName };
         
+        // Модели Gemma не поддерживают systemInstruction, поэтому применяем только для Gemini
+        if (!isGemma) {
+            modelConfig.systemInstruction = "Ты — полезный ИИ-ассистент. Если пользователь присылает тебе аудиофайл или голосовое сообщение, просто выслушай вопрос/информацию, которая там содержится, и дай прямой ответ. НИКОГДА не делай технический или структурный анализ аудиофайла (не пиши про длительность, шумы, пол спикера, перевод и транскрипцию), если только тебя не попросили об этом напрямую. Также используй удобное форматирование Markdown.";
+        }
+
+        const model = genAI.getGenerativeModel(modelConfig);
         const chat = model.startChat({ history: geminiHistory });
         const result = await chat.sendMessage(msgParts);
         const responseText = result.response.text();
@@ -442,3 +467,4 @@ app.get('/', async (req, res) => {
 });
 
 app.listen(process.env.PORT || 8080);
+                
