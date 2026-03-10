@@ -202,7 +202,6 @@ app.get('/', async (req, res) => {
     const targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).send('Укажите URL: ?url=https://example.com');
 
-    // ВОТ ОНИ: ВОССТАНОВЛЕННЫЕ ЛОГИ ПРОКСИ-СЕРВЕРА
     console.log(`\n[PROXY] Запрос веб-ресурса: ${targetUrl}`);
     const parsedTarget = new URL.URL(targetUrl);
 
@@ -277,6 +276,16 @@ app.get('/', async (req, res) => {
                 }
             }
             
+            // --- НОВОЕ: ЕСЛИ ЗАПРОШЕНО СКАЧИВАНИЕ HTML-СТРАНИЦЫ ---
+            if (req.query.nf_dl_html === 'true') {
+                console.log(`[PROXY] Формирование HTML-страницы для оффлайн скачивания: ${parsedTarget.hostname}`);
+                $('head').prepend(`<base href="${parsedTarget.origin}">`);
+                const hostSafe = parsedTarget.hostname.replace(/[^a-zA-Z0-9.-]/g, '_');
+                res.set('Content-Type', 'application/octet-stream'); // Это заставит GAS скачать ее как файл
+                res.set('Content-Disposition', `attachment; filename="page_${hostSafe}.html"`);
+                return res.send($.html());
+            }
+
             console.log(`[PROXY] Страница ${parsedTarget.hostname} успешно обработана и отправлена клиенту.`);
             res.set('Content-Type', 'text/html; charset=utf-8');
             return res.send($.html());
