@@ -30,6 +30,9 @@ if (GEMINI_API_KEY) {
     genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 }
 
+// ==========================================
+// СИСТЕМА ЛОГИРОВАНИЯ
+// ==========================================
 const MAX_LOG_LINES = 100;
 let serverLogs = [];
 function captureLog(msg) {
@@ -40,6 +43,11 @@ function captureLog(msg) {
 const origLog = console.log; console.log = function(...args) { origLog.apply(console, args); captureLog(util.format(...args)); };
 const origErr = console.error; console.error = function(...args) { origErr.apply(console, args); captureLog("ERROR: " + util.format(...args)); };
 
+console.log("[SYSTEM] Сервер запущен. Система логирования активна.");
+
+// ==========================================
+// МАРШРУТ УПРАВЛЕНИЯ И GEMINI
+// ==========================================
 app.post('/gemini', async (req, res) => {
     if (req.query.token !== PROXY_SECRET) return res.status(403).json({ok: false, error: "Auth failed"});
 
@@ -49,7 +57,7 @@ app.post('/gemini', async (req, res) => {
             const buffer = Buffer.from(req.body.b64, 'base64');
             const savePath = path.join(TMP_DIR, filename);
             fs.writeFileSync(savePath, buffer);
-            console.log(`[UPLOAD] Файл сохранен: ${savePath} (${(buffer.length/1024/1024).toFixed(2)} MB)`);
+            console.log(`[UPLOAD] Файл сохранен на диск сервера: ${savePath} (${(buffer.length/1024/1024).toFixed(2)} MB)`);
             return res.json({ok: true, text: `✅ Файл <b>${filename}</b> загружен!<br>Путь: <code>${savePath}</code>`});
         } catch (err) {
             console.error("[UPLOAD ERROR]", err.message);
@@ -82,6 +90,7 @@ app.post('/gemini', async (req, res) => {
             return res.json({ok: true, text: `⚠️ Файл слишком большой для прокси Google (${mb} МБ). Максимум 15 МБ.<br>Разрежьте его на части:<br><code>!zip -s 14m /tmp/archive.zip ${targetPath}</code>`});
         }
         
+        console.log(`[DOWNLOAD] Подготовлен файл для скачивания: ${targetPath} (${mb} MB)`);
         const fakeUrl = `http://system.local/dl?path=${encodeURIComponent(targetPath)}`;
         const respHtml = `📦 <b>Файл готов (${mb} MB)</b><br><a href="${fakeUrl}" style="display:inline-block; margin-top:8px; padding:8px 12px; background:#28a745; color:white; text-decoration:none; border-radius:5px; font-weight:bold;">📥 Загрузить на телефон</a>`;
         return res.json({ok: true, text: respHtml});
@@ -104,15 +113,15 @@ app.post('/gemini', async (req, res) => {
         const cmd = userText.substring(1).trim();
         if (!cmd) return res.json({ ok: true, text: "⚠️ Введите команду после знака '!'." });
         try {
-            console.log(`[CHATOPS] Выполнение: ${cmd}`);
+            console.log(`[CHATOPS] Выполнение в консоли: ${cmd}`);
             const { stdout, stderr } = await execPromise(cmd, { timeout: 15000 }); 
             let output = stdout;
             if (stderr) output += `\n[STDERR]:\n${stderr}`;
-            if (!output) output = "[Выполнено успешно]";
+            if (!output) output = "[Выполнено успешно, вывода нет]";
             if (output.length > 3000) output = output.substring(0, 3000) + "\n...[ВЫВОД ОБРЕЗАН]...";
             return res.json({ ok: true, text: `<b>$</b> <code>${cmd}</code><br><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#1e1e1e; color:#00ff00; padding:8px; border-radius:5px; margin-top:5px; white-space:pre-wrap;">${output}</div>` });
         } catch (err) {
-            console.error(`[CHATOPS] Ошибка: ${cmd}`, err.message);
+            console.error(`[CHATOPS] Ошибка выполнения: ${cmd}`, err.message);
             return res.json({ ok: true, text: `<b>$</b> <code>${cmd}</code><br><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#3b1313; color:#ff6b6b; padding:8px; border-radius:5px; margin-top:5px; white-space:pre-wrap;">${err.message}</div>` });
         }
     }
@@ -132,6 +141,7 @@ app.post('/gemini', async (req, res) => {
 
     if (req.body.clear === 'true') {
         geminiHistory = [];
+        console.log("[GEMINI] Память контекста нейросети очищена.");
         if (userText === 'clear') return res.json({ok: true, text: "История очищена"});
     }
 
@@ -147,15 +157,14 @@ app.post('/gemini', async (req, res) => {
                 mimeType: req.body.mimeType
             }
         });
-        console.log(`[GEMINI] Прикреплен медиафайл: ${req.body.mimeType}`);
+        console.log(`[GEMINI] К запросу прикреплен медиафайл: ${req.body.mimeType}`);
     }
 
     if (msgParts.length === 0) return res.status(400).json({ok: false, error: "Пустой запрос"});
 
-    console.log(`[GEMINI] Сообщение. Модель: [${modelName}]. Контекст: [${geminiHistory.length}]`);
+    console.log(`[GEMINI] Запрос к ИИ. Модель: [${modelName}]. Контекст в памяти: [${geminiHistory.length} сообщений]`);
 
     try {
-        // ИСПРАВЛЕНО: ЖЕСТКАЯ СИСТЕМНАЯ ИНСТРУКЦИЯ
         const model = genAI.getGenerativeModel({ 
             model: modelName,
             systemInstruction: "Ты — полезный ИИ-ассистент. Если пользователь присылает тебе аудиофайл или голосовое сообщение, просто выслушай вопрос/информацию, которая там содержится, и дай прямой ответ. НИКОГДА не делай технический или структурный анализ аудиофайла (не пиши про длительность, шумы, пол спикера, перевод и транскрипцию), если только тебя не попросили об этом напрямую. Также используй удобное форматирование Markdown."
@@ -172,6 +181,9 @@ app.post('/gemini', async (req, res) => {
     }
 });
 
+// ==========================================
+// ОСНОВНОЙ ПРОКСИ
+// ==========================================
 app.get('/', async (req, res) => {
     const reqToken = req.query.token;
     if (reqToken !== PROXY_SECRET) return res.status(403).send('Forbidden: Access Denied.');
@@ -183,13 +195,17 @@ app.get('/', async (req, res) => {
         res.set('Content-Type', 'application/octet-stream');
         res.set('Content-Disposition', `attachment; filename="${path.basename(nfDlPath)}"`);
         res.set('Content-Length', stats.size);
+        console.log(`[DOWNLOAD] Отдача запрошенного файла: ${nfDlPath}`);
         return fs.createReadStream(nfDlPath).pipe(res);
     }
 
     const targetUrl = req.query.url;
-    if (!targetUrl) return res.status(400).send('Укажите URL: ?url=[https://example.com](https://example.com)');
+    if (!targetUrl) return res.status(400).send('Укажите URL: ?url=https://example.com');
 
+    // ВОТ ОНИ: ВОССТАНОВЛЕННЫЕ ЛОГИ ПРОКСИ-СЕРВЕРА
+    console.log(`\n[PROXY] Запрос веб-ресурса: ${targetUrl}`);
     const parsedTarget = new URL.URL(targetUrl);
+
     const nfFileId = parsedTarget.searchParams.get('nf_fileId');
     const nfPartName = parsedTarget.searchParams.get('nf_partName');
 
@@ -201,6 +217,7 @@ app.get('/', async (req, res) => {
         res.set('Content-Type', 'application/octet-stream');
         res.set('Content-Disposition', `attachment; filename="${nfPartName}"`);
         res.set('Content-Length', stats.size);
+        console.log(`[PROXY] Отдача части архива: ${nfPartName}`);
         return fs.createReadStream(partPath).pipe(res);
     }
 
@@ -218,6 +235,7 @@ app.get('/', async (req, res) => {
         });
         
         if ([401, 403, 406, 429, 503].includes(response.status)) {
+            console.warn(`[PROXY WARNING] Целевой сайт заблокировал запрос (Код ${response.status})`);
             res.set('Content-Type', 'text/html; charset=utf-8');
             return res.status(200).send(`<!DOCTYPE html><html><body style="font-family:sans-serif; text-align:center; padding:40px;"><h2 style="color:#dc3545;">🚫 Защита от ботов (Код: ${response.status})</h2></body></html>`);
         }
@@ -228,9 +246,15 @@ app.get('/', async (req, res) => {
             let chunks = []; let htmlBytes = 0;
             for await (const chunk of response.data) {
                 chunks.push(chunk); htmlBytes += chunk.length;
-                if (htmlBytes > 20 * 1024 * 1024) { response.data.destroy(); return res.status(400).send("Слишком тяжелая страница."); }
+                if (htmlBytes > 20 * 1024 * 1024) { 
+                    response.data.destroy(); 
+                    console.error(`[PROXY ERROR] Страница превысила лимит HTML в 20MB!`);
+                    return res.status(400).send("Слишком тяжелая страница."); 
+                }
             }
             const html = Buffer.concat(chunks).toString('utf-8');
+            console.log(`[PROXY] HTML загружен (${(htmlBytes/1024).toFixed(1)} KB). Парсинг стилей и изображений...`);
+            
             const $ = cheerio.load(html);
             const baseUrl = parsedTarget.origin;
 
@@ -252,11 +276,14 @@ app.get('/', async (req, res) => {
                     } catch (e) {}
                 }
             }
+            
+            console.log(`[PROXY] Страница ${parsedTarget.hostname} успешно обработана и отправлена клиенту.`);
             res.set('Content-Type', 'text/html; charset=utf-8');
             return res.send($.html());
         } 
         
         else {
+            console.log(`[PROXY] Обнаружен файл (${contentType}). Начинается загрузка на жесткий диск...`);
             const fileId = crypto.randomUUID();
             const fileDir = path.join(TMP_DIR, fileId);
             fs.mkdirSync(fileDir, { recursive: true });
@@ -276,32 +303,46 @@ app.get('/', async (req, res) => {
                 response.data.pipe(writer);
                 response.data.on('data', (chunk) => {
                     downloadedBytes += chunk.length;
-                    if (downloadedBytes > MAX_FILE_SIZE && !isTooLarge) { isTooLarge = true; response.data.destroy(); writer.close(); reject(new Error("FILE_TOO_LARGE")); }
+                    if (downloadedBytes > MAX_FILE_SIZE && !isTooLarge) { 
+                        isTooLarge = true; 
+                        response.data.destroy(); 
+                        writer.close(); 
+                        reject(new Error("FILE_TOO_LARGE")); 
+                    }
                 });
                 writer.on('close', resolve);
                 writer.on('error', reject);
             }).catch(err => { if (err.message !== "FILE_TOO_LARGE") throw err; });
 
             if (isTooLarge) {
+                console.warn(`[PROXY] Файл превысил жесткий лимит скачивания (${MAX_FILE_SIZE/1024/1024} МБ). Операция прервана.`);
                 fs.rmSync(fileDir, { recursive: true, force: true });
                 res.set('Content-Type', 'text/html; charset=utf-8');
                 return res.status(200).send(`<h2>🐘 Файл больше ${MAX_FILE_SIZE/1024/1024} МБ.</h2>`);
             }
 
+            console.log(`[PROXY] Файл успешно скачан. Размер: ${(downloadedBytes/1024/1024).toFixed(2)} MB`);
             setTimeout(() => { try { fs.rmSync(fileDir, { recursive: true, force: true }); } catch(e) {} }, 2 * 60 * 60 * 1000);
 
             if (downloadedBytes <= CHUNK_SIZE_MB * 1024 * 1024) {
+                console.log(`[PROXY] Файл маленький, стримим напрямую клиенту.`);
                 res.set('Content-Type', contentType);
                 res.set('Content-Disposition', `attachment; filename="${fileName}"`);
                 return fs.createReadStream(filePath).pipe(res);
             } else {
+                console.log(`[PROXY] Файл больше ${CHUNK_SIZE_MB} МБ. Запущена упаковка в ZIP архив...`);
                 const zipBaseName = safeName + '.zip';
                 try { await execPromise(`cd "${fileDir}" && zip -s ${CHUNK_SIZE_MB}m "${zipBaseName}" "${safeName}"`); } 
-                catch (zipErr) { return res.status(500).send("Ошибка архивации"); }
+                catch (zipErr) { 
+                    console.error(`[PROXY ERROR] Ошибка создания ZIP архива: ${zipErr.message}`);
+                    return res.status(500).send("Ошибка архивации"); 
+                }
+                
                 fs.unlinkSync(filePath);
-
                 const filesInDir = fs.readdirSync(fileDir);
                 const archiveParts = filesInDir.filter(f => f.startsWith(safeName + '.')).sort(); 
+                
+                console.log(`[PROXY] Архив успешно создан. Состоит из ${archiveParts.length} частей.`);
 
                 let buttonsHtml = ''; let totalCompressedBytes = 0; 
                 archiveParts.forEach((partName) => {
@@ -317,8 +358,10 @@ app.get('/', async (req, res) => {
                 return res.status(200).send(`<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1.0"></head><body style="background:#f0f2f5; display:flex; justify-content:center; padding:20px; font-family:sans-serif;"><div style="background:white; padding:25px; border-top:5px solid #1a73e8; border-radius:10px; text-align:center; width:100%; max-width:400px; box-shadow:0 4px 10px rgba(0,0,0,0.1);"><h2 style="margin-top:0;">📦 Объемный архив</h2><p style="font-size:14px; margin-bottom:5px;">Оригинал: ${origMB} МБ</p><p style="font-size:14px; margin-top:0; margin-bottom:15px;">${savingsHtml}</p><div style="background:#fff3cd; color:#856404; padding:10px; border-radius:5px; font-size:12px; text-align:left; margin-bottom:15px;">Распакуйте файл <b>.zip</b> в ZArchiver.</div>${buttonsHtml}</div></body></html>`);
             }
         }
-    } catch (error) { res.status(500).send(`Ошибка шлюза: ${error.message}`); }
+    } catch (error) { 
+        console.error(`[PROXY ERROR] Ошибка шлюза при обработке ${targetUrl}:`, error.message);
+        res.status(500).send(`Ошибка шлюза: ${error.message}`); 
+    }
 });
 
 app.listen(process.env.PORT || 8080);
-                                                                 
