@@ -43,6 +43,7 @@ const origErr = console.error; console.error = function(...args) { origErr.apply
 app.post('/gemini', async (req, res) => {
     if (req.query.token !== PROXY_SECRET) return res.status(403).json({ok: false, error: "Auth failed"});
 
+    // --- ЗАГРУЗКА НА СЕРВЕР (Кнопка 💻) ---
     if (req.body.action === 'upload') {
         try {
             const filename = req.body.filename.replace(/[^a-zA-Z0-9.\-_]/g, '_');
@@ -50,7 +51,7 @@ app.post('/gemini', async (req, res) => {
             const savePath = path.join(TMP_DIR, filename);
             fs.writeFileSync(savePath, buffer);
             console.log(`[UPLOAD] Файл сохранен: ${savePath} (${(buffer.length/1024/1024).toFixed(2)} MB)`);
-            return res.json({ok: true, text: `✅ Файл <b>${filename}</b> загружен!<br>Путь: <code>${savePath}</code>`});
+            return res.json({ok: true, text: `✅ Файл <b>${filename}</b> загружен на сервер!<br>Путь: <code>${savePath}</code>`});
         } catch (err) {
             console.error("[UPLOAD ERROR]", err.message);
             return res.status(500).json({ok: false, error: err.message});
@@ -63,15 +64,16 @@ app.post('/gemini', async (req, res) => {
         const respHtml = `🤖 <b>СИСТЕМА CHATOPS:</b><br><br>
         <code>/status</code> — Состояние сервера<br>
         <code>/logs</code> — Логи Northflank<br>
-        <code>/download [путь]</code> — Скачать файл (до 15 МБ)<br>
-        <i>*Используйте кнопку 📎 для загрузки файлов на сервер.</i><br><br>
+        <code>/download [путь]</code> — Скачать файл (до 15 МБ)<br><br>
+        📁 <b>Работа с файлами:</b><br>
+        Кнопка [💻] — Загрузить файл на диск сервера.<br>
+        Кнопка [📎] — Отправить файл в чат (Telegram или Gemini на анализ).<br><br>
         💻 <b>Терминал:</b><br>
         <code>! [команда]</code> — Консоль Linux<br>
         <i>Пример: <code>!ls -la /tmp</code></i>`;
         return res.json({ ok: true, text: respHtml });
     }
 
-    // --- ИСПРАВЛЕННЫЙ ОБРАБОТЧИК СКАЧИВАНИЯ ---
     if (userText.startsWith('/download ')) {
         const targetPath = userText.substring(10).trim();
         if (!fs.existsSync(targetPath)) return res.json({ok: true, text: `❌ Файл не найден: <code>${targetPath}</code>`});
@@ -84,7 +86,6 @@ app.post('/gemini', async (req, res) => {
             return res.json({ok: true, text: `⚠️ Файл слишком большой для прокси Google (${mb} МБ). Максимум 15 МБ.<br>Разрежьте его на части:<br><code>!zip -s 14m /tmp/archive.zip ${targetPath}</code>`});
         }
         
-        // Возвращаем надежную ссылку, которую перехватит Google Apps Script
         const fakeUrl = `http://system.local/dl?path=${encodeURIComponent(targetPath)}`;
         const respHtml = `📦 <b>Файл готов (${mb} MB)</b><br><a href="${fakeUrl}" style="display:inline-block; margin-top:8px; padding:8px 12px; background:#28a745; color:white; text-decoration:none; border-radius:5px; font-weight:bold;">📥 Загрузить на телефон</a>`;
         return res.json({ok: true, text: respHtml});
@@ -120,6 +121,7 @@ app.post('/gemini', async (req, res) => {
         }
     }
 
+    // --- ОБРАЩЕНИЕ К ИИ (ТЕПЕРЬ С ПОДДЕРЖКОЙ ФАЙЛОВ) ---
     if (!GEMINI_API_KEY) return res.status(500).json({ok: false, error: "Отсутствует GEMINI_API_KEY на сервере"});
 
     if (req.body.action === 'get_models') {
@@ -139,12 +141,31 @@ app.post('/gemini', async (req, res) => {
     }
 
     const modelName = req.body.model || "gemini-2.5-flash"; 
+    
+    // Формируем запрос (собираем текст + файл, если есть)
+    const msgParts = [];
+    if (userText) msgParts.push(userText);
+    
+    if (req.body.b64 && req.body.mimeType) {
+        msgParts.push({
+            inlineData: {
+                data: req.body.b64,
+                mimeType: req.body.mimeType
+            }
+        });
+        console.log(`[GEMINI] Прикреплен файл: ${req.body.mimeType}`);
+    }
+
+    if (msgParts.length === 0) return res.status(400).json({ok: false, error: "Пустой запрос"});
+
     console.log(`[GEMINI] Сообщение. Модель: [${modelName}]. Контекст: [${geminiHistory.length}]`);
 
     try {
         const model = genAI.getGenerativeModel({ model: modelName });
         const chat = model.startChat({ history: geminiHistory });
-        const result = await chat.sendMessage(userText);
+        
+        // Отправляем массив частей (текст + файл)
+        const result = await chat.sendMessage(msgParts);
         const responseText = result.response.text();
         geminiHistory = await chat.getHistory();
         return res.json({ ok: true, text: responseText });
@@ -306,4 +327,3 @@ app.get('/', async (req, res) => {
 });
 
 app.listen(process.env.PORT || 8080);
-        
