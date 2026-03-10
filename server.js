@@ -13,8 +13,10 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 const app = express();
 app.use(compression());
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
+
+// ВАЖНО: Увеличиваем лимиты Express для приема файлов (до 50 МБ)
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+app.use(express.json({ limit: '50mb' }));
 
 const MAX_FILE_SIZE = 130 * 1024 * 1024;
 const CHUNK_SIZE_MB = 15; 
@@ -30,48 +32,69 @@ if (GEMINI_API_KEY) {
     genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 }
 
-// ==========================================
-// СИСТЕМА ЛОГИРОВАНИЯ (В ПАМЯТЬ СЕРВЕРА)
-// ==========================================
+// СИСТЕМА ЛОГИРОВАНИЯ
 const MAX_LOG_LINES = 100;
 let serverLogs = [];
-
 function captureLog(msg) {
     const time = new Date().toISOString().substring(11, 19); 
     serverLogs.push(`[${time}] ${msg}`);
     if (serverLogs.length > MAX_LOG_LINES) serverLogs.shift();
 }
-
-const origLog = console.log;
-console.log = function(...args) {
-    origLog.apply(console, args);
-    captureLog(util.format(...args));
-};
-
-const origErr = console.error;
-console.error = function(...args) {
-    origErr.apply(console, args);
-    captureLog("ERROR: " + util.format(...args));
-};
+const origLog = console.log; console.log = function(...args) { origLog.apply(console, args); captureLog(util.format(...args)); };
+const origErr = console.error; console.error = function(...args) { origErr.apply(console, args); captureLog("ERROR: " + util.format(...args)); };
 
 // ==========================================
-// МАРШРУТ GEMINI (И CHATOPS: УПРАВЛЕНИЕ СЕРВЕРОМ)
+// МАРШРУТ УПРАВЛЕНИЯ И GEMINI
 // ==========================================
 app.post('/gemini', async (req, res) => {
     if (req.query.token !== PROXY_SECRET) return res.status(403).json({ok: false, error: "Auth failed"});
-    
-    // Перехват системных команд ДО проверки ключа Gemini (чтобы терминал работал даже без ИИ)
+
+    // --- ОБРАБОТЧИК ЗАГРУЗКИ ФАЙЛА НА СЕРВЕР (/upload) ---
+    if (req.body.action === 'upload') {
+        try {
+            const filename = req.body.filename.replace(/[^a-zA-Z0-9.\-_]/g, '_');
+            const buffer = Buffer.from(req.body.b64, 'base64');
+            const savePath = path.join(TMP_DIR, filename);
+            fs.writeFileSync(savePath, buffer);
+            console.log(`[UPLOAD] Файл сохранен: ${savePath} (${(buffer.length/1024/1024).toFixed(2)} MB)`);
+            return res.json({ok: true, text: `✅ Файл <b>${filename}</b> загружен на сервер!<br>Путь: <code>${savePath}</code>`});
+        } catch (err) {
+            console.error("[UPLOAD ERROR]", err.message);
+            return res.status(500).json({ok: false, error: err.message});
+        }
+    }
+
     const userText = req.body.text ? req.body.text.trim() : "";
     
+    // --- СИСТЕМНЫЕ КОМАНДЫ ---
     if (userText === '/help') {
-        const respHtml = `🤖 <b>Доступные системные команды:</b><br><br>
-        <code>/status</code> — Состояние сервера (uptime, RAM, память ИИ)<br>
-        <code>/logs</code> — Последние 100 строк логов Northflank<br>
-        <code>/help</code> — Это меню<br><br>
+        const respHtml = `🤖 <b>СИСТЕМА CHATOPS:</b><br><br>
+        <code>/status</code> — Состояние сервера<br>
+        <code>/logs</code> — Логи Northflank<br>
+        <code>/download [путь]</code> — Скачать файл с сервера (до 15МБ)<br>
+        <i>*Используйте кнопку 📎 для загрузки файлов на сервер.</i><br><br>
         💻 <b>Терминал:</b><br>
-        <code>! [команда]</code> — Выполнить команду в консоли контейнера<br>
-        <i>Примеры: <code>!ls -la</code>, <code>!df -h</code>, <code>!pwd</code></i>`;
+        <code>! [команда]</code> — Консоль Linux<br>
+        <i>Пример: <code>!ls -la /tmp</code></i>`;
         return res.json({ ok: true, text: respHtml });
+    }
+
+    // --- ОБРАБОТЧИК СКАЧИВАНИЯ ФАЙЛА С СЕРВЕРА (/download) ---
+    if (userText.startsWith('/download ')) {
+        const targetPath = userText.substring(10).trim();
+        if (!fs.existsSync(targetPath)) return res.json({ok: true, text: `❌ Файл не найден: <code>${targetPath}</code>`});
+        const stat = fs.statSync(targetPath);
+        if (stat.isDirectory()) return res.json({ok: true, text: `❌ Это папка. Сначала запакуйте её:<br><code>!zip -r /tmp/dir.zip ${targetPath}</code>`});
+
+        const mb = (stat.size / 1024 / 1024).toFixed(2);
+        if (stat.size > 20 * 1024 * 1024) {
+            return res.json({ok: true, text: `⚠️ Файл слишком большой для прямой загрузки (${mb} МБ).<br>Разрежьте его на сервере:<br><code>!zip -s 15m /tmp/archive.zip ${targetPath}</code>`});
+        }
+
+        // Генерируем внутреннюю ссылку-крючок для Google Proxy
+        const fakeUrl = `http://system.local/dl?path=${encodeURIComponent(targetPath)}`;
+        const respHtml = `📦 <b>Файл готов (${mb} MB)</b><br><a href="${fakeUrl}" target="_blank" style="display:inline-block; margin-top:8px; padding:8px 12px; background:#28a745; color:white; text-decoration:none; border-radius:5px; font-weight:bold;">📥 Нажмите, чтобы скачать</a>`;
+        return res.json({ok: true, text: respHtml});
     }
 
     if (userText === '/logs') {
@@ -85,40 +108,31 @@ app.post('/gemini', async (req, res) => {
         const uptime = Math.floor(process.uptime());
         const hours = Math.floor(uptime / 3600);
         const mins = Math.floor((uptime % 3600) / 60);
-        const respHtml = `🖥 <b>Статус контейнера:</b><br>⏱ Uptime: <b>${hours}ч ${mins}м</b><br>💾 Память (RSS): <b>${(mem.rss / 1024 / 1024).toFixed(1)} MB</b><br>🧠 Контекст ИИ в памяти: <b>${geminiHistory.length} сообщений</b>`;
+        const respHtml = `🖥 <b>Статус контейнера:</b><br>⏱ Uptime: <b>${hours}ч ${mins}м</b><br>💾 Память (RSS): <b>${(mem.rss / 1024 / 1024).toFixed(1)} MB</b><br>🧠 Контекст ИИ: <b>${geminiHistory.length} сообщений</b>`;
         return res.json({ ok: true, text: respHtml });
     }
 
-    // --- ПРОИЗВОЛЬНЫЕ КОМАНДЫ ТЕРМИНАЛА ---
     if (userText.startsWith('!')) {
         const cmd = userText.substring(1).trim();
         if (!cmd) return res.json({ ok: true, text: "⚠️ Введите команду после знака '!'." });
-        
         try {
             console.log(`[CHATOPS] Выполнение: ${cmd}`);
-            // Таймаут 15 секунд, чтобы команда не "повесила" сервер
             const { stdout, stderr } = await execPromise(cmd, { timeout: 15000 }); 
             let output = stdout;
             if (stderr) output += `\n[STDERR]:\n${stderr}`;
-            if (!output) output = "[Команда выполнена успешно, вывода нет]";
-            
-            // Защита от переполнения чата
+            if (!output) output = "[Выполнено успешно]";
             if (output.length > 3000) output = output.substring(0, 3000) + "\n...[ВЫВОД ОБРЕЗАН]...";
-
-            const respHtml = `<b>$</b> <code>${cmd}</code><br><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#1e1e1e; color:#00ff00; padding:8px; border-radius:5px; margin-top:5px; white-space:pre-wrap;">${output}</div>`;
-            return res.json({ ok: true, text: respHtml });
+            return res.json({ ok: true, text: `<b>$</b> <code>${cmd}</code><br><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#1e1e1e; color:#00ff00; padding:8px; border-radius:5px; margin-top:5px; white-space:pre-wrap;">${output}</div>` });
         } catch (err) {
             console.error(`[CHATOPS] Ошибка: ${cmd}`, err.message);
-            const errHtml = `<b>$</b> <code>${cmd}</code><br><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#3b1313; color:#ff6b6b; padding:8px; border-radius:5px; margin-top:5px; white-space:pre-wrap;">${err.message}</div>`;
-            return res.json({ ok: true, text: errHtml });
+            return res.json({ ok: true, text: `<b>$</b> <code>${cmd}</code><br><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#3b1313; color:#ff6b6b; padding:8px; border-radius:5px; margin-top:5px; white-space:pre-wrap;">${err.message}</div>` });
         }
     }
 
-    // --- ОБРАЩЕНИЕ К ИИ (ТОЛЬКО ЕСЛИ ЭТО НЕ КОМАНДА) ---
+    // --- ОБРАЩЕНИЕ К ИИ ---
     if (!GEMINI_API_KEY) return res.status(500).json({ok: false, error: "Отсутствует GEMINI_API_KEY на сервере"});
 
     if (req.body.action === 'get_models') {
-        console.log("[GEMINI] Запрос актуального списка моделей от Google API...");
         try {
             const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_API_KEY}`;
             const response = await axios.get(url);
@@ -126,35 +140,26 @@ app.post('/gemini', async (req, res) => {
                 .filter(m => m.supportedGenerationMethods.includes('generateContent'))
                 .map(m => ({ id: m.name.replace('models/', ''), name: m.displayName }));
             return res.json({ ok: true, models: models });
-        } catch (err) {
-            console.error("[GEMINI ERROR] Ошибка получения списка моделей:", err.message);
-            return res.status(500).json({ ok: false, error: err.message });
-        }
+        } catch (err) { return res.status(500).json({ ok: false, error: err.message }); }
     }
 
     if (req.body.clear === 'true') {
         geminiHistory = [];
-        console.log("[GEMINI] Память контекста нейросети успешно очищена.");
         if (userText === 'clear') return res.json({ok: true, text: "История очищена"});
     }
 
     const modelName = req.body.model || "gemini-2.5-flash"; 
-    
-    console.log(`[GEMINI] Входящее сообщение. Модель: [${modelName}]. Контекст в памяти: [${geminiHistory.length} сообщений]`);
+    console.log(`[GEMINI] Сообщение. Модель: [${modelName}]. Контекст: [${geminiHistory.length}]`);
 
     try {
         const model = genAI.getGenerativeModel({ model: modelName });
         const chat = model.startChat({ history: geminiHistory });
-        
         const result = await chat.sendMessage(userText);
         const responseText = result.response.text();
-        
         geminiHistory = await chat.getHistory();
-        console.log(`[GEMINI] Ответ успешно сгенерирован и отправлен пользователю.`);
-        
         return res.json({ ok: true, text: responseText });
     } catch (err) {
-        console.error("[GEMINI ERROR] Сбой генерации ответа:", err.message);
+        console.error("[GEMINI ERROR]", err.message);
         return res.status(500).json({ ok: false, error: err.message });
     }
 });
@@ -172,6 +177,17 @@ app.get('/', async (req, res) => {
     console.log(`\n[START] Запрос URL: ${targetUrl}`);
     const parsedTarget = new URL.URL(targetUrl);
 
+    // ПЕРЕХВАТ ЛОКАЛЬНОГО СКАЧИВАНИЯ (/download)
+    if (targetUrl.startsWith('http://system.local/dl')) {
+        const dlPath = parsedTarget.searchParams.get('path');
+        if (!fs.existsSync(dlPath)) return res.status(404).send("File not found on Northflank");
+        const stat = fs.statSync(dlPath);
+        res.set('Content-Type', 'application/octet-stream');
+        res.set('Content-Disposition', `attachment; filename="${path.basename(dlPath)}"`);
+        res.set('Content-Length', stat.size);
+        return fs.createReadStream(dlPath).pipe(res);
+    }
+
     const nfFileId = parsedTarget.searchParams.get('nf_fileId');
     const nfPartName = parsedTarget.searchParams.get('nf_partName');
 
@@ -179,7 +195,6 @@ app.get('/', async (req, res) => {
         if (nfPartName.includes('/') || nfPartName.includes('\\') || nfFileId.includes('/')) return res.status(400).send("Bad path.");
         const partPath = path.join(TMP_DIR, nfFileId, nfPartName);
         if (!fs.existsSync(partPath)) return res.status(404).send("<meta charset='utf-8'><h3>⏳ Кэш истек. Начните заново.</h3>");
-        
         const stats = fs.statSync(partPath);
         res.set('Content-Type', 'application/octet-stream');
         res.set('Content-Disposition', `attachment; filename="${nfPartName}"`);
