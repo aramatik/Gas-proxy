@@ -148,15 +148,8 @@ app.post('/gemini', async (req, res) => {
     const userText = req.body.text ? req.body.text.trim() : "";
     
     if (userText === '/help') {
-        const respHtml = `🤖 <b>СИСТЕМА CHATOPS:</b><br><br>
-        <code>/status</code> — Состояние сервера<br>
-        <code>/limit</code> — Состояние моделей (Блокировки)<br>
-        <code>/logs</code> — Логи Northflank<br>
-        <code>/download [путь]</code> — Скачать файл (до 15 МБ)<br>
-        <code>/upload</code> — Загрузить файл на сервер<br><br>
-        💻 <b>Терминал:</b><br>
-        <code>! [команда]</code> — Консоль Linux<br>
-        <i>Пример: <code>!ls -la /tmp</code></i>`;
+        // Убрали переносы строк из шаблона, чтобы frontend не накидал <br> тегов
+        const respHtml = `🤖 <b>СИСТЕМА CHATOPS:</b><br><br><code>/status</code> — Состояние сервера<br><code>/limit</code> — Состояние моделей (Блокировки)<br><code>/logs</code> — Логи Northflank<br><code>/download [путь]</code> — Скачать файл (до 15 МБ)<br><code>/upload</code> — Загрузить файл на сервер<br><br>💻 <b>Терминал:</b><br><code>! [команда]</code> — Консоль Linux<br><i>Пример: <code>!ls -la /tmp</code></i>`;
         return res.json({ ok: true, text: respHtml });
     }
 
@@ -164,23 +157,11 @@ app.post('/gemini', async (req, res) => {
         if (Object.keys(geminiLimits).length === 0) {
             return res.json({ ok: true, text: `📊 <b>Состояние API-моделей:</b><br><br>Google больше не передает остаток лимитов заранее. Сервер узнает точный лимит только при достижении потолка (ошибке 429). Сделайте запрос к ИИ, чтобы начать отслеживание статуса.` });
         }
-        let tableHtml = `<table style="width:100%; border-collapse:collapse; font-size:11px; margin-top:5px; background:#fff; color:#333;">
-            <tr style="background:#1a73e8; color:white;">
-                <th style="padding:4px; border:1px solid #ccc;">Модель</th>
-                <th style="padding:4px; border:1px solid #ccc;">Статус</th>
-                <th style="padding:4px; border:1px solid #ccc;">Макс.</th>
-                <th style="padding:4px; border:1px solid #ccc;">Сброс</th>
-                <th style="padding:4px; border:1px solid #ccc;">Обновлено</th>
-            </tr>`;
+        // Таблица записана в одну строку, чтобы избежать лишних переносов строк (которые превращаются в <br>)
+        let tableHtml = `<table style="width:100%; border-collapse:collapse; font-size:11px; margin-top:5px; background:#fff; color:#333;"><tr style="background:#1a73e8; color:white;"><th style="padding:4px; border:1px solid #ccc;">Модель</th><th style="padding:4px; border:1px solid #ccc;">Статус</th><th style="padding:4px; border:1px solid #ccc;">Макс.</th><th style="padding:4px; border:1px solid #ccc;">Сброс</th><th style="padding:4px; border:1px solid #ccc;">Обновлено</th></tr>`;
         for (const [model, data] of Object.entries(geminiLimits)) {
             const statusColor = data.status === 'OK' ? '#28a745' : '#dc3545'; 
-            tableHtml += `<tr>
-                <td style="padding:4px; border:1px solid #ccc; font-weight:bold;">${model}</td>
-                <td style="padding:4px; border:1px solid #ccc; text-align:center; font-weight:bold; color:${statusColor};">${data.status}</td>
-                <td style="padding:4px; border:1px solid #ccc; text-align:center;">${data.limit}</td>
-                <td style="padding:4px; border:1px solid #ccc; text-align:center;">${data.reset}</td>
-                <td style="padding:4px; border:1px solid #ccc; text-align:center; color:#666;">${data.lastUpdated}</td>
-            </tr>`;
+            tableHtml += `<tr><td style="padding:4px; border:1px solid #ccc; font-weight:bold;">${model}</td><td style="padding:4px; border:1px solid #ccc; text-align:center; font-weight:bold; color:${statusColor};">${data.status}</td><td style="padding:4px; border:1px solid #ccc; text-align:center;">${data.limit}</td><td style="padding:4px; border:1px solid #ccc; text-align:center;">${data.reset}</td><td style="padding:4px; border:1px solid #ccc; text-align:center; color:#666;">${data.lastUpdated}</td></tr>`;
         }
         tableHtml += `</table>`;
         return res.json({ ok: true, text: `📊 <b>Мониторинг блокировок:</b><br>${tableHtml}` });
@@ -239,23 +220,9 @@ app.post('/gemini', async (req, res) => {
         try {
             const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_API_KEY}`;
             const response = await axios.get(url);
-            
-            // Жесткий список "мертвых" моделей и устаревших
-            const zeroLimitModels = [
-                'gemini-2.5-pro',
-                'gemini-2-flash', 
-                'gemini-3.1-pro',
-                'bison',
-                'gecko'
-            ];
 
             const models = response.data.models
                 .filter(m => m.supportedGenerationMethods.includes('generateContent'))
-                .filter(m => {
-                    const id = m.name.replace('models/', '');
-                    // Если ID модели содержит строку из черного списка - выбрасываем
-                    return !zeroLimitModels.some(zeroId => id.includes(zeroId));
-                })
                 .map(m => ({ id: m.name.replace('models/', ''), name: m.displayName }));
                 
             return res.json({ ok: true, models: models });
@@ -500,4 +467,4 @@ app.get('/', async (req, res) => {
 });
 
 app.listen(process.env.PORT || 8080);
-                
+        
