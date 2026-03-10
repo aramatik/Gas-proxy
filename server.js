@@ -37,12 +37,11 @@ const MAX_LOG_LINES = 100;
 let serverLogs = [];
 
 function captureLog(msg) {
-    const time = new Date().toISOString().substring(11, 19); // Достаем только HH:MM:SS
+    const time = new Date().toISOString().substring(11, 19); 
     serverLogs.push(`[${time}] ${msg}`);
     if (serverLogs.length > MAX_LOG_LINES) serverLogs.shift();
 }
 
-// Перехватываем стандартный вывод Node.js
 const origLog = console.log;
 console.log = function(...args) {
     origLog.apply(console, args);
@@ -56,10 +55,66 @@ console.error = function(...args) {
 };
 
 // ==========================================
-// МАРШРУТ GEMINI (И CHATOPS)
+// МАРШРУТ GEMINI (И CHATOPS: УПРАВЛЕНИЕ СЕРВЕРОМ)
 // ==========================================
 app.post('/gemini', async (req, res) => {
     if (req.query.token !== PROXY_SECRET) return res.status(403).json({ok: false, error: "Auth failed"});
+    
+    // Перехват системных команд ДО проверки ключа Gemini (чтобы терминал работал даже без ИИ)
+    const userText = req.body.text ? req.body.text.trim() : "";
+    
+    if (userText === '/help') {
+        const respHtml = `🤖 <b>Доступные системные команды:</b><br><br>
+        <code>/status</code> — Состояние сервера (uptime, RAM, память ИИ)<br>
+        <code>/logs</code> — Последние 100 строк логов Northflank<br>
+        <code>/help</code> — Это меню<br><br>
+        💻 <b>Терминал:</b><br>
+        <code>! [команда]</code> — Выполнить команду в консоли контейнера<br>
+        <i>Примеры: <code>!ls -la</code>, <code>!df -h</code>, <code>!pwd</code></i>`;
+        return res.json({ ok: true, text: respHtml });
+    }
+
+    if (userText === '/logs') {
+        const logsHtml = serverLogs.length ? serverLogs.join('\n') : "Логи пусты.";
+        const respHtml = `🖥 <b>Логи Northflank:</b><br><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#e0e0e0; color:#333; padding:8px; border-radius:5px; margin-top:5px; white-space:pre-wrap;">${logsHtml}</div>`;
+        return res.json({ ok: true, text: respHtml });
+    }
+    
+    if (userText === '/status') {
+        const mem = process.memoryUsage();
+        const uptime = Math.floor(process.uptime());
+        const hours = Math.floor(uptime / 3600);
+        const mins = Math.floor((uptime % 3600) / 60);
+        const respHtml = `🖥 <b>Статус контейнера:</b><br>⏱ Uptime: <b>${hours}ч ${mins}м</b><br>💾 Память (RSS): <b>${(mem.rss / 1024 / 1024).toFixed(1)} MB</b><br>🧠 Контекст ИИ в памяти: <b>${geminiHistory.length} сообщений</b>`;
+        return res.json({ ok: true, text: respHtml });
+    }
+
+    // --- ПРОИЗВОЛЬНЫЕ КОМАНДЫ ТЕРМИНАЛА ---
+    if (userText.startsWith('!')) {
+        const cmd = userText.substring(1).trim();
+        if (!cmd) return res.json({ ok: true, text: "⚠️ Введите команду после знака '!'." });
+        
+        try {
+            console.log(`[CHATOPS] Выполнение: ${cmd}`);
+            // Таймаут 15 секунд, чтобы команда не "повесила" сервер
+            const { stdout, stderr } = await execPromise(cmd, { timeout: 15000 }); 
+            let output = stdout;
+            if (stderr) output += `\n[STDERR]:\n${stderr}`;
+            if (!output) output = "[Команда выполнена успешно, вывода нет]";
+            
+            // Защита от переполнения чата
+            if (output.length > 3000) output = output.substring(0, 3000) + "\n...[ВЫВОД ОБРЕЗАН]...";
+
+            const respHtml = `<b>$</b> <code>${cmd}</code><br><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#1e1e1e; color:#00ff00; padding:8px; border-radius:5px; margin-top:5px; white-space:pre-wrap;">${output}</div>`;
+            return res.json({ ok: true, text: respHtml });
+        } catch (err) {
+            console.error(`[CHATOPS] Ошибка: ${cmd}`, err.message);
+            const errHtml = `<b>$</b> <code>${cmd}</code><br><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#3b1313; color:#ff6b6b; padding:8px; border-radius:5px; margin-top:5px; white-space:pre-wrap;">${err.message}</div>`;
+            return res.json({ ok: true, text: errHtml });
+        }
+    }
+
+    // --- ОБРАЩЕНИЕ К ИИ (ТОЛЬКО ЕСЛИ ЭТО НЕ КОМАНДА) ---
     if (!GEMINI_API_KEY) return res.status(500).json({ok: false, error: "Отсутствует GEMINI_API_KEY на сервере"});
 
     if (req.body.action === 'get_models') {
@@ -80,31 +135,11 @@ app.post('/gemini', async (req, res) => {
     if (req.body.clear === 'true') {
         geminiHistory = [];
         console.log("[GEMINI] Память контекста нейросети успешно очищена.");
-        if (req.body.text === 'clear') return res.json({ok: true, text: "История очищена"});
+        if (userText === 'clear') return res.json({ok: true, text: "История очищена"});
     }
 
-    const userText = req.body.text ? req.body.text.trim() : "";
     const modelName = req.body.model || "gemini-2.5-flash"; 
     
-    if (!userText) return res.status(400).json({ok: false, error: "Нет текста запроса"});
-
-    // --- СИСТЕМНЫЕ КОМАНДЫ (СЕРВЕР ОТВЕЧАЕТ САМ) ---
-    if (userText === '/logs') {
-        const logsHtml = serverLogs.length ? serverLogs.join('\n') : "Логи пусты.";
-        const respHtml = `🖥 <b>Логи Northflank (последние ${MAX_LOG_LINES} строк):</b><br><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#e0e0e0; padding:8px; border-radius:5px; margin-top:5px; white-space:pre-wrap;">${logsHtml}</div>`;
-        return res.json({ ok: true, text: respHtml });
-    }
-    
-    if (userText === '/status') {
-        const mem = process.memoryUsage();
-        const uptime = Math.floor(process.uptime());
-        const hours = Math.floor(uptime / 3600);
-        const mins = Math.floor((uptime % 3600) / 60);
-        const respHtml = `🖥 <b>Статус контейнера Northflank:</b><br>⏱ Uptime: <b>${hours}ч ${mins}м</b><br>💾 Память (RSS): <b>${(mem.rss / 1024 / 1024).toFixed(1)} MB</b><br>🧠 Контекст ИИ в памяти: <b>${geminiHistory.length} сообщений</b>`;
-        return res.json({ ok: true, text: respHtml });
-    }
-
-    // --- ОБЫЧНЫЙ ЗАПРОС К GEMINI ---
     console.log(`[GEMINI] Входящее сообщение. Модель: [${modelName}]. Контекст в памяти: [${geminiHistory.length} сообщений]`);
 
     try {
@@ -269,4 +304,4 @@ app.get('/', async (req, res) => {
 });
 
 app.listen(process.env.PORT || 8080);
-    
+        
