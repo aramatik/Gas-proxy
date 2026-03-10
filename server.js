@@ -30,21 +30,50 @@ if (GEMINI_API_KEY) {
     genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 }
 
-// МАРШРУТ GEMINI
+// ==========================================
+// МАРШРУТ GEMINI (С ДИНАМИЧЕСКИМИ МОДЕЛЯМИ И ЛОГИРОВАНИЕМ)
+// ==========================================
 app.post('/gemini', async (req, res) => {
     if (req.query.token !== PROXY_SECRET) return res.status(403).json({ok: false, error: "Auth failed"});
-    if (!genAI) return res.status(500).json({ok: false, error: "Отсутствует GEMINI_API_KEY на сервере"});
+    if (!GEMINI_API_KEY) return res.status(500).json({ok: false, error: "Отсутствует GEMINI_API_KEY на сервере"});
 
+    // 1. ОБРАБОТКА ЗАПРОСА СПИСКА МОДЕЛЕЙ
+    if (req.body.action === 'get_models') {
+        console.log("\n[GEMINI] Запрос актуального списка моделей от Google API...");
+        try {
+            const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_API_KEY}`;
+            const response = await axios.get(url);
+            
+            // Фильтруем только те модели, которые могут генерировать текст
+            const models = response.data.models
+                .filter(m => m.supportedGenerationMethods.includes('generateContent'))
+                .map(m => ({ 
+                    id: m.name.replace('models/', ''), // Убираем префикс models/ для SDK
+                    name: m.displayName 
+                }));
+            
+            console.log(`[GEMINI] Успешно получено моделей: ${models.length}`);
+            return res.json({ ok: true, models: models });
+        } catch (err) {
+            console.error("[GEMINI ERROR] Ошибка получения списка моделей:", err.message);
+            return res.status(500).json({ ok: false, error: err.message });
+        }
+    }
+
+    // 2. ОЧИСТКА ПАМЯТИ
     if (req.body.clear === 'true') {
         geminiHistory = [];
-        console.log("[GEMINI] Память нейросети успешно очищена.");
+        console.log("[GEMINI] Память контекста нейросети успешно очищена.");
         if (req.body.text === 'clear') return res.json({ok: true, text: "История очищена"});
     }
 
+    // 3. ГЕНЕРАЦИЯ ОТВЕТА
     const userText = req.body.text;
-    // ИСПРАВЛЕНО: Добавлен суффикс -latest
-    const modelName = req.body.model || "gemini-1.5-flash-latest"; 
+    const modelName = req.body.model || "gemini-2.5-flash"; 
+    
     if (!userText) return res.status(400).json({ok: false, error: "Нет текста запроса"});
+
+    console.log(`\n[GEMINI] Входящее сообщение. Модель: [${modelName}]. Контекст в памяти: [${geminiHistory.length} сообщений]`);
 
     try {
         const model = genAI.getGenerativeModel({ model: modelName });
@@ -54,14 +83,18 @@ app.post('/gemini', async (req, res) => {
         const responseText = result.response.text();
         
         geminiHistory = await chat.getHistory();
+        console.log(`[GEMINI] Ответ успешно сгенерирован и отправлен пользователю.`);
+        
         return res.json({ ok: true, text: responseText });
     } catch (err) {
-        console.error("[GEMINI ERROR]", err);
+        console.error("[GEMINI ERROR] Сбой генерации ответа:", err.message);
         return res.status(500).json({ ok: false, error: err.message });
     }
 });
 
+// ==========================================
 // ОСНОВНОЙ ПРОКСИ
+// ==========================================
 app.get('/', async (req, res) => {
     const reqToken = req.query.token;
     if (reqToken !== PROXY_SECRET) return res.status(403).send('Forbidden: Access Denied.');
@@ -204,4 +237,4 @@ app.get('/', async (req, res) => {
 });
 
 app.listen(process.env.PORT || 8080);
-                
+        
