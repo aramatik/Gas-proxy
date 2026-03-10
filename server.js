@@ -31,28 +31,45 @@ if (GEMINI_API_KEY) {
 }
 
 // ==========================================
-// МАРШРУТ GEMINI (С ДИНАМИЧЕСКИМИ МОДЕЛЯМИ И ЛОГИРОВАНИЕМ)
+// СИСТЕМА ЛОГИРОВАНИЯ (В ПАМЯТЬ СЕРВЕРА)
+// ==========================================
+const MAX_LOG_LINES = 100;
+let serverLogs = [];
+
+function captureLog(msg) {
+    const time = new Date().toISOString().substring(11, 19); // Достаем только HH:MM:SS
+    serverLogs.push(`[${time}] ${msg}`);
+    if (serverLogs.length > MAX_LOG_LINES) serverLogs.shift();
+}
+
+// Перехватываем стандартный вывод Node.js
+const origLog = console.log;
+console.log = function(...args) {
+    origLog.apply(console, args);
+    captureLog(util.format(...args));
+};
+
+const origErr = console.error;
+console.error = function(...args) {
+    origErr.apply(console, args);
+    captureLog("ERROR: " + util.format(...args));
+};
+
+// ==========================================
+// МАРШРУТ GEMINI (И CHATOPS)
 // ==========================================
 app.post('/gemini', async (req, res) => {
     if (req.query.token !== PROXY_SECRET) return res.status(403).json({ok: false, error: "Auth failed"});
     if (!GEMINI_API_KEY) return res.status(500).json({ok: false, error: "Отсутствует GEMINI_API_KEY на сервере"});
 
-    // 1. ОБРАБОТКА ЗАПРОСА СПИСКА МОДЕЛЕЙ
     if (req.body.action === 'get_models') {
-        console.log("\n[GEMINI] Запрос актуального списка моделей от Google API...");
+        console.log("[GEMINI] Запрос актуального списка моделей от Google API...");
         try {
             const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_API_KEY}`;
             const response = await axios.get(url);
-            
-            // Фильтруем только те модели, которые могут генерировать текст
             const models = response.data.models
                 .filter(m => m.supportedGenerationMethods.includes('generateContent'))
-                .map(m => ({ 
-                    id: m.name.replace('models/', ''), // Убираем префикс models/ для SDK
-                    name: m.displayName 
-                }));
-            
-            console.log(`[GEMINI] Успешно получено моделей: ${models.length}`);
+                .map(m => ({ id: m.name.replace('models/', ''), name: m.displayName }));
             return res.json({ ok: true, models: models });
         } catch (err) {
             console.error("[GEMINI ERROR] Ошибка получения списка моделей:", err.message);
@@ -60,20 +77,35 @@ app.post('/gemini', async (req, res) => {
         }
     }
 
-    // 2. ОЧИСТКА ПАМЯТИ
     if (req.body.clear === 'true') {
         geminiHistory = [];
         console.log("[GEMINI] Память контекста нейросети успешно очищена.");
         if (req.body.text === 'clear') return res.json({ok: true, text: "История очищена"});
     }
 
-    // 3. ГЕНЕРАЦИЯ ОТВЕТА
-    const userText = req.body.text;
+    const userText = req.body.text ? req.body.text.trim() : "";
     const modelName = req.body.model || "gemini-2.5-flash"; 
     
     if (!userText) return res.status(400).json({ok: false, error: "Нет текста запроса"});
 
-    console.log(`\n[GEMINI] Входящее сообщение. Модель: [${modelName}]. Контекст в памяти: [${geminiHistory.length} сообщений]`);
+    // --- СИСТЕМНЫЕ КОМАНДЫ (СЕРВЕР ОТВЕЧАЕТ САМ) ---
+    if (userText === '/logs') {
+        const logsHtml = serverLogs.length ? serverLogs.join('\n') : "Логи пусты.";
+        const respHtml = `🖥 <b>Логи Northflank (последние ${MAX_LOG_LINES} строк):</b><br><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#e0e0e0; padding:8px; border-radius:5px; margin-top:5px; white-space:pre-wrap;">${logsHtml}</div>`;
+        return res.json({ ok: true, text: respHtml });
+    }
+    
+    if (userText === '/status') {
+        const mem = process.memoryUsage();
+        const uptime = Math.floor(process.uptime());
+        const hours = Math.floor(uptime / 3600);
+        const mins = Math.floor((uptime % 3600) / 60);
+        const respHtml = `🖥 <b>Статус контейнера Northflank:</b><br>⏱ Uptime: <b>${hours}ч ${mins}м</b><br>💾 Память (RSS): <b>${(mem.rss / 1024 / 1024).toFixed(1)} MB</b><br>🧠 Контекст ИИ в памяти: <b>${geminiHistory.length} сообщений</b>`;
+        return res.json({ ok: true, text: respHtml });
+    }
+
+    // --- ОБЫЧНЫЙ ЗАПРОС К GEMINI ---
+    console.log(`[GEMINI] Входящее сообщение. Модель: [${modelName}]. Контекст в памяти: [${geminiHistory.length} сообщений]`);
 
     try {
         const model = genAI.getGenerativeModel({ model: modelName });
@@ -102,7 +134,7 @@ app.get('/', async (req, res) => {
     const targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).send('Укажите URL: ?url=https://example.com');
 
-    console.log(`\n[${new Date().toISOString()}] [START] Запрос URL: ${targetUrl}`);
+    console.log(`\n[START] Запрос URL: ${targetUrl}`);
     const parsedTarget = new URL.URL(targetUrl);
 
     const nfFileId = parsedTarget.searchParams.get('nf_fileId');
@@ -237,4 +269,4 @@ app.get('/', async (req, res) => {
 });
 
 app.listen(process.env.PORT || 8080);
-        
+    
