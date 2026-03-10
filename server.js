@@ -13,8 +13,6 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 const app = express();
 app.use(compression());
-
-// ВАЖНО: Увеличиваем лимиты Express для приема файлов (до 50 МБ)
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 app.use(express.json({ limit: '50mb' }));
 
@@ -32,7 +30,6 @@ if (GEMINI_API_KEY) {
     genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 }
 
-// СИСТЕМА ЛОГИРОВАНИЯ
 const MAX_LOG_LINES = 100;
 let serverLogs = [];
 function captureLog(msg) {
@@ -43,13 +40,9 @@ function captureLog(msg) {
 const origLog = console.log; console.log = function(...args) { origLog.apply(console, args); captureLog(util.format(...args)); };
 const origErr = console.error; console.error = function(...args) { origErr.apply(console, args); captureLog("ERROR: " + util.format(...args)); };
 
-// ==========================================
-// МАРШРУТ УПРАВЛЕНИЯ И GEMINI
-// ==========================================
 app.post('/gemini', async (req, res) => {
     if (req.query.token !== PROXY_SECRET) return res.status(403).json({ok: false, error: "Auth failed"});
 
-    // --- ОБРАБОТЧИК ЗАГРУЗКИ ФАЙЛА НА СЕРВЕР (/upload) ---
     if (req.body.action === 'upload') {
         try {
             const filename = req.body.filename.replace(/[^a-zA-Z0-9.\-_]/g, '_');
@@ -57,7 +50,7 @@ app.post('/gemini', async (req, res) => {
             const savePath = path.join(TMP_DIR, filename);
             fs.writeFileSync(savePath, buffer);
             console.log(`[UPLOAD] Файл сохранен: ${savePath} (${(buffer.length/1024/1024).toFixed(2)} MB)`);
-            return res.json({ok: true, text: `✅ Файл <b>${filename}</b> загружен на сервер!<br>Путь: <code>${savePath}</code>`});
+            return res.json({ok: true, text: `✅ Файл <b>${filename}</b> загружен!<br>Путь: <code>${savePath}</code>`});
         } catch (err) {
             console.error("[UPLOAD ERROR]", err.message);
             return res.status(500).json({ok: false, error: err.message});
@@ -66,12 +59,11 @@ app.post('/gemini', async (req, res) => {
 
     const userText = req.body.text ? req.body.text.trim() : "";
     
-    // --- СИСТЕМНЫЕ КОМАНДЫ ---
     if (userText === '/help') {
         const respHtml = `🤖 <b>СИСТЕМА CHATOPS:</b><br><br>
         <code>/status</code> — Состояние сервера<br>
         <code>/logs</code> — Логи Northflank<br>
-        <code>/download [путь]</code> — Скачать файл с сервера (до 15МБ)<br>
+        <code>/download [путь]</code> — Скачать файл (до 15 МБ)<br>
         <i>*Используйте кнопку 📎 для загрузки файлов на сервер.</i><br><br>
         💻 <b>Терминал:</b><br>
         <code>! [команда]</code> — Консоль Linux<br>
@@ -79,7 +71,7 @@ app.post('/gemini', async (req, res) => {
         return res.json({ ok: true, text: respHtml });
     }
 
-    // --- ОБРАБОТЧИК СКАЧИВАНИЯ ФАЙЛА С СЕРВЕРА (/download) ---
+    // --- СКАЧИВАНИЕ: АДАПТИРОВАНО ПОД GOOGLE ПРОКСИ ---
     if (userText.startsWith('/download ')) {
         const targetPath = userText.substring(10).trim();
         if (!fs.existsSync(targetPath)) return res.json({ok: true, text: `❌ Файл не найден: <code>${targetPath}</code>`});
@@ -87,20 +79,20 @@ app.post('/gemini', async (req, res) => {
         if (stat.isDirectory()) return res.json({ok: true, text: `❌ Это папка. Сначала запакуйте её:<br><code>!zip -r /tmp/dir.zip ${targetPath}</code>`});
 
         const mb = (stat.size / 1024 / 1024).toFixed(2);
-        if (stat.size > 20 * 1024 * 1024) {
-            return res.json({ok: true, text: `⚠️ Файл слишком большой для прямой загрузки (${mb} МБ).<br>Разрежьте его на сервере:<br><code>!zip -s 15m /tmp/archive.zip ${targetPath}</code>`});
+        
+        // Жесткий лимит 15МБ, иначе Google Apps Script упадет с ошибкой памяти
+        if (stat.size > 15 * 1024 * 1024) {
+            return res.json({ok: true, text: `⚠️ Файл слишком большой для прокси Google (${mb} МБ). Максимум 15 МБ.<br>Разрежьте его на части:<br><code>!zip -s 14m /tmp/archive.zip ${targetPath}</code>`});
         }
-
-        // Генерируем внутреннюю ссылку-крючок для Google Proxy
-        const fakeUrl = `http://system.local/dl?path=${encodeURIComponent(targetPath)}`;
-        const respHtml = `📦 <b>Файл готов (${mb} MB)</b><br><a href="${fakeUrl}" target="_blank" style="display:inline-block; margin-top:8px; padding:8px 12px; background:#28a745; color:white; text-decoration:none; border-radius:5px; font-weight:bold;">📥 Нажмите, чтобы скачать</a>`;
+        
+        // Специальная кнопка, которая заставит GAS скачать файл
+        const respHtml = `📦 <b>Файл готов (${mb} MB)</b><br><a href="javascript:void(0)" onclick="dlFromServer('${targetPath}')" style="display:inline-block; margin-top:8px; padding:8px 12px; background:#28a745; color:white; text-decoration:none; border-radius:5px; font-weight:bold;">📥 Загрузить через Google</a>`;
         return res.json({ok: true, text: respHtml});
     }
 
     if (userText === '/logs') {
         const logsHtml = serverLogs.length ? serverLogs.join('\n') : "Логи пусты.";
-        const respHtml = `🖥 <b>Логи Northflank:</b><br><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#e0e0e0; color:#333; padding:8px; border-radius:5px; margin-top:5px; white-space:pre-wrap;">${logsHtml}</div>`;
-        return res.json({ ok: true, text: respHtml });
+        return res.json({ ok: true, text: `🖥 <b>Логи Northflank:</b><br><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#e0e0e0; color:#333; padding:8px; border-radius:5px; margin-top:5px; white-space:pre-wrap;">${logsHtml}</div>` });
     }
     
     if (userText === '/status') {
@@ -108,8 +100,7 @@ app.post('/gemini', async (req, res) => {
         const uptime = Math.floor(process.uptime());
         const hours = Math.floor(uptime / 3600);
         const mins = Math.floor((uptime % 3600) / 60);
-        const respHtml = `🖥 <b>Статус контейнера:</b><br>⏱ Uptime: <b>${hours}ч ${mins}м</b><br>💾 Память (RSS): <b>${(mem.rss / 1024 / 1024).toFixed(1)} MB</b><br>🧠 Контекст ИИ: <b>${geminiHistory.length} сообщений</b>`;
-        return res.json({ ok: true, text: respHtml });
+        return res.json({ ok: true, text: `🖥 <b>Статус контейнера:</b><br>⏱ Uptime: <b>${hours}ч ${mins}м</b><br>💾 Память (RSS): <b>${(mem.rss / 1024 / 1024).toFixed(1)} MB</b><br>🧠 Контекст ИИ: <b>${geminiHistory.length} сообщений</b>` });
     }
 
     if (userText.startsWith('!')) {
@@ -129,7 +120,6 @@ app.post('/gemini', async (req, res) => {
         }
     }
 
-    // --- ОБРАЩЕНИЕ К ИИ ---
     if (!GEMINI_API_KEY) return res.status(500).json({ok: false, error: "Отсутствует GEMINI_API_KEY на сервере"});
 
     if (req.body.action === 'get_models') {
@@ -164,29 +154,27 @@ app.post('/gemini', async (req, res) => {
     }
 });
 
-// ==========================================
-// ОСНОВНОЙ ПРОКСИ
-// ==========================================
 app.get('/', async (req, res) => {
     const reqToken = req.query.token;
     if (reqToken !== PROXY_SECRET) return res.status(403).send('Forbidden: Access Denied.');
+
+    // ОТДАЧА ЛОКАЛЬНЫХ ФАЙЛОВ ДЛЯ GOOGLE PROXY
+    const nfDlPath = req.query.nf_dl_path;
+    if (nfDlPath) {
+        if (!fs.existsSync(nfDlPath)) return res.status(404).send("File not found on server.");
+        const stats = fs.statSync(nfDlPath);
+        res.set('Content-Type', 'application/octet-stream');
+        res.set('Content-Disposition', `attachment; filename="${path.basename(nfDlPath)}"`);
+        res.set('Content-Length', stats.size);
+        console.log(`[DOWNLOAD] Отдача файла для Google Proxy: ${nfDlPath}`);
+        return fs.createReadStream(nfDlPath).pipe(res);
+    }
 
     const targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).send('Укажите URL: ?url=https://example.com');
 
     console.log(`\n[START] Запрос URL: ${targetUrl}`);
     const parsedTarget = new URL.URL(targetUrl);
-
-    // ПЕРЕХВАТ ЛОКАЛЬНОГО СКАЧИВАНИЯ (/download)
-    if (targetUrl.startsWith('http://system.local/dl')) {
-        const dlPath = parsedTarget.searchParams.get('path');
-        if (!fs.existsSync(dlPath)) return res.status(404).send("File not found on Northflank");
-        const stat = fs.statSync(dlPath);
-        res.set('Content-Type', 'application/octet-stream');
-        res.set('Content-Disposition', `attachment; filename="${path.basename(dlPath)}"`);
-        res.set('Content-Length', stat.size);
-        return fs.createReadStream(dlPath).pipe(res);
-    }
 
     const nfFileId = parsedTarget.searchParams.get('nf_fileId');
     const nfPartName = parsedTarget.searchParams.get('nf_partName');
@@ -319,4 +307,4 @@ app.get('/', async (req, res) => {
 });
 
 app.listen(process.env.PORT || 8080);
-        
+    
