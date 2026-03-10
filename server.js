@@ -71,7 +71,6 @@ app.post('/gemini', async (req, res) => {
         return res.json({ ok: true, text: respHtml });
     }
 
-    // --- СКАЧИВАНИЕ: АДАПТИРОВАНО ПОД GOOGLE ПРОКСИ ---
     if (userText.startsWith('/download ')) {
         const targetPath = userText.substring(10).trim();
         if (!fs.existsSync(targetPath)) return res.json({ok: true, text: `❌ Файл не найден: <code>${targetPath}</code>`});
@@ -80,13 +79,12 @@ app.post('/gemini', async (req, res) => {
 
         const mb = (stat.size / 1024 / 1024).toFixed(2);
         
-        // Жесткий лимит 15МБ, иначе Google Apps Script упадет с ошибкой памяти
         if (stat.size > 15 * 1024 * 1024) {
             return res.json({ok: true, text: `⚠️ Файл слишком большой для прокси Google (${mb} МБ). Максимум 15 МБ.<br>Разрежьте его на части:<br><code>!zip -s 14m /tmp/archive.zip ${targetPath}</code>`});
         }
         
-        // Специальная кнопка, которая заставит GAS скачать файл
-        const respHtml = `📦 <b>Файл готов (${mb} MB)</b><br><a href="javascript:void(0)" onclick="dlFromServer('${targetPath}')" style="display:inline-block; margin-top:8px; padding:8px 12px; background:#28a745; color:white; text-decoration:none; border-radius:5px; font-weight:bold;">📥 Загрузить через Google</a>`;
+        // ИСПРАВЛЕНО: Теперь это кнопка, а не ссылка
+        const respHtml = `📦 <b>Файл готов (${mb} MB)</b><br><button type="button" onclick="dlFromServer('${targetPath}')" style="display:inline-block; margin-top:8px; padding:8px 12px; background:#28a745; color:white; border:none; border-radius:5px; font-weight:bold; cursor:pointer;">📥 Загрузить через Google</button>`;
         return res.json({ok: true, text: respHtml});
     }
 
@@ -158,7 +156,6 @@ app.get('/', async (req, res) => {
     const reqToken = req.query.token;
     if (reqToken !== PROXY_SECRET) return res.status(403).send('Forbidden: Access Denied.');
 
-    // ОТДАЧА ЛОКАЛЬНЫХ ФАЙЛОВ ДЛЯ GOOGLE PROXY
     const nfDlPath = req.query.nf_dl_path;
     if (nfDlPath) {
         if (!fs.existsSync(nfDlPath)) return res.status(404).send("File not found on server.");
@@ -307,4 +304,4 @@ app.get('/', async (req, res) => {
 });
 
 app.listen(process.env.PORT || 8080);
-    
+        
