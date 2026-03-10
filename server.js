@@ -20,26 +20,21 @@ const MAX_FILE_SIZE = 130 * 1024 * 1024;
 const CHUNK_SIZE_MB = 15; 
 const TMP_DIR = '/tmp';
 
-// Секреты из Environment Variables
 const PROXY_SECRET = process.env.PROXY_SECRET || "MySuperSecretPassword2026";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 
-// Глобальная инициализация ИИ и хранилище памяти
 let genAI = null;
-let geminiHistory = []; // Память диалога
+let geminiHistory = []; 
 
 if (GEMINI_API_KEY) {
     genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 }
 
-// ==========================================
-// МАРШРУТ: ПРЯМОЙ МОСТ К GEMINI AI
-// ==========================================
+// МАРШРУТ GEMINI
 app.post('/gemini', async (req, res) => {
     if (req.query.token !== PROXY_SECRET) return res.status(403).json({ok: false, error: "Auth failed"});
     if (!genAI) return res.status(500).json({ok: false, error: "Отсутствует GEMINI_API_KEY на сервере"});
 
-    // Обработка сигнала об очистке памяти
     if (req.body.clear === 'true') {
         geminiHistory = [];
         console.log("[GEMINI] Память нейросети успешно очищена.");
@@ -47,20 +42,18 @@ app.post('/gemini', async (req, res) => {
     }
 
     const userText = req.body.text;
-    const modelName = req.body.model || "gemini-1.5-flash"; // Модель по умолчанию
+    // ИСПРАВЛЕНО: Добавлен суффикс -latest
+    const modelName = req.body.model || "gemini-1.5-flash-latest"; 
     if (!userText) return res.status(400).json({ok: false, error: "Нет текста запроса"});
 
     try {
-        // Подключаем выбранную модель, передаем ей всю историю прошлых бесед
         const model = genAI.getGenerativeModel({ model: modelName });
         const chat = model.startChat({ history: geminiHistory });
         
         const result = await chat.sendMessage(userText);
         const responseText = result.response.text();
         
-        // Сохраняем обновленную историю обратно в память
         geminiHistory = await chat.getHistory();
-        
         return res.json({ ok: true, text: responseText });
     } catch (err) {
         console.error("[GEMINI ERROR]", err);
@@ -68,14 +61,10 @@ app.post('/gemini', async (req, res) => {
     }
 });
 
-// ==========================================
-// ОСНОВНОЙ ПРОКСИ-СЕРВЕР
-// ==========================================
+// ОСНОВНОЙ ПРОКСИ
 app.get('/', async (req, res) => {
     const reqToken = req.query.token;
-    if (reqToken !== PROXY_SECRET) {
-        return res.status(403).send('Forbidden: Access Denied.');
-    }
+    if (reqToken !== PROXY_SECRET) return res.status(403).send('Forbidden: Access Denied.');
 
     const targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).send('Укажите URL: ?url=https://example.com');
@@ -215,3 +204,4 @@ app.get('/', async (req, res) => {
 });
 
 app.listen(process.env.PORT || 8080);
+                
