@@ -71,6 +71,7 @@ app.post('/gemini', async (req, res) => {
         return res.json({ ok: true, text: respHtml });
     }
 
+    // --- ИСПРАВЛЕННЫЙ ОБРАБОТЧИК СКАЧИВАНИЯ ---
     if (userText.startsWith('/download ')) {
         const targetPath = userText.substring(10).trim();
         if (!fs.existsSync(targetPath)) return res.json({ok: true, text: `❌ Файл не найден: <code>${targetPath}</code>`});
@@ -83,8 +84,9 @@ app.post('/gemini', async (req, res) => {
             return res.json({ok: true, text: `⚠️ Файл слишком большой для прокси Google (${mb} МБ). Максимум 15 МБ.<br>Разрежьте его на части:<br><code>!zip -s 14m /tmp/archive.zip ${targetPath}</code>`});
         }
         
-        // ИСПРАВЛЕНО: Теперь это кнопка, а не ссылка
-        const respHtml = `📦 <b>Файл готов (${mb} MB)</b><br><button type="button" onclick="dlFromServer('${targetPath}')" style="display:inline-block; margin-top:8px; padding:8px 12px; background:#28a745; color:white; border:none; border-radius:5px; font-weight:bold; cursor:pointer;">📥 Загрузить через Google</button>`;
+        // Возвращаем надежную ссылку, которую перехватит Google Apps Script
+        const fakeUrl = `http://system.local/dl?path=${encodeURIComponent(targetPath)}`;
+        const respHtml = `📦 <b>Файл готов (${mb} MB)</b><br><a href="${fakeUrl}" style="display:inline-block; margin-top:8px; padding:8px 12px; background:#28a745; color:white; text-decoration:none; border-radius:5px; font-weight:bold;">📥 Загрузить на телефон</a>`;
         return res.json({ok: true, text: respHtml});
     }
 
