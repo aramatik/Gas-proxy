@@ -181,7 +181,7 @@ app.post('/gemini', async (req, res) => {
 
     if (userText === '/logs') {
         const logsHtml = serverLogs.length ? serverLogs.join('\n') : "Логи пусты.";
-        return res.json({ ok: true, text: `🖥 <b>Логи Northflank:</b><br><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#e0e0e0; color:#333; padding:8px; border-radius:5px; margin-top:5px; white-space:pre-wrap;">${logsHtml}</div>` });
+        return res.json({ ok: true, text: `🖥 <b>Логи Northflank:</b><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#e0e0e0; color:#333; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${logsHtml}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#999; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
     }
     
     if (userText === '/status') {
@@ -202,10 +202,10 @@ app.post('/gemini', async (req, res) => {
             if (stderr) output += `\n[STDERR]:\n${stderr}`;
             if (!output) output = "[Выполнено успешно, вывода нет]";
             if (output.length > 3000) output = output.substring(0, 3000) + "\n...[ВЫВОД ОБРЕЗАН]...";
-            return res.json({ ok: true, text: `<b>$</b> <code>${cmd}</code><br><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#1e1e1e; color:#00ff00; padding:8px; border-radius:5px; margin-top:5px; white-space:pre-wrap;">${output}</div>` });
+            return res.json({ ok: true, text: `<b>$</b> <code>${cmd}</code><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#1e1e1e; color:#00ff00; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${output}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#555; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
         } catch (err) {
             console.error(`[CHATOPS] Ошибка выполнения: ${cmd}`, err.message);
-            return res.json({ ok: true, text: `<b>$</b> <code>${cmd}</code><br><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#3b1313; color:#ff6b6b; padding:8px; border-radius:5px; margin-top:5px; white-space:pre-wrap;">${err.message}</div>` });
+            return res.json({ ok: true, text: `<b>$</b> <code>${cmd}</code><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#3b1313; color:#ff6b6b; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${err.message}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#773333; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
         }
     }
 
@@ -290,7 +290,6 @@ app.get('/', async (req, res) => {
     const targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).send('Укажите URL: ?url=https://example.com');
 
-    // Получаем лимит картинок из запроса
     let imgLim = 10; 
     if (req.query.img_limit !== undefined) {
         imgLim = parseInt(req.query.img_limit);
@@ -358,24 +357,18 @@ app.get('/', async (req, res) => {
                 if (href) { try { const cssRes = await axios.get(href, { timeout: 3000 }); $(stylesheets[i]).replaceWith(`<style>${cssRes.data}</style>`); } catch (e) {} }
             }
 
-            // ОБНОВЛЕННЫЙ ПАРСЕР КАРТИНОК С УЧЕТОМ ЛИМИТОВ
             const images = $('img').toArray();
             for (let i = 0; i < images.length; i++) {
                 let img = $(images[i]);
                 
-                // Если пользователь выбрал "Без картинок", мы заменяем их все на прозрачный 1x1 пиксель,
-                // чтобы браузер даже не пытался их качать, экономя трафик.
                 if (imgLim === 0) {
                     img.attr('src', 'data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=')
                        .removeAttr('srcset').removeAttr('data-src').removeAttr('loading');
                     continue;
                 }
                 
-                // Если лимит больше 0 и мы его достигли - просто прерываем цикл 
-                // (остальные картинки останутся оригинальными и загрузятся сами, если инет потянет)
                 if (imgLim > 0 && i >= imgLim) break;
 
-                // Ищем ссылку в src или в атрибутах ленивой загрузки
                 let src = img.attr('src') || img.attr('data-src') || img.attr('data-original');
                 
                 if (src && !src.startsWith('data:') && src.startsWith('/')) src = baseUrl + src;
@@ -486,4 +479,4 @@ app.get('/', async (req, res) => {
 });
 
 app.listen(process.env.PORT || 8080);
-                
+                        
