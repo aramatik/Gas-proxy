@@ -295,7 +295,13 @@ app.get('/', async (req, res) => {
         imgLim = parseInt(req.query.img_limit);
     }
 
-    console.log(`\n[PROXY] Запрос веб-ресурса: ${targetUrl} (Лимит картинок: ${imgLim === -1 ? 'ВСЕ' : imgLim})`);
+    // Выбираем User-Agent на основе запроса
+    let isMobile = req.query.mobile_ua === 'true';
+    let userAgentStr = isMobile 
+        ? 'Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36'
+        : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+    console.log(`\n[PROXY] Запрос веб-ресурса: ${targetUrl} (Картинки: ${imgLim === -1 ? 'ВСЕ' : imgLim}, Режим: ${isMobile ? 'Mobile' : 'Desktop'})`);
     const parsedTarget = new URL.URL(targetUrl);
 
     const nfFileId = parsedTarget.searchParams.get('nf_fileId');
@@ -317,7 +323,7 @@ app.get('/', async (req, res) => {
         const response = await axios.get(targetUrl, { 
             responseType: 'stream',
             headers: { 
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'User-Agent': userAgentStr,
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                 'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
                 'Cache-Control': 'no-cache'
@@ -479,4 +485,4 @@ app.get('/', async (req, res) => {
 });
 
 app.listen(process.env.PORT || 8080);
-                        
+                
