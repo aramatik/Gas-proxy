@@ -71,13 +71,11 @@ global.fetch = async (input, init) => {
     else if (input && input.url) url = input.url; 
     else if (input && input.href) url = input.href; 
 
-    // Ловим запросы генерации к Google API
     if (url && url.includes('generativelanguage.googleapis.com/v1beta/models/')) {
         const match = url.match(/models\/([^:]+)(?::generateContent|:streamGenerateContent)/);
         if (match && match[1]) {
             const modelId = match[1];
             
-            // Если словили 429 - лимиты исчерпаны, парсим JSON
             if (response.status === 429) {
                 try {
                     const clonedRes = response.clone();
@@ -109,7 +107,6 @@ global.fetch = async (input, init) => {
                     console.error("[FETCH INTERCEPTOR] Ошибка парсинга 429:", e.message);
                 }
             } else if (response.status === 200) {
-                // Если запрос прошел успешно, снимаем статус блокировки
                 if (!geminiLimits[modelId] || geminiLimits[modelId].status !== 'OK') {
                     geminiLimits[modelId] = {
                         status: 'OK',
@@ -148,7 +145,6 @@ app.post('/gemini', async (req, res) => {
     const userText = req.body.text ? req.body.text.trim() : "";
     
     if (userText === '/help') {
-        // Убрали переносы строк из шаблона, чтобы frontend не накидал <br> тегов
         const respHtml = `🤖 <b>СИСТЕМА CHATOPS:</b><br><br><code>/status</code> — Состояние сервера<br><code>/limit</code> — Состояние моделей (Блокировки)<br><code>/logs</code> — Логи Northflank<br><code>/download [путь]</code> — Скачать файл (до 15 МБ)<br><code>/upload</code> — Загрузить файл на сервер<br><br>💻 <b>Терминал:</b><br><code>! [команда]</code> — Консоль Linux<br><i>Пример: <code>!ls -la /tmp</code></i>`;
         return res.json({ ok: true, text: respHtml });
     }
@@ -157,7 +153,6 @@ app.post('/gemini', async (req, res) => {
         if (Object.keys(geminiLimits).length === 0) {
             return res.json({ ok: true, text: `📊 <b>Состояние API-моделей:</b><br><br>Google больше не передает остаток лимитов заранее. Сервер узнает точный лимит только при достижении потолка (ошибке 429). Сделайте запрос к ИИ, чтобы начать отслеживание статуса.` });
         }
-        // Таблица записана в одну строку, чтобы избежать лишних переносов строк (которые превращаются в <br>)
         let tableHtml = `<table style="width:100%; border-collapse:collapse; font-size:11px; margin-top:5px; background:#fff; color:#333;"><tr style="background:#1a73e8; color:white;"><th style="padding:4px; border:1px solid #ccc;">Модель</th><th style="padding:4px; border:1px solid #ccc;">Статус</th><th style="padding:4px; border:1px solid #ccc;">Макс.</th><th style="padding:4px; border:1px solid #ccc;">Сброс</th><th style="padding:4px; border:1px solid #ccc;">Обновлено</th></tr>`;
         for (const [model, data] of Object.entries(geminiLimits)) {
             const statusColor = data.status === 'OK' ? '#28a745' : '#dc3545'; 
@@ -258,9 +253,8 @@ app.post('/gemini', async (req, res) => {
         const isGemma = modelName.toLowerCase().includes('gemma');
         const modelConfig = { model: modelName };
         
-        // Модели Gemma не поддерживают systemInstruction
         if (!isGemma) {
-            modelConfig.systemInstruction = "Окружение: контейнер Alpine Linux (адаптируй команды терминала). Формат: Markdown. Аудио/голос: отвечай только на вопрос в аудио без анализа самого аудио.";
+            modelConfig.systemInstruction = "Ты — полезный ИИ-ассистент. Если пользователь присылает тебе аудиофайл или голосовое сообщение, просто выслушай вопрос/информацию, которая там содержится, и дай прямой ответ. НИКОГДА не делай технический или структурный анализ аудиофайла (не пиши про длительность, шумы, пол спикера, перевод и транскрипцию), если только тебя не попросили об этом напрямую. Также используй удобное форматирование Markdown.";
         }
 
         const model = genAI.getGenerativeModel(modelConfig);
@@ -296,7 +290,13 @@ app.get('/', async (req, res) => {
     const targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).send('Укажите URL: ?url=https://example.com');
 
-    console.log(`\n[PROXY] Запрос веб-ресурса: ${targetUrl}`);
+    // Получаем лимит картинок из запроса
+    let imgLim = 10; 
+    if (req.query.img_limit !== undefined) {
+        imgLim = parseInt(req.query.img_limit);
+    }
+
+    console.log(`\n[PROXY] Запрос веб-ресурса: ${targetUrl} (Лимит картинок: ${imgLim === -1 ? 'ВСЕ' : imgLim})`);
     const parsedTarget = new URL.URL(targetUrl);
 
     const nfFileId = parsedTarget.searchParams.get('nf_fileId');
@@ -346,7 +346,7 @@ app.get('/', async (req, res) => {
                 }
             }
             const html = Buffer.concat(chunks).toString('utf-8');
-            console.log(`[PROXY] HTML загружен (${(htmlBytes/1024).toFixed(1)} KB). Парсинг стилей и изображений...`);
+            console.log(`[PROXY] HTML загружен (${(htmlBytes/1024).toFixed(1)} KB). Парсинг ресурсов...`);
             
             const $ = cheerio.load(html);
             const baseUrl = parsedTarget.origin;
@@ -358,14 +358,33 @@ app.get('/', async (req, res) => {
                 if (href) { try { const cssRes = await axios.get(href, { timeout: 3000 }); $(stylesheets[i]).replaceWith(`<style>${cssRes.data}</style>`); } catch (e) {} }
             }
 
+            // ОБНОВЛЕННЫЙ ПАРСЕР КАРТИНОК С УЧЕТОМ ЛИМИТОВ
             const images = $('img').toArray();
-            for (let i = 0; i < Math.min(images.length, 10); i++) {
-                let src = $(images[i]).attr('src');
+            for (let i = 0; i < images.length; i++) {
+                let img = $(images[i]);
+                
+                // Если пользователь выбрал "Без картинок", мы заменяем их все на прозрачный 1x1 пиксель,
+                // чтобы браузер даже не пытался их качать, экономя трафик.
+                if (imgLim === 0) {
+                    img.attr('src', 'data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=')
+                       .removeAttr('srcset').removeAttr('data-src').removeAttr('loading');
+                    continue;
+                }
+                
+                // Если лимит больше 0 и мы его достигли - просто прерываем цикл 
+                // (остальные картинки останутся оригинальными и загрузятся сами, если инет потянет)
+                if (imgLim > 0 && i >= imgLim) break;
+
+                // Ищем ссылку в src или в атрибутах ленивой загрузки
+                let src = img.attr('src') || img.attr('data-src') || img.attr('data-original');
+                
                 if (src && !src.startsWith('data:') && src.startsWith('/')) src = baseUrl + src;
                 if (src && !src.startsWith('data:')) {
-                    try { const imgRes = await axios.get(src, { responseType: 'arraybuffer', timeout: 3000 });
+                    try { 
+                        const imgRes = await axios.get(src, { responseType: 'arraybuffer', timeout: 3500 });
                         const b64 = Buffer.from(imgRes.data, 'binary').toString('base64');
-                        $(images[i]).attr('src', `data:${imgRes.headers['content-type']};base64,${b64}`).removeAttr('srcset'); 
+                        img.attr('src', `data:${imgRes.headers['content-type']};base64,${b64}`);
+                        img.removeAttr('srcset').removeAttr('data-src').removeAttr('loading'); 
                     } catch (e) {}
                 }
             }
@@ -467,4 +486,4 @@ app.get('/', async (req, res) => {
 });
 
 app.listen(process.env.PORT || 8080);
-        
+                
