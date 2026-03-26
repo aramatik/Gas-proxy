@@ -25,7 +25,7 @@ const TMP_DIR = '/tmp';
 
 const PROXY_SECRET = process.env.PROXY_SECRET || "MySuperSecretPassword2026";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
-const TAVILY_API_KEY = process.env.TAVILY_API_KEY || ""; // <--- НОВЫЙ КЛЮЧ TAVILY
+const TAVILY_API_KEY = process.env.TAVILY_API_KEY || ""; 
 
 let genAI = null;
 let geminiHistory = []; 
@@ -148,11 +148,11 @@ app.post('/gemini', async (req, res) => {
     if (userText === '/help') {
         const respHtml = `🤖 <b>СИСТЕМА CHATOPS:</b><br><br>
 <code>/status</code> — Состояние сервера<br>
-<code>/limit</code> — Состояние моделей (Блокировки)<br>
+<code>/limit</code> — Состояние моделей<br>
 <code>/logs</code> — Логи Northflank<br>
 <code>/download [путь]</code> — Скачать файл (до 15 МБ)<br>
 <code>/upload</code> — Загрузить файл на сервер<br>
-<code>/search [запрос]</code> — Поиск в интернете (через Tavily API)<br>
+<code>/search [запрос]</code> — Поиск в сети (поддерживает <i>site:</i> и <i>filetype:</i>)<br>
 <code>/search download:[url]</code> — Прямая загрузка файла<br><br>
 💻 <b>Терминал:</b><br>
 <code>! [команда]</code> — Консоль Linux<br>
@@ -225,7 +225,7 @@ app.post('/gemini', async (req, res) => {
     // ==========================================
     if (userText.startsWith('/search ')) {
         const query = userText.substring(8).trim();
-        if (!query) return res.json({ ok: true, text: "⚠️ Укажите запрос: <code>/search документация express</code>" });
+        if (!query) return res.json({ ok: true, text: "⚠️ Укажите запрос: <code>/search документация express filetype:pdf</code>" });
 
         console.log(`[WEB SEARCH] Выполнение команды: ${query}`);
         try {
@@ -254,17 +254,45 @@ app.post('/gemini', async (req, res) => {
                 const stat = fs.statSync(savePath);
                 searchResultsText = `✅ Файл успешно скачан!\n📁 Путь на сервере: ${savePath}\n📦 Размер: ${(stat.size/1024).toFixed(1)} KB\n🔗 Источник: ${dlUrl}`;
             } else {
-                // Использование официального API Tavily для поиска
                 if (!TAVILY_API_KEY) {
                     throw new Error("Не настроен TAVILY_API_KEY в переменных окружения. Поиск через API невозможен.");
                 }
 
-                const response = await axios.post('https://api.tavily.com/search', {
+                // Парсинг операторов из строки
+                let apiQuery = query;
+                let includeDomains = [];
+
+                // 1. Ищем и вырезаем site:example.com
+                const siteRegex = /(?:^|\s)site:([^\s]+)/i;
+                const siteMatch = apiQuery.match(siteRegex);
+                if (siteMatch) {
+                    includeDomains.push(siteMatch[1]);
+                    apiQuery = apiQuery.replace(siteRegex, '').trim();
+                }
+
+                // 2. Ищем и вырезаем filetype:pdf, добавляя семантический вес
+                const ftRegex = /(?:^|\s)filetype:([a-z0-9]+)/i;
+                const ftMatch = apiQuery.match(ftRegex);
+                if (ftMatch) {
+                    apiQuery = apiQuery.replace(ftRegex, '').trim();
+                    apiQuery += ` (file document ${ftMatch[1]})`;
+                }
+
+                if (!apiQuery) apiQuery = "index"; // Если остались пустые строки
+
+                const requestBody = {
                     api_key: TAVILY_API_KEY,
-                    query: query,
+                    query: apiQuery,
                     max_results: 6,
                     search_depth: "basic"
-                });
+                };
+
+                // Если нашли оператор site:, жестко фильтруем выдачу
+                if (includeDomains.length > 0) {
+                    requestBody.include_domains = includeDomains;
+                }
+
+                const response = await axios.post('https://api.tavily.com/search', requestBody);
 
                 if (response.data && response.data.results && response.data.results.length > 0) {
                     let results = response.data.results.map((r, i) => `[${i+1}] ${r.title}\n${r.content}\nСсылка: ${r.url}`);
@@ -557,4 +585,4 @@ app.get('/', async (req, res) => {
 });
 
 app.listen(process.env.PORT || 8080);
-        
+                
