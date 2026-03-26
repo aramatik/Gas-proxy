@@ -25,6 +25,7 @@ const TMP_DIR = '/tmp';
 
 const PROXY_SECRET = process.env.PROXY_SECRET || "MySuperSecretPassword2026";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+const TAVILY_API_KEY = process.env.TAVILY_API_KEY || ""; // <--- НОВЫЙ КЛЮЧ TAVILY
 
 let genAI = null;
 let geminiHistory = []; 
@@ -151,7 +152,7 @@ app.post('/gemini', async (req, res) => {
 <code>/logs</code> — Логи Northflank<br>
 <code>/download [путь]</code> — Скачать файл (до 15 МБ)<br>
 <code>/upload</code> — Загрузить файл на сервер<br>
-<code>/search [запрос]</code> — Поиск в интернете<br>
+<code>/search [запрос]</code> — Поиск в интернете (через Tavily API)<br>
 <code>/search download:[url]</code> — Прямая загрузка файла<br><br>
 💻 <b>Терминал:</b><br>
 <code>! [команда]</code> — Консоль Linux<br>
@@ -253,38 +254,21 @@ app.post('/gemini', async (req, res) => {
                 const stat = fs.statSync(savePath);
                 searchResultsText = `✅ Файл успешно скачан!\n📁 Путь на сервере: ${savePath}\n📦 Размер: ${(stat.size/1024).toFixed(1)} KB\n🔗 Источник: ${dlUrl}`;
             } else {
-                // Northflank IP блокируется DuckDuckGo, используем Yahoo Search
-                const response = await axios.get('https://search.yahoo.com/search', {
-                    params: { p: query },
-                    headers: { 
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-                        'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7'
-                    }
-                });
-                
-                const $ = cheerio.load(response.data);
-                let results = [];
-                
-                $('.algo').each((i, el) => {
-                    if (results.length >= 6) return; 
-                    
-                    const titleElement = $(el).find('h3.title a, h3 a').first();
-                    const title = titleElement.text().trim();
-                    let href = titleElement.attr('href');
-                    const snippet = $(el).find('.compText, .compTitle ~ div').first().text().trim();
-                    
-                    // Расшифровка редиректов Yahoo (вытаскиваем прямую ссылку из параметра RU=)
-                    if (href && href.includes('RU=')) {
-                        try { href = decodeURIComponent(href.split('RU=')[1].split('/RK=')[0]); } catch(e) {}
-                    }
-                    
-                    if (title && snippet && href) {
-                        results.push(`[${results.length + 1}] ${title}\n${snippet}\nСсылка: ${href}`);
-                    }
+                // Использование официального API Tavily для поиска
+                if (!TAVILY_API_KEY) {
+                    throw new Error("Не настроен TAVILY_API_KEY в переменных окружения. Поиск через API невозможен.");
+                }
+
+                const response = await axios.post('https://api.tavily.com/search', {
+                    api_key: TAVILY_API_KEY,
+                    query: query,
+                    max_results: 6,
+                    search_depth: "basic"
                 });
 
-                if (results.length > 0) {
-                    searchResultsText = `Результаты поиска:\n\n${results.join('\n\n')}\n\n💡 Подсказка: если найден нужный файл (pdf, zip и т.д.), ты можешь предложить мне скачать его через команду /search download:ССЫЛКА_НА_ФАЙЛ`;
+                if (response.data && response.data.results && response.data.results.length > 0) {
+                    let results = response.data.results.map((r, i) => `[${i+1}] ${r.title}\n${r.content}\nСсылка: ${r.url}`);
+                    searchResultsText = `Результаты поиска (Tavily):\n\n${results.join('\n\n')}\n\n💡 Подсказка: если найден нужный файл (pdf, zip и т.д.), ты можешь предложить мне скачать его через команду /search download:ССЫЛКА_НА_ФАЙЛ`;
                 } else {
                     searchResultsText = `По запросу «${query}» ничего не найдено. Возможно, стоит уточнить запрос.`;
                 }
@@ -573,4 +557,4 @@ app.get('/', async (req, res) => {
 });
 
 app.listen(process.env.PORT || 8080);
-    
+        
