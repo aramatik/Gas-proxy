@@ -142,7 +142,6 @@ app.post('/gemini', async (req, res) => {
         }
     }
 
-    // Делаем userText изменяемым (let)
     let userText = req.body.text ? req.body.text.trim() : "";
     
     if (userText === '/help') {
@@ -152,7 +151,7 @@ app.post('/gemini', async (req, res) => {
 <code>/logs</code> — Логи Northflank<br>
 <code>/download [путь]</code> — Скачать файл (до 15 МБ)<br>
 <code>/upload</code> — Загрузить файл на сервер<br>
-<code>/search [запрос]</code> — Поиск в интернете (поддержка <i>site:</i> и <i>filetype:</i>)<br>
+<code>/search [запрос]</code> — Поиск в интернете<br>
 <code>/search download:[url]</code> — Прямая загрузка файла<br><br>
 💻 <b>Терминал:</b><br>
 <code>! [команда]</code> — Консоль Linux<br>
@@ -225,7 +224,7 @@ app.post('/gemini', async (req, res) => {
     // ==========================================
     if (userText.startsWith('/search ')) {
         const query = userText.substring(8).trim();
-        if (!query) return res.json({ ok: true, text: "⚠️ Укажите запрос: <code>/search документация express filetype:pdf</code>" });
+        if (!query) return res.json({ ok: true, text: "⚠️ Укажите запрос: <code>/search документация express</code>" });
 
         console.log(`[WEB SEARCH] Выполнение команды: ${query}`);
         try {
@@ -254,8 +253,9 @@ app.post('/gemini', async (req, res) => {
                 const stat = fs.statSync(savePath);
                 searchResultsText = `✅ Файл успешно скачан!\n📁 Путь на сервере: ${savePath}\n📦 Размер: ${(stat.size/1024).toFixed(1)} KB\n🔗 Источник: ${dlUrl}`;
             } else {
-                const response = await axios.get('https://html.duckduckgo.com/html/', {
-                    params: { q: query },
+                // Northflank IP блокируется DuckDuckGo, используем Yahoo Search
+                const response = await axios.get('https://search.yahoo.com/search', {
+                    params: { p: query },
                     headers: { 
                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
                         'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7'
@@ -265,17 +265,21 @@ app.post('/gemini', async (req, res) => {
                 const $ = cheerio.load(response.data);
                 let results = [];
                 
-                $('.result__body').each((i, el) => {
-                    if (i >= 6) return; 
-                    const title = $(el).find('.result__title').text().trim();
-                    const snippet = $(el).find('.result__snippet').text().trim();
-                    let href = $(el).find('.result__url').attr('href');
+                $('.algo').each((i, el) => {
+                    if (results.length >= 6) return; 
                     
-                    if (href && href.includes('uddg=')) {
-                        try { href = decodeURIComponent(href.split('uddg=')[1].split('&')[0]); } catch(e) {}
+                    const titleElement = $(el).find('h3.title a, h3 a').first();
+                    const title = titleElement.text().trim();
+                    let href = titleElement.attr('href');
+                    const snippet = $(el).find('.compText, .compTitle ~ div').first().text().trim();
+                    
+                    // Расшифровка редиректов Yahoo (вытаскиваем прямую ссылку из параметра RU=)
+                    if (href && href.includes('RU=')) {
+                        try { href = decodeURIComponent(href.split('RU=')[1].split('/RK=')[0]); } catch(e) {}
                     }
-                    if (title && snippet) {
-                        results.push(`[${i+1}] ${title}\n${snippet}\nСсылка: ${href}`);
+                    
+                    if (title && snippet && href) {
+                        results.push(`[${results.length + 1}] ${title}\n${snippet}\nСсылка: ${href}`);
                     }
                 });
 
