@@ -142,10 +142,21 @@ app.post('/gemini', async (req, res) => {
         }
     }
 
-    const userText = req.body.text ? req.body.text.trim() : "";
+    // Делаем userText изменяемым (let)
+    let userText = req.body.text ? req.body.text.trim() : "";
     
     if (userText === '/help') {
-        const respHtml = `🤖 <b>СИСТЕМА CHATOPS:</b><br><br><code>/status</code> — Состояние сервера<br><code>/limit</code> — Состояние моделей (Блокировки)<br><code>/logs</code> — Логи Northflank<br><code>/download [путь]</code> — Скачать файл (до 15 МБ)<br><code>/upload</code> — Загрузить файл на сервер<br><br>💻 <b>Терминал:</b><br><code>! [команда]</code> — Консоль Linux<br><i>Пример: <code>!ls -la /tmp</code></i>`;
+        const respHtml = `🤖 <b>СИСТЕМА CHATOPS:</b><br><br>
+<code>/status</code> — Состояние сервера<br>
+<code>/limit</code> — Состояние моделей (Блокировки)<br>
+<code>/logs</code> — Логи Northflank<br>
+<code>/download [путь]</code> — Скачать файл (до 15 МБ)<br>
+<code>/upload</code> — Загрузить файл на сервер<br>
+<code>/search [запрос]</code> — Поиск в интернете (поддержка <i>site:</i> и <i>filetype:</i>)<br>
+<code>/search download:[url]</code> — Прямая загрузка файла<br><br>
+💻 <b>Терминал:</b><br>
+<code>! [команда]</code> — Консоль Linux<br>
+<i>Пример: <code>!ls -la /tmp</code></i>`;
         return res.json({ ok: true, text: respHtml });
     }
 
@@ -206,6 +217,80 @@ app.post('/gemini', async (req, res) => {
         } catch (err) {
             console.error(`[CHATOPS] Ошибка выполнения: ${cmd}`, err.message);
             return res.json({ ok: true, text: `<b>$</b> <code>${cmd}</code><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#3b1313; color:#ff6b6b; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${err.message}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#773333; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
+        }
+    }
+
+    // ==========================================
+    // ВЕБ-ПОИСК И ЗАГРУЗКА ФАЙЛОВ (/search)
+    // ==========================================
+    if (userText.startsWith('/search ')) {
+        const query = userText.substring(8).trim();
+        if (!query) return res.json({ ok: true, text: "⚠️ Укажите запрос: <code>/search документация express filetype:pdf</code>" });
+
+        console.log(`[WEB SEARCH] Выполнение команды: ${query}`);
+        try {
+            let searchResultsText = "";
+
+            if (query.toLowerCase().startsWith('download:')) {
+                const dlUrl = query.substring(9).trim();
+                const parsed = new URL.URL(dlUrl);
+                let filename = path.basename(parsed.pathname) || `dl_${Date.now()}`;
+                filename = filename.replace(/[^a-zA-Z0-9.\-_]/g, '_');
+                const savePath = path.join(TMP_DIR, filename);
+
+                const response = await axios.get(dlUrl, { 
+                    responseType: 'stream', 
+                    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36' },
+                    timeout: 60000
+                });
+                
+                const writer = fs.createWriteStream(savePath);
+                response.data.pipe(writer);
+                await new Promise((resolve, reject) => { 
+                    writer.on('finish', resolve); 
+                    writer.on('error', reject); 
+                });
+                
+                const stat = fs.statSync(savePath);
+                searchResultsText = `✅ Файл успешно скачан!\n📁 Путь на сервере: ${savePath}\n📦 Размер: ${(stat.size/1024).toFixed(1)} KB\n🔗 Источник: ${dlUrl}`;
+            } else {
+                const response = await axios.get('https://html.duckduckgo.com/html/', {
+                    params: { q: query },
+                    headers: { 
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                        'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7'
+                    }
+                });
+                
+                const $ = cheerio.load(response.data);
+                let results = [];
+                
+                $('.result__body').each((i, el) => {
+                    if (i >= 6) return; 
+                    const title = $(el).find('.result__title').text().trim();
+                    const snippet = $(el).find('.result__snippet').text().trim();
+                    let href = $(el).find('.result__url').attr('href');
+                    
+                    if (href && href.includes('uddg=')) {
+                        try { href = decodeURIComponent(href.split('uddg=')[1].split('&')[0]); } catch(e) {}
+                    }
+                    if (title && snippet) {
+                        results.push(`[${i+1}] ${title}\n${snippet}\nСсылка: ${href}`);
+                    }
+                });
+
+                if (results.length > 0) {
+                    searchResultsText = `Результаты поиска:\n\n${results.join('\n\n')}\n\n💡 Подсказка: если найден нужный файл (pdf, zip и т.д.), ты можешь предложить мне скачать его через команду /search download:ССЫЛКА_НА_ФАЙЛ`;
+                } else {
+                    searchResultsText = `По запросу «${query}» ничего не найдено. Возможно, стоит уточнить запрос.`;
+                }
+            }
+
+            userText = `Я, как пользователь, запросил выполнение команды /search "${query}".\nВот системный отчет и сырые данные, которые вернул скрипт:\n\n${searchResultsText}\n\nПожалуйста, проанализируй эти данные и дай мне развернутый, читаемый ответ. Если файл скачан, скажи, что я могу скачать его на свое устройство через команду /download [путь].`;
+
+        } catch (err) {
+            console.error(`[WEB SEARCH ERROR]`, err.message);
+            userText = `Я попытался выполнить команду /search "${query}", но сервер вернул ошибку: ${err.message}. Объясни мне, почему это могло произойти, и предложи другие варианты.`;
         }
     }
 
@@ -295,7 +380,6 @@ app.get('/', async (req, res) => {
         imgLim = parseInt(req.query.img_limit);
     }
 
-    // Выбираем User-Agent на основе запроса
     let isMobile = req.query.mobile_ua === 'true';
     let userAgentStr = isMobile 
         ? 'Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36'
@@ -485,4 +569,4 @@ app.get('/', async (req, res) => {
 });
 
 app.listen(process.env.PORT || 8080);
-                
+    
