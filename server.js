@@ -28,6 +28,7 @@ const PROXY_SECRET = process.env.PROXY_SECRET || "MySuperSecretPassword2026";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY || ""; 
 const SOCKS5_PROXY = process.env.SOCKS5_PROXY || ""; 
+const SCRAPER_API_KEY = process.env.SCRAPER_API_KEY || ""; // <--- НОВЫЙ КЛЮЧ SCRAPER API
 
 let genAI = null;
 let geminiHistory = []; 
@@ -56,23 +57,11 @@ const origErr = console.error; console.error = function(...args) { origErr.apply
 console.log("[SYSTEM] Сервер запущен. Часовой пояс: Europe/Kyiv");
 
 // ==========================================
-// СИСТЕМА ПРОКСИРОВАНИЯ (SOCKS5)
+// СИСТЕМА ПРОКСИРОВАНИЯ И АНТИ-БОТА
 // ==========================================
 let useProxy = false;
+let useBypass = false;
 
-function getAxiosConfig(extraConfig = {}) {
-    const config = { ...extraConfig };
-    if (useProxy && SOCKS5_PROXY) {
-        const agent = new SocksProxyAgent(SOCKS5_PROXY);
-        config.httpAgent = agent;
-        config.httpsAgent = agent;
-    }
-    return config;
-}
-
-// ==========================================
-// ИДЕАЛЬНЫЕ ЗАГОЛОВКИ БРАУЗЕРА (АНТИ-БОТ)
-// ==========================================
 function getBrowserHeaders(isMobile = false) {
     const ua = isMobile 
         ? 'Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36'
@@ -80,7 +69,7 @@ function getBrowserHeaders(isMobile = false) {
     
     return {
         'User-Agent': ua,
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
         'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
         'Cache-Control': 'max-age=0',
         'sec-ch-ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
@@ -92,6 +81,28 @@ function getBrowserHeaders(isMobile = false) {
         'sec-fetch-user': '?1',
         'upgrade-insecure-requests': '1'
     };
+}
+
+// Получить готовый конфиг для Axios (решает, пускать ли через API, SOCKS5 или напрямую)
+function getRequestConfig(targetUrl, isMobile, extraConfig = {}, renderJs = false) {
+    // 1. Если включен Bypass API (с приоритетом над SOCKS5)
+    if (useBypass && SCRAPER_API_KEY) {
+        const fetchUrl = `http://api.scraperapi.com/?api_key=${SCRAPER_API_KEY}&url=${encodeURIComponent(targetUrl)}${renderJs ? '&render=true' : ''}`;
+        return {
+            fetchUrl: fetchUrl,
+            axiosConfig: { ...extraConfig } // Заголовки и прокси не нужны, API делает всё сам
+        };
+    }
+    
+    // 2. Если включен обычный SOCKS5
+    const config = { ...extraConfig, headers: extraConfig.headers || getBrowserHeaders(isMobile) };
+    if (useProxy && SOCKS5_PROXY) {
+        const agent = new SocksProxyAgent(SOCKS5_PROXY);
+        config.httpAgent = agent;
+        config.httpsAgent = agent;
+    }
+    
+    return { fetchUrl: targetUrl, axiosConfig: config };
 }
 
 // ==========================================
@@ -107,10 +118,7 @@ if (fs.existsSync(LIMITS_FILE)) {
 const originalFetch = global.fetch;
 global.fetch = async (input, init) => {
     const response = await originalFetch(input, init);
-    let url = '';
-    if (typeof input === 'string') url = input;
-    else if (input && input.url) url = input.url; 
-    else if (input && input.href) url = input.href; 
+    let url = typeof input === 'string' ? input : (input && input.url ? input.url : ''); 
 
     if (url && url.includes('generativelanguage.googleapis.com/v1beta/models/')) {
         const match = url.match(/models\/([^:]+)(?::generateContent|:streamGenerateContent)/);
@@ -118,8 +126,7 @@ global.fetch = async (input, init) => {
             const modelId = match[1];
             if (response.status === 429) {
                 try {
-                    const clonedRes = response.clone();
-                    const data = await clonedRes.json();
+                    const data = await response.clone().json();
                     let limit = '?'; let reset = '?';
                     if (data.error && data.error.details) {
                         const quotaFailure = data.error.details.find(d => d['@type'] === 'type.googleapis.com/google.rpc.QuotaFailure');
@@ -150,10 +157,8 @@ app.post('/gemini', async (req, res) => {
     if (req.body.action === 'upload') {
         try {
             const filename = req.body.filename.replace(/[^a-zA-Z0-9.\-_]/g, '_');
-            const buffer = Buffer.from(req.body.b64, 'base64');
             const savePath = path.join(TMP_DIR, filename);
-            fs.writeFileSync(savePath, buffer);
-            console.log(`[UPLOAD] Файл сохранен на диск сервера: ${savePath}`);
+            fs.writeFileSync(savePath, Buffer.from(req.body.b64, 'base64'));
             return res.json({ok: true, text: `✅ Файл <b>${filename}</b> загружен!<br>Путь: <code>${savePath}</code>`});
         } catch (err) { return res.status(500).json({ok: false, error: err.message}); }
     }
@@ -163,38 +168,42 @@ app.post('/gemini', async (req, res) => {
     if (userText === '/help') {
         const respHtml = `🤖 <b>СИСТЕМА CHATOPS:</b><br><br>
 <code>/status</code> — Состояние сервера<br>
+<code>/proxy on</code> | <code>/proxy off</code> — Управление SOCKS5 Proxy<br>
+<code>/bypass on</code> | <code>/bypass off</code> — Анти-бот API (Обход Cloudflare)<br>
 <code>/limit</code> — Состояние моделей (Блокировки)<br>
 <code>/logs</code> — Логи Northflank<br>
-<code>/proxy on</code> | <code>/proxy off</code> — Управление SOCKS5 Proxy<br>
-<code>/download [путь]</code> — Скачать файл (до 15 МБ)<br>
-<code>/upload</code> — Загрузить файл<br>
-<code>/search [запрос]</code> — Поиск в сети<br>
-<code>/search download:[url]</code> — Прямая загрузка файла<br><br>
-💻 <b>Терминал:</b><br>
-<code>! [команда]</code> — Консоль Linux`;
+<code>/download [путь]</code> — Скачать файл<br>
+<code>/search [запрос]</code> — Поиск в сети<br><br>
+💻 <b>Терминал:</b><br><code>! [команда]</code> — Консоль Linux`;
         return res.json({ ok: true, text: respHtml });
     }
 
-    // --- УПРАВЛЕНИЕ PROXY ---
     if (userText === '/proxy on') {
-        if (!SOCKS5_PROXY) return res.json({ok: true, text: "❌ Переменная SOCKS5_PROXY не настроена в Northflank."});
+        if (!SOCKS5_PROXY) return res.json({ok: true, text: "❌ Переменная SOCKS5_PROXY не настроена."});
         useProxy = true;
-        console.log("[PROXY] Включен обход блокировок через внешний сервер.");
-        return res.json({ok: true, text: "🚀 <b>Proxy включен!</b><br>Веб-парсинг и скачивание теперь идут через твой внешний сервер."});
+        return res.json({ok: true, text: "🚀 <b>Proxy включен!</b><br>Трафик идет через твой внешний сервер."});
     }
-
     if (userText === '/proxy off') {
         useProxy = false;
-        console.log("[PROXY] Отключен. Трафик идет напрямую с Northflank.");
-        return res.json({ok: true, text: "🛑 <b>Proxy выключен.</b><br>Запросы идут через родной IP дата-центра."});
+        return res.json({ok: true, text: "🛑 <b>Proxy выключен.</b>"});
+    }
+
+    if (userText === '/bypass on') {
+        if (!SCRAPER_API_KEY) return res.json({ok: true, text: "❌ Переменная SCRAPER_API_KEY не настроена."});
+        useBypass = true;
+        return res.json({ok: true, text: "🕵️ <b>Bypass API включен!</b><br>Запросы к защищенным сайтам выполняются через невидимый браузер. Обход Cloudflare активен."});
+    }
+    if (userText === '/bypass off') {
+        useBypass = false;
+        return res.json({ok: true, text: "🛑 <b>Bypass API выключен.</b>"});
     }
 
     if (userText === '/limit') {
-        if (Object.keys(geminiLimits).length === 0) return res.json({ ok: true, text: `📊 <b>Состояние API-моделей:</b><br><br>Google больше не передает остаток лимитов заранее.` });
-        let tableHtml = `<table style="width:100%; border-collapse:collapse; font-size:11px; margin-top:5px; background:#fff; color:#333;"><tr style="background:#1a73e8; color:white;"><th style="padding:4px; border:1px solid #ccc;">Модель</th><th style="padding:4px; border:1px solid #ccc;">Статус</th><th style="padding:4px; border:1px solid #ccc;">Макс.</th><th style="padding:4px; border:1px solid #ccc;">Сброс</th><th style="padding:4px; border:1px solid #ccc;">Обновлено</th></tr>`;
+        if (Object.keys(geminiLimits).length === 0) return res.json({ ok: true, text: `📊 <b>Состояние API-моделей:</b><br>Сделайте запрос к ИИ, чтобы начать отслеживание.` });
+        let tableHtml = `<table style="width:100%; border-collapse:collapse; font-size:11px; margin-top:5px; background:#fff; color:#333;"><tr style="background:#1a73e8; color:white;"><th style="padding:4px; border:1px solid #ccc;">Модель</th><th style="padding:4px; border:1px solid #ccc;">Статус</th><th style="padding:4px; border:1px solid #ccc;">Сброс</th></tr>`;
         for (const [model, data] of Object.entries(geminiLimits)) {
             const statusColor = data.status === 'OK' ? '#28a745' : '#dc3545'; 
-            tableHtml += `<tr><td style="padding:4px; border:1px solid #ccc; font-weight:bold;">${model}</td><td style="padding:4px; border:1px solid #ccc; text-align:center; font-weight:bold; color:${statusColor};">${data.status}</td><td style="padding:4px; border:1px solid #ccc; text-align:center;">${data.limit}</td><td style="padding:4px; border:1px solid #ccc; text-align:center;">${data.reset}</td><td style="padding:4px; border:1px solid #ccc; text-align:center; color:#666;">${data.lastUpdated}</td></tr>`;
+            tableHtml += `<tr><td style="padding:4px; border:1px solid #ccc; font-weight:bold;">${model}</td><td style="padding:4px; border:1px solid #ccc; text-align:center; font-weight:bold; color:${statusColor};">${data.status}</td><td style="padding:4px; border:1px solid #ccc; text-align:center;">${data.reset}</td></tr>`;
         }
         tableHtml += `</table>`;
         return res.json({ ok: true, text: `📊 <b>Мониторинг блокировок:</b><br>${tableHtml}` });
@@ -219,9 +228,7 @@ app.post('/gemini', async (req, res) => {
     if (userText === '/status') {
         const mem = process.memoryUsage();
         const uptime = Math.floor(process.uptime());
-        const hours = Math.floor(uptime / 3600);
-        const mins = Math.floor((uptime % 3600) / 60);
-        return res.json({ ok: true, text: `🖥 <b>Статус контейнера:</b><br>⏱ Uptime: <b>${hours}ч ${mins}м</b><br>💾 Память: <b>${(mem.rss / 1024 / 1024).toFixed(1)} MB</b><br>🔒 Proxy: <b>${useProxy ? '<span style="color:green">ВКЛЮЧЕН</span>' : '<span style="color:red">ВЫКЛЮЧЕН</span>'}</b><br>🧠 Контекст ИИ: <b>${geminiHistory.length} сообщений</b>` });
+        return res.json({ ok: true, text: `🖥 <b>Статус контейнера:</b><br>⏱ Uptime: <b>${Math.floor(uptime/3600)}ч ${Math.floor((uptime%3600)/60)}м</b><br>💾 Память: <b>${(mem.rss / 1024 / 1024).toFixed(1)} MB</b><br>🔒 SOCKS5 Proxy: <b>${useProxy ? '<span style="color:green">ВКЛЮЧЕН</span>' : '<span style="color:red">ВЫКЛЮЧЕН</span>'}</b><br>🕵️ Bypass API: <b>${useBypass ? '<span style="color:green">ВКЛЮЧЕН</span>' : '<span style="color:red">ВЫКЛЮЧЕН</span>'}</b><br>🧠 Контекст ИИ: <b>${geminiHistory.length} сообщений</b>` });
     }
 
     if (userText.startsWith('!')) {
@@ -232,9 +239,9 @@ app.post('/gemini', async (req, res) => {
             let output = stdout; if (stderr) output += `\n[STDERR]:\n${stderr}`;
             if (!output) output = "[Выполнено успешно]";
             if (output.length > 3000) output = output.substring(0, 3000) + "\n...[ОБРЕЗАН]...";
-            return res.json({ ok: true, text: `<b>$</b> <code>${cmd}</code><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#1e1e1e; color:#00ff00; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${output}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#555; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
+            return res.json({ ok: true, text: `<b>$</b> <code>${cmd}</code><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#1e1e1e; color:#0f0; padding:8px; border-radius:5px; white-space:pre-wrap;">${output}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#555; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
         } catch (err) {
-            return res.json({ ok: true, text: `<b>$</b> <code>${cmd}</code><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#3b1313; color:#ff6b6b; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${err.message}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#773333; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
+            return res.json({ ok: true, text: `<b>$</b> <code>${cmd}</code><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#3b1313; color:#f66; padding:8px; border-radius:5px; white-space:pre-wrap;">${err.message}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#773333; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
         }
     }
 
@@ -245,7 +252,6 @@ app.post('/gemini', async (req, res) => {
         const query = userText.substring(8).trim();
         if (!query) return res.json({ ok: true, text: "⚠️ Укажите запрос." });
 
-        console.log(`[WEB SEARCH] Выполнение: ${query}`);
         try {
             let searchResultsText = "";
 
@@ -255,11 +261,9 @@ app.post('/gemini', async (req, res) => {
                 let filename = (path.basename(parsed.pathname) || `dl_${Date.now()}`).replace(/[^a-zA-Z0-9.\-_]/g, '_');
                 const savePath = path.join(TMP_DIR, filename);
 
-                const response = await axios.get(dlUrl, getAxiosConfig({ 
-                    responseType: 'stream', 
-                    headers: getBrowserHeaders(false),
-                    timeout: 60000
-                }));
+                // Скачивание файлов тоже поддерживает Bypass API (без рендера JS, чтобы экономить время)
+                const reqConf = getRequestConfig(dlUrl, false, { responseType: 'stream', timeout: 60000 }, false);
+                const response = await axios.get(reqConf.fetchUrl, reqConf.axiosConfig);
                 
                 const writer = fs.createWriteStream(savePath);
                 response.data.pipe(writer);
@@ -294,15 +298,6 @@ app.post('/gemini', async (req, res) => {
     }
 
     if (!GEMINI_API_KEY) return res.status(500).json({ok: false, error: "Отсутствует GEMINI_API_KEY"});
-
-    if (req.body.action === 'get_models') {
-        try {
-            const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_API_KEY}`;
-            const response = await axios.get(url);
-            const models = response.data.models.filter(m => m.supportedGenerationMethods.includes('generateContent')).map(m => ({ id: m.name.replace('models/', ''), name: m.displayName }));
-            return res.json({ ok: true, models: models });
-        } catch (err) { return res.status(500).json({ ok: false, error: err.message }); }
-    }
 
     if (req.body.clear === 'true') {
         geminiHistory = []; console.log("[GEMINI] Память очищена.");
@@ -369,17 +364,18 @@ app.get('/', async (req, res) => {
     }
 
     try {
-        // ИСПОЛЬЗУЕМ ИДЕАЛЬНЫЕ ЗАГОЛОВКИ И SOCKS5
-        const response = await axios.get(targetUrl, getAxiosConfig({ 
+        // Главный запрос к HTML (Включаем render=true для обхода JavaScript-капчи)
+        const mainReq = getRequestConfig(targetUrl, isMobile, { 
             responseType: 'stream',
-            headers: getBrowserHeaders(isMobile),
-            timeout: 15000,
+            timeout: useBypass ? 30000 : 15000, // Scraper API рендерит дольше
             validateStatus: () => true 
-        }));
+        }, true);
+        
+        const response = await axios.get(mainReq.fetchUrl, mainReq.axiosConfig);
         
         if ([401, 403, 406, 429, 503].includes(response.status)) {
             console.warn(`[PROXY] Сайт заблокировал запрос (Код ${response.status})`);
-            return res.status(200).send(`<!DOCTYPE html><html><body style="text-align:center; padding:40px;"><h2 style="color:#dc3545;">🚫 Защита от ботов (${response.status})</h2><p>Попробуйте включить Proxy командой <b>/proxy on</b> в чате с ИИ.</p></body></html>`);
+            return res.status(200).send(`<!DOCTYPE html><html><body style="text-align:center; padding:40px;"><h2 style="color:#dc3545;">🚫 Защита от ботов (${response.status})</h2><p>Попробуйте включить Анти-бот командой <b>/bypass on</b> в чате с ИИ.</p></body></html>`);
         }
 
         const contentType = response.headers['content-type'] || '';
@@ -398,7 +394,14 @@ app.get('/', async (req, res) => {
             for (let i = 0; i < Math.min(stylesheets.length, 5); i++) {
                 let href = $(stylesheets[i]).attr('href');
                 if (href && href.startsWith('/')) href = baseUrl + href;
-                if (href) { try { const cssRes = await axios.get(href, getAxiosConfig({ headers: getBrowserHeaders(isMobile), timeout: 3000 })); $(stylesheets[i]).replaceWith(`<style>${cssRes.data}</style>`); } catch (e) {} }
+                if (href) { 
+                    try { 
+                        // Стили запрашиваем без рендера JS (render=false)
+                        const cssReq = getRequestConfig(href, isMobile, { timeout: 10000 }, false);
+                        const cssRes = await axios.get(cssReq.fetchUrl, cssReq.axiosConfig); 
+                        $(stylesheets[i]).replaceWith(`<style>${cssRes.data}</style>`); 
+                    } catch (e) {} 
+                }
             }
 
             const images = $('img').toArray();
@@ -411,7 +414,9 @@ app.get('/', async (req, res) => {
                 if (src && !src.startsWith('data:') && src.startsWith('/')) src = baseUrl + src;
                 if (src && !src.startsWith('data:')) {
                     try { 
-                        const imgRes = await axios.get(src, getAxiosConfig({ responseType: 'arraybuffer', headers: getBrowserHeaders(isMobile), timeout: 3500 }));
+                        // Картинки тоже без рендера JS
+                        const imgReq = getRequestConfig(src, isMobile, { responseType: 'arraybuffer', timeout: 10000 }, false);
+                        const imgRes = await axios.get(imgReq.fetchUrl, imgReq.axiosConfig);
                         img.attr('src', `data:${imgRes.headers['content-type']};base64,${Buffer.from(imgRes.data, 'binary').toString('base64')}`);
                         img.removeAttr('srcset').removeAttr('data-src').removeAttr('loading'); 
                     } catch (e) {}
@@ -493,4 +498,4 @@ app.get('/', async (req, res) => {
 });
 
 app.listen(process.env.PORT || 8080);
-        
+            
