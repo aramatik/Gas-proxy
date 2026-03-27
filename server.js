@@ -144,7 +144,7 @@ app.post('/gemini', async (req, res) => {
         useProxy = true;
         
         const curlDir = path.join(TMP_DIR, 'curl-impersonate');
-        const curlBin = path.join(curlDir, 'curl-impersonate-chrome');
+        const curlBin = path.join(curlDir, 'curl_chrome110'); // <-- ТЕПЕРЬ ЗАПУСКАЕМ ОБЕРТКУ
         
         if (!fs.existsSync(curlBin)) {
             console.log("[PROXY] Скачивание curl-impersonate...");
@@ -165,18 +165,18 @@ app.post('/gemini', async (req, res) => {
             }
         }
 
-        // Фикс для Alpine Linux: Устанавливаем gcompat
+        // Фикс для Alpine Linux: Устанавливаем gcompat и bash
         try {
             if (fs.existsSync('/etc/os-release')) {
                 const osRelease = fs.readFileSync('/etc/os-release', 'utf8');
                 if (osRelease.includes('Alpine')) {
-                    console.log("[PROXY] Обнаружен Alpine Linux. Установка gcompat...");
-                    await execPromise(`apk add --no-cache gcompat libc6-compat`);
-                    console.log("[PROXY] Успешно установлен слой совместимости gcompat.");
+                    console.log("[PROXY] Обнаружен Alpine Linux. Установка зависимостей...");
+                    await execPromise(`apk add --no-cache bash gcompat libc6-compat`);
+                    console.log("[PROXY] Успешно установлены bash и gcompat.");
                 }
             }
         } catch (e) {
-            console.log("[PROXY WARNING] Ошибка установки gcompat (возможно нет прав root):", e.message);
+            console.log("[PROXY WARNING] Ошибка установки зависимостей:", e.message);
         }
 
         return res.json({ok: true, text: "🚀 <b>Ghost Proxy включен!</b><br>Трафик идет через SOCKS5 с идеальной подменой JA3 (Chrome)."});
@@ -228,9 +228,9 @@ app.post('/gemini', async (req, res) => {
             let output = stdout; if (stderr) output += `\n[STDERR]:\n${stderr}`;
             if (!output) output = "[Выполнено успешно]";
             if (output.length > 3000) output = output.substring(0, 3000) + "\n...[ОБРЕЗАН]...";
-            return res.json({ ok: true, text: `<b>$</b> <code>${cmd}</code><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#1e1e1e; color:#00ff00; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${output}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#555; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
+            return res.json({ ok: true, text: `<b>$</b> <code>${cmd}</code><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#1e1e1e; color:#0f0; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${output}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#555; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
         } catch (err) {
-            return res.json({ ok: true, text: `<b>$</b> <code>${cmd}</code><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#3b1313; color:#ff6b6b; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${err.message}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#773333; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
+            return res.json({ ok: true, text: `<b>$</b> <code>${cmd}</code><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#3b1313; color:#f66; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${err.message}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#773333; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
         }
     }
 
@@ -247,9 +247,9 @@ app.post('/gemini', async (req, res) => {
                 const savePath = path.join(TMP_DIR, filename);
 
                 if (useProxy && SOCKS5_PROXY) {
-                    const curlBin = path.join(TMP_DIR, 'curl-impersonate', 'curl-impersonate-chrome');
+                    const curlBin = path.join(TMP_DIR, 'curl-impersonate', 'curl_chrome110'); // <-- И ТУТ ОБЕРТКА
                     const proxyStr = SOCKS5_PROXY.replace('socks5://', 'socks5h://');
-                    await execPromise(`${curlBin} -m 60 -s -L -x "${proxyStr}" -o "${savePath}" "${dlUrl}"`);
+                    await execPromise(`"${curlBin}" -m 60 -s -L -x "${proxyStr}" -o "${savePath}" "${dlUrl}"`);
                 } else {
                     const response = await axios.get(dlUrl, { responseType: 'stream', headers: getBrowserHeaders(false), timeout: 60000 });
                     const writer = fs.createWriteStream(savePath);
@@ -347,11 +347,10 @@ app.get('/', async (req, res) => {
             const reqId = crypto.randomUUID();
             const headFile = path.join(TMP_DIR, `${reqId}_head.txt`);
             const bodyFile = path.join(TMP_DIR, `${reqId}_body.bin`);
-            const curlBin = path.join(TMP_DIR, 'curl-impersonate', 'curl-impersonate-chrome');
+            const curlBin = path.join(TMP_DIR, 'curl-impersonate', 'curl_chrome110'); // <-- И ТУТ ОБЕРТКА
             const proxyStr = SOCKS5_PROXY.replace('socks5://', 'socks5h://');
             
-            // Выполняем запрос через curl-impersonate, сохраняя заголовки и тело
-            await execPromise(`${curlBin} -m 15 -s -L -x "${proxyStr}" -D "${headFile}" -o "${bodyFile}" "${targetUrl}"`);
+            await execPromise(`"${curlBin}" -m 15 -s -L -x "${proxyStr}" -D "${headFile}" -o "${bodyFile}" "${targetUrl}"`);
             
             const headContent = fs.readFileSync(headFile, 'utf8');
             const headerLines = headContent.split('\r\n');
@@ -377,7 +376,6 @@ app.get('/', async (req, res) => {
                 fs.unlinkSync(headFile);
             }
         } else {
-            // Классический Axios
             const response = await axios.get(targetUrl, { 
                 responseType: 'stream', headers: getBrowserHeaders(isMobile), timeout: 15000, validateStatus: () => true 
             });
@@ -402,7 +400,6 @@ app.get('/', async (req, res) => {
             }
         }
 
-        // --- Обработка HTML ---
         if (isHtml) {
             const $ = cheerio.load(htmlContent);
             const baseUrl = parsedTarget.origin;
@@ -445,10 +442,7 @@ app.get('/', async (req, res) => {
 
             res.set('Content-Type', 'text/html; charset=utf-8');
             return res.send($.html());
-        } 
-        
-        // --- Обработка Загрузки файлов ---
-        else {
+        } else {
             const fileId = crypto.randomUUID();
             const fileDir = path.join(TMP_DIR, fileId);
             fs.mkdirSync(fileDir, { recursive: true });
@@ -516,4 +510,4 @@ app.get('/', async (req, res) => {
 });
 
 app.listen(process.env.PORT || 8080);
-        
+    
