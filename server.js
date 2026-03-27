@@ -49,8 +49,16 @@ function captureLog(msg) {
     serverLogs.push(`[${getKyivTime()}] ${msg}`);
     if (serverLogs.length > MAX_LOG_LINES) serverLogs.shift();
 }
-const origLog = console.log; console.log = function(...args) { origLog.apply(console, args); captureLog(util.format(...args)); };
-const origErr = console.error; console.error = function(...args) { origErr.apply(console, args); captureLog("ERROR: " + util.format(...args)); };
+const origLog = console.log; 
+console.log = function(...args) { 
+    origLog.apply(console, args); 
+    captureLog(util.format(...args)); 
+};
+const origErr = console.error; 
+console.error = function(...args) { 
+    origErr.apply(console, args); 
+    captureLog("ERROR: " + util.format(...args)); 
+};
 
 console.log("[SYSTEM] Сервер запущен. Часовой пояс: Europe/Kyiv");
 
@@ -137,8 +145,12 @@ app.post('/gemini', async (req, res) => {
             const filename = req.body.filename.replace(/[^a-zA-Z0-9.\-_]/g, '_');
             const savePath = path.join(TMP_DIR, filename);
             fs.writeFileSync(savePath, Buffer.from(req.body.b64, 'base64'));
+            console.log(`[UPLOAD] Файл сохранен: ${savePath}`);
             return res.json({ok: true, text: `✅ Файл <b>${filename}</b> загружен!<br>Путь: <code>${savePath}</code>`});
-        } catch (err) { return res.status(500).json({ok: false, error: err.message}); }
+        } catch (err) { 
+            console.error("[UPLOAD ERROR]", err.message);
+            return res.status(500).json({ok: false, error: err.message}); 
+        }
     }
 
     let userText = req.body.text ? req.body.text.trim() : "";
@@ -176,6 +188,7 @@ app.post('/gemini', async (req, res) => {
                 await execPromise(`tar -xzf ${tarPath} -C ${curlDir}`);
                 console.log("[PROXY] curl-impersonate распакован.");
             } catch (e) {
+                console.error("[PROXY ERROR]", e.message);
                 return res.json({ok: true, text: `❌ Ошибка загрузки curl-impersonate: ${e.message}`});
             }
         }
@@ -184,20 +197,22 @@ app.post('/gemini', async (req, res) => {
             if (fs.existsSync('/etc/os-release')) {
                 const osRelease = fs.readFileSync('/etc/os-release', 'utf8');
                 if (osRelease.includes('Alpine')) {
-                    console.log("[PROXY] Обнаружен Alpine Linux. Установка зависимостей...");
+                    console.log("[PROXY] Обнаружен Alpine Linux. Проверка зависимостей...");
                     await execPromise(`apk add --no-cache bash gcompat libc6-compat`);
-                    console.log("[PROXY] Успешно установлены bash и gcompat.");
+                    console.log("[PROXY] Успешно проверены bash и gcompat.");
                 }
             }
         } catch (e) {
             console.log("[PROXY WARNING] Ошибка установки зависимостей:", e.message);
         }
 
+        console.log("[PROXY] Ghost Proxy успешно активирован.");
         return res.json({ok: true, text: "🚀 <b>Ghost Proxy включен!</b><br>Трафик идет через SOCKS5 с идеальной подменой JA3 (Chrome)."});
     }
 
     if (userText === '/proxy off') {
         useProxy = false;
+        console.log("[PROXY] Ghost Proxy отключен.");
         return res.json({ok: true, text: "🛑 <b>Proxy выключен.</b>"});
     }
 
@@ -219,6 +234,8 @@ app.post('/gemini', async (req, res) => {
         if (stat.isDirectory()) return res.json({ok: true, text: `❌ Это папка. Сначала запакуйте её: <code>!zip -r /tmp/dir.zip ${targetPath}</code>`});
         const mb = (stat.size / 1024 / 1024).toFixed(2);
         if (stat.size > 15 * 1024 * 1024) return res.json({ok: true, text: `⚠️ Файл слишком большой (${mb} МБ). Максимум 15 МБ.`});
+        
+        console.log(`[DOWNLOAD] Подготовлен файл: ${targetPath} (${mb} MB)`);
         const fakeUrl = `http://system.local/dl?path=${encodeURIComponent(targetPath)}`;
         return res.json({ok: true, text: `📦 <b>Файл готов (${mb} MB)</b><br><a href="${fakeUrl}" style="display:inline-block; margin-top:8px; padding:8px 12px; background:#28a745; color:white; text-decoration:none; border-radius:5px; font-weight:bold;">📥 Загрузить на телефон</a>`});
     }
@@ -231,20 +248,21 @@ app.post('/gemini', async (req, res) => {
     if (userText === '/status') {
         const mem = process.memoryUsage();
         const uptime = Math.floor(process.uptime());
-        return res.json({ ok: true, text: `🖥 <b>Статус:</b><br>⏱ Uptime: <b>${Math.floor(uptime/3600)}ч ${Math.floor((uptime%3600)/60)}м</b><br>💾 Память: <b>${(mem.rss / 1024 / 1024).toFixed(1)} MB</b><br>🔒 Ghost Proxy: <b>${useProxy ? '<span style="color:green">ВКЛЮЧЕН</span>' : '<span style="color:red">ВЫКЛЮЧЕН</span>'}</b>` });
+        return res.json({ ok: true, text: `🖥 <b>Статус:</b><br>⏱ Uptime: <b>${Math.floor(uptime/3600)}ч ${Math.floor((uptime%3600)/60)}м</b><br>💾 Память: <b>${(mem.rss / 1024 / 1024).toFixed(1)} MB</b><br>🔒 Ghost Proxy: <b>${useProxy ? '<span style="color:green">ВКЛЮЧЕН</span>' : '<span style="color:red">ВЫКЛЮЧЕН</span>'}</b><br>🧠 Контекст: <b>${geminiHistory.length} сообщений</b>` });
     }
 
     if (userText.startsWith('!')) {
         const cmd = userText.substring(1).trim();
         if (!cmd) return res.json({ ok: true, text: "⚠️ Введите команду." });
         try {
+            console.log(`[CHATOPS] Выполнение: ${cmd}`);
             const { stdout, stderr } = await execPromise(cmd, { timeout: 15000 }); 
             let output = stdout; if (stderr) output += `\n[STDERR]:\n${stderr}`;
             if (!output) output = "[Выполнено успешно]";
             if (output.length > 3000) output = output.substring(0, 3000) + "\n...[ОБРЕЗАН]...";
-            return res.json({ ok: true, text: `<b>$</b> <code>${cmd}</code><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#1e1e1e; color:#0f0; padding:8px; border-radius:5px; white-space:pre-wrap;">${output}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#555; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
+            return res.json({ ok: true, text: `<b>$</b> <code>${cmd}</code><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#1e1e1e; color:#0f0; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${output}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#555; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
         } catch (err) {
-            return res.json({ ok: true, text: `<b>$</b> <code>${cmd}</code><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#3b1313; color:#f66; padding:8px; border-radius:5px; white-space:pre-wrap;">${err.message}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#773333; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
+            return res.json({ ok: true, text: `<b>$</b> <code>${cmd}</code><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#3b1313; color:#f66; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${err.message}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#773333; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
         }
     }
 
@@ -252,6 +270,7 @@ app.post('/gemini', async (req, res) => {
         const query = userText.substring(8).trim();
         if (!query) return res.json({ ok: true, text: "⚠️ Укажите запрос." });
 
+        console.log(`[WEB SEARCH] Выполнение: ${query}`);
         try {
             let searchResultsText = "";
             if (query.toLowerCase().startsWith('download:')) {
@@ -261,16 +280,19 @@ app.post('/gemini', async (req, res) => {
                 const savePath = path.join(TMP_DIR, filename);
 
                 if (useProxy && SOCKS5_PROXY) {
+                    console.log(`[WEB SEARCH] Скачивание через Ghost Proxy: ${dlUrl}`);
                     const curlBin = path.join(TMP_DIR, 'curl-impersonate', 'curl_chrome110'); 
                     const proxyStr = SOCKS5_PROXY.replace('socks5://', 'socks5h://');
                     await execPromise(`bash "${curlBin}" --compressed -m 60 -s -L -x "${proxyStr}" -o "${savePath}" "${dlUrl}"`);
                 } else {
+                    console.log(`[WEB SEARCH] Скачивание напрямую: ${dlUrl}`);
                     const response = await axios.get(dlUrl, { responseType: 'stream', headers: getBrowserHeaders(false), timeout: 60000 });
                     const writer = fs.createWriteStream(savePath);
                     response.data.pipe(writer);
                     await new Promise((resolve, reject) => { writer.on('finish', resolve); writer.on('error', reject); });
                 }
                 const stat = fs.statSync(savePath);
+                console.log(`[WEB SEARCH] Файл успешно скачан. Размер: ${(stat.size/1024).toFixed(1)} KB`);
                 searchResultsText = `✅ Файл успешно скачан!\n📁 Путь: ${savePath}\n📦 Размер: ${(stat.size/1024).toFixed(1)} KB`;
             } else {
                 if (!TAVILY_API_KEY) throw new Error("Не настроен TAVILY_API_KEY.");
@@ -290,17 +312,30 @@ app.post('/gemini', async (req, res) => {
                 } else { searchResultsText = `По запросу «${query}» ничего не найдено.`; }
             }
             userText = `Команда /search "${query}". Данные:\n\n${searchResultsText}\n\nПроанализируй и дай ответ.`;
-        } catch (err) { userText = `Ошибка поиска "${query}": ${err.message}.`; }
+        } catch (err) { 
+            console.error(`[WEB SEARCH ERROR]`, err.message);
+            userText = `Ошибка поиска "${query}": ${err.message}.`; 
+        }
     }
 
     if (!GEMINI_API_KEY) return res.status(500).json({ok: false, error: "Отсутствует GEMINI_API_KEY"});
-    if (req.body.clear === 'true') { geminiHistory = []; if (userText === 'clear') return res.json({ok: true, text: "История очищена"}); }
+    if (req.body.clear === 'true') { 
+        geminiHistory = []; 
+        console.log("[GEMINI] Память контекста нейросети очищена.");
+        if (userText === 'clear') return res.json({ok: true, text: "История очищена"}); 
+    }
 
     const modelName = req.body.model || "gemini-2.5-flash"; 
     const msgParts = [];
     if (userText) msgParts.push(userText);
-    if (req.body.b64 && req.body.mimeType) msgParts.push({ inlineData: { data: req.body.b64, mimeType: req.body.mimeType } });
+    if (req.body.b64 && req.body.mimeType) {
+        msgParts.push({ inlineData: { data: req.body.b64, mimeType: req.body.mimeType } });
+        console.log(`[GEMINI] К запросу прикреплен файл: ${req.body.mimeType}`);
+    }
+
     if (msgParts.length === 0) return res.status(400).json({ok: false, error: "Пустой запрос"});
+
+    console.log(`[GEMINI] Запрос к ИИ. Модель: [${modelName}]. Контекст в памяти: [${geminiHistory.length} сообщений]`);
 
     try {
         const isGemma = modelName.toLowerCase().includes('gemma');
@@ -311,7 +346,10 @@ app.post('/gemini', async (req, res) => {
         const result = await chat.sendMessage(msgParts);
         geminiHistory = await chat.getHistory();
         return res.json({ ok: true, text: result.response.text() });
-    } catch (err) { return res.status(500).json({ ok: false, error: err.message }); }
+    } catch (err) { 
+        console.error("[GEMINI ERROR]", err.message);
+        return res.status(500).json({ ok: false, error: err.message }); 
+    }
 });
 
 // ==========================================
@@ -327,6 +365,7 @@ app.get('/', async (req, res) => {
         res.set('Content-Type', 'application/octet-stream');
         res.set('Content-Disposition', `attachment; filename="${path.basename(nfDlPath)}"`);
         res.set('Content-Length', fs.statSync(nfDlPath).size);
+        console.log(`[DOWNLOAD] Отдача локального файла: ${nfDlPath}`);
         return fs.createReadStream(nfDlPath).pipe(res);
     }
 
@@ -334,6 +373,8 @@ app.get('/', async (req, res) => {
     if (!targetUrl) return res.status(400).send('Укажите URL.');
     let imgLim = req.query.img_limit !== undefined ? parseInt(req.query.img_limit) : 10;
     let isMobile = req.query.mobile_ua === 'true';
+
+    console.log(`\n[PROXY] Запрос ресурса: ${targetUrl} (Картинки: ${imgLim === -1 ? 'ВСЕ' : imgLim}, Режим: ${isMobile ? 'Mobile' : 'Desktop'})`);
 
     const parsedTarget = new URL.URL(targetUrl);
     const nfFileId = parsedTarget.searchParams.get('nf_fileId');
@@ -345,6 +386,7 @@ app.get('/', async (req, res) => {
         res.set('Content-Type', 'application/octet-stream');
         res.set('Content-Disposition', `attachment; filename="${nfPartName}"`);
         res.set('Content-Length', fs.statSync(partPath).size);
+        console.log(`[PROXY] Отдача части архива: ${nfPartName}`);
         return fs.createReadStream(partPath).pipe(res);
     }
 
@@ -358,6 +400,7 @@ app.get('/', async (req, res) => {
 
     try {
         if (useProxy && SOCKS5_PROXY) {
+            console.log(`[PROXY] Использование Ghost Proxy (curl-impersonate)...`);
             const reqId = crypto.randomUUID();
             const headFile = path.join(TMP_DIR, `${reqId}_head.txt`);
             const bodyFile = path.join(TMP_DIR, `${reqId}_body.bin`);
@@ -387,6 +430,7 @@ app.get('/', async (req, res) => {
                 fs.unlinkSync(headFile);
             }
         } else {
+            console.log(`[PROXY] Запрос напрямую (axios)...`);
             const response = await axios.get(targetUrl, { 
                 responseType: 'stream', headers: getBrowserHeaders(isMobile), timeout: 15000, validateStatus: () => true 
             });
@@ -408,7 +452,20 @@ app.get('/', async (req, res) => {
             }
         }
 
+        // --- УМНАЯ ЗАГЛУШКА АНТИ-БОТОВ ---
+        if ([401, 403, 406, 429, 503].includes(responseStatus)) {
+            console.warn(`[PROXY WARNING] Сайт заблокировал запрос. HTTP Код: ${responseStatus}`);
+            return res.status(200).send(`<!DOCTYPE html><html><body style="font-family:sans-serif; text-align:center; padding:40px; background:#f8d7da; color:#721c24; border-radius:10px; margin:20px;"><h2 style="margin-top:0;">🚫 Доступ заблокирован (${responseStatus})</h2><p>Целевой сервер отклонил запрос. Попробуйте использовать команду <b>/proxy on</b> в чате.</p></body></html>`);
+        }
+
+        if (isHtml && (htmlContent.includes('<title>Just a moment...</title>') || htmlContent.includes('Enable JavaScript and cookies to continue'))) {
+             console.warn(`[PROXY WARNING] Обнаружена JS-капча Cloudflare (Код ${responseStatus})`);
+             return res.status(200).send(`<!DOCTYPE html><html><body style="font-family:sans-serif; text-align:center; padding:40px; background:#fff3cd; color:#856404; border-radius:10px; margin:20px;"><h2 style="margin-top:0;">🤖 JS-Капча (Cloudflare)</h2><p>Сайт требует вычисления сложной JavaScript-капчи, которую невозможно выполнить через серверный прокси. Откройте эту ссылку в обычном браузере.</p></body></html>`);
+        }
+
+        // --- Обработка HTML ---
         if (isHtml) {
+            console.log(`[PROXY] HTML загружен успешно. Парсинг ресурсов...`);
             const $ = cheerio.load(htmlContent);
             const baseUrl = parsedTarget.origin;
             
@@ -442,15 +499,21 @@ app.get('/', async (req, res) => {
             }
             
             if (req.query.nf_dl_html === 'true') {
+                console.log(`[PROXY] Формирование HTML для скачивания: ${parsedTarget.hostname}`);
                 $('head').prepend(`<base href="${parsedTarget.origin}">`);
                 res.set('Content-Type', 'application/octet-stream'); 
                 res.set('Content-Disposition', `attachment; filename="page_${parsedTarget.hostname.replace(/[^a-zA-Z0-9.-]/g, '_')}.html"`);
                 return res.send($.html());
             }
 
+            console.log(`[PROXY] Страница успешно обработана и отправлена.`);
             res.set('Content-Type', 'text/html; charset=utf-8');
             return res.send($.html());
-        } else {
+        } 
+        
+        // --- Обработка Загрузки файлов ---
+        else {
+            console.log(`[PROXY] Обнаружен файл (${contentType}). Подготовка к загрузке...`);
             const fileId = crypto.randomUUID();
             const fileDir = path.join(TMP_DIR, fileId);
             fs.mkdirSync(fileDir, { recursive: true });
@@ -466,6 +529,7 @@ app.get('/', async (req, res) => {
             if (downloadFilePath) {
                 downloadedBytes = fs.statSync(downloadFilePath).size;
                 if (downloadedBytes > MAX_FILE_SIZE) {
+                    console.warn(`[PROXY] Ошибка: Файл превысил лимит ${MAX_FILE_SIZE/1024/1024} МБ`);
                     fs.unlinkSync(downloadFilePath); return res.status(200).send(`<h2>🐘 Файл больше ${MAX_FILE_SIZE/1024/1024} МБ.</h2>`);
                 }
                 fs.renameSync(downloadFilePath, filePath);
@@ -484,20 +548,28 @@ app.get('/', async (req, res) => {
                 if (isTooLarge) { fs.rmSync(fileDir, { recursive: true, force: true }); return res.status(200).send(`<h2>🐘 Файл больше ${MAX_FILE_SIZE/1024/1024} МБ.</h2>`); }
             }
 
+            console.log(`[PROXY] Файл скачан на сервер. Размер: ${(downloadedBytes/1024/1024).toFixed(2)} MB`);
             setTimeout(() => { try { fs.rmSync(fileDir, { recursive: true, force: true }); } catch(e) {} }, 2 * 60 * 60 * 1000);
 
             if (downloadedBytes <= CHUNK_SIZE_MB * 1024 * 1024) {
+                console.log(`[PROXY] Отдача файла напрямую клиенту.`);
                 res.set('Content-Type', contentType);
                 res.set('Content-Disposition', `attachment; filename="${fileName}"`);
                 return fs.createReadStream(filePath).pipe(res);
             } else {
+                console.log(`[PROXY] Файл больше ${CHUNK_SIZE_MB} МБ. Запущена упаковка в ZIP архив...`);
                 const zipBaseName = safeName + '.zip';
                 try { await execPromise(`cd "${fileDir}" && zip -s ${CHUNK_SIZE_MB}m "${zipBaseName}" "${safeName}"`); } 
-                catch (zipErr) { return res.status(500).send("Ошибка архивации"); }
+                catch (zipErr) { 
+                    console.error(`[PROXY ERROR] Ошибка создания ZIP:`, zipErr.message);
+                    return res.status(500).send("Ошибка архивации"); 
+                }
                 
                 fs.unlinkSync(filePath);
                 const archiveParts = fs.readdirSync(fileDir).filter(f => f.startsWith(safeName + '.')).sort(); 
                 
+                console.log(`[PROXY] Архив создан успешно (${archiveParts.length} частей).`);
+
                 let buttonsHtml = ''; let totalCompressedBytes = 0; 
                 archiveParts.forEach((partName) => {
                     parsedTarget.searchParams.set('nf_fileId', fileId); parsedTarget.searchParams.set('nf_partName', partName);
@@ -513,9 +585,10 @@ app.get('/', async (req, res) => {
             }
         }
     } catch (error) { 
+        console.error(`[PROXY ERROR] Ошибка шлюза:`, error.message);
         res.status(500).send(`Ошибка шлюза: ${error.message}`); 
     }
 });
 
 app.listen(process.env.PORT || 8080);
-            
+    
