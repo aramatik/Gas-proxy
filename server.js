@@ -155,6 +155,7 @@ app.post('/gemini', async (req, res) => {
 <code>/search [запрос]</code> — Поиск в сети (поддерживает <i>site:</i> и <i>filetype:</i>)<br>
 <code>/search download:[url]</code> — Прямая загрузка файла<br><br>
 💻 <b>Терминал:</b><br>
+<i>Путь контейнера: <code>/usr/src/app</code></i><br>
 <code>! [команда]</code> — Консоль Linux<br>
 <i>Пример: <code>!ls -la /tmp</code></i>`;
         return res.json({ ok: true, text: respHtml });
