@@ -28,7 +28,6 @@ const PROXY_SECRET = process.env.PROXY_SECRET || "MySuperSecretPassword2026";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY || ""; 
 const SOCKS5_PROXY = process.env.SOCKS5_PROXY || ""; 
-const SCRAPER_API_KEY = process.env.SCRAPER_API_KEY || ""; // <--- НОВЫЙ КЛЮЧ SCRAPER API
 
 let genAI = null;
 let geminiHistory = []; 
@@ -57,10 +56,9 @@ const origErr = console.error; console.error = function(...args) { origErr.apply
 console.log("[SYSTEM] Сервер запущен. Часовой пояс: Europe/Kyiv");
 
 // ==========================================
-// СИСТЕМА ПРОКСИРОВАНИЯ И АНТИ-БОТА
+// СИСТЕМА ПРОКСИРОВАНИЯ (SOCKS5 + JA3 SPOOFING)
 // ==========================================
 let useProxy = false;
-let useBypass = false;
 
 function getBrowserHeaders(isMobile = false) {
     const ua = isMobile 
@@ -83,26 +81,22 @@ function getBrowserHeaders(isMobile = false) {
     };
 }
 
-// Получить готовый конфиг для Axios (решает, пускать ли через API, SOCKS5 или напрямую)
-function getRequestConfig(targetUrl, isMobile, extraConfig = {}, renderJs = false) {
-    // 1. Если включен Bypass API (с приоритетом над SOCKS5)
-    if (useBypass && SCRAPER_API_KEY) {
-        const fetchUrl = `http://api.scraperapi.com/?api_key=${SCRAPER_API_KEY}&url=${encodeURIComponent(targetUrl)}${renderJs ? '&render=true' : ''}`;
-        return {
-            fetchUrl: fetchUrl,
-            axiosConfig: { ...extraConfig } // Заголовки и прокси не нужны, API делает всё сам
-        };
-    }
-    
-    // 2. Если включен обычный SOCKS5
-    const config = { ...extraConfig, headers: extraConfig.headers || getBrowserHeaders(isMobile) };
+function getAxiosConfig(extraConfig = {}) {
+    const config = { ...extraConfig };
     if (useProxy && SOCKS5_PROXY) {
-        const agent = new SocksProxyAgent(SOCKS5_PROXY);
+        // Подмена TLS-шифров (JA3) под поведение реального Chrome
+        const tlsOptions = {
+            ciphers: 'TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES256-GCM-SHA384',
+            honorCipherOrder: true,
+            minVersion: 'TLSv1.2',
+            maxVersion: 'TLSv1.3',
+            secureOptions: crypto.constants.SSL_OP_NO_SSLv3 | crypto.constants.SSL_OP_NO_TLSv1 | crypto.constants.SSL_OP_NO_TLSv1_1
+        };
+        const agent = new SocksProxyAgent(SOCKS5_PROXY, tlsOptions);
         config.httpAgent = agent;
         config.httpsAgent = agent;
     }
-    
-    return { fetchUrl: targetUrl, axiosConfig: config };
+    return config;
 }
 
 // ==========================================
@@ -169,7 +163,6 @@ app.post('/gemini', async (req, res) => {
         const respHtml = `🤖 <b>СИСТЕМА CHATOPS:</b><br><br>
 <code>/status</code> — Состояние сервера<br>
 <code>/proxy on</code> | <code>/proxy off</code> — Управление SOCKS5 Proxy<br>
-<code>/bypass on</code> | <code>/bypass off</code> — Анти-бот API (Обход Cloudflare)<br>
 <code>/limit</code> — Состояние моделей (Блокировки)<br>
 <code>/logs</code> — Логи Northflank<br>
 <code>/download [путь]</code> — Скачать файл<br>
@@ -181,21 +174,11 @@ app.post('/gemini', async (req, res) => {
     if (userText === '/proxy on') {
         if (!SOCKS5_PROXY) return res.json({ok: true, text: "❌ Переменная SOCKS5_PROXY не настроена."});
         useProxy = true;
-        return res.json({ok: true, text: "🚀 <b>Proxy включен!</b><br>Трафик идет через твой внешний сервер."});
+        return res.json({ok: true, text: "🚀 <b>Proxy включен!</b><br>Трафик идет через твой внешний сервер с подменой TLS-отпечатков."});
     }
     if (userText === '/proxy off') {
         useProxy = false;
         return res.json({ok: true, text: "🛑 <b>Proxy выключен.</b>"});
-    }
-
-    if (userText === '/bypass on') {
-        if (!SCRAPER_API_KEY) return res.json({ok: true, text: "❌ Переменная SCRAPER_API_KEY не настроена."});
-        useBypass = true;
-        return res.json({ok: true, text: "🕵️ <b>Bypass API включен!</b><br>Запросы к защищенным сайтам выполняются через невидимый браузер. Обход Cloudflare активен."});
-    }
-    if (userText === '/bypass off') {
-        useBypass = false;
-        return res.json({ok: true, text: "🛑 <b>Bypass API выключен.</b>"});
     }
 
     if (userText === '/limit') {
@@ -228,7 +211,7 @@ app.post('/gemini', async (req, res) => {
     if (userText === '/status') {
         const mem = process.memoryUsage();
         const uptime = Math.floor(process.uptime());
-        return res.json({ ok: true, text: `🖥 <b>Статус контейнера:</b><br>⏱ Uptime: <b>${Math.floor(uptime/3600)}ч ${Math.floor((uptime%3600)/60)}м</b><br>💾 Память: <b>${(mem.rss / 1024 / 1024).toFixed(1)} MB</b><br>🔒 SOCKS5 Proxy: <b>${useProxy ? '<span style="color:green">ВКЛЮЧЕН</span>' : '<span style="color:red">ВЫКЛЮЧЕН</span>'}</b><br>🕵️ Bypass API: <b>${useBypass ? '<span style="color:green">ВКЛЮЧЕН</span>' : '<span style="color:red">ВЫКЛЮЧЕН</span>'}</b><br>🧠 Контекст ИИ: <b>${geminiHistory.length} сообщений</b>` });
+        return res.json({ ok: true, text: `🖥 <b>Статус контейнера:</b><br>⏱ Uptime: <b>${Math.floor(uptime/3600)}ч ${Math.floor((uptime%3600)/60)}м</b><br>💾 Память: <b>${(mem.rss / 1024 / 1024).toFixed(1)} MB</b><br>🔒 SOCKS5 Proxy: <b>${useProxy ? '<span style="color:green">ВКЛЮЧЕН</span>' : '<span style="color:red">ВЫКЛЮЧЕН</span>'}</b><br>🧠 Контекст ИИ: <b>${geminiHistory.length} сообщений</b>` });
     }
 
     if (userText.startsWith('!')) {
@@ -261,9 +244,11 @@ app.post('/gemini', async (req, res) => {
                 let filename = (path.basename(parsed.pathname) || `dl_${Date.now()}`).replace(/[^a-zA-Z0-9.\-_]/g, '_');
                 const savePath = path.join(TMP_DIR, filename);
 
-                // Скачивание файлов тоже поддерживает Bypass API (без рендера JS, чтобы экономить время)
-                const reqConf = getRequestConfig(dlUrl, false, { responseType: 'stream', timeout: 60000 }, false);
-                const response = await axios.get(reqConf.fetchUrl, reqConf.axiosConfig);
+                const response = await axios.get(dlUrl, getAxiosConfig({ 
+                    responseType: 'stream', 
+                    headers: getBrowserHeaders(false),
+                    timeout: 60000
+                }));
                 
                 const writer = fs.createWriteStream(savePath);
                 response.data.pipe(writer);
@@ -364,18 +349,16 @@ app.get('/', async (req, res) => {
     }
 
     try {
-        // Главный запрос к HTML (Включаем render=true для обхода JavaScript-капчи)
-        const mainReq = getRequestConfig(targetUrl, isMobile, { 
+        const response = await axios.get(targetUrl, getAxiosConfig({ 
             responseType: 'stream',
-            timeout: useBypass ? 30000 : 15000, // Scraper API рендерит дольше
+            headers: getBrowserHeaders(isMobile),
+            timeout: 15000,
             validateStatus: () => true 
-        }, true);
-        
-        const response = await axios.get(mainReq.fetchUrl, mainReq.axiosConfig);
+        }));
         
         if ([401, 403, 406, 429, 503].includes(response.status)) {
             console.warn(`[PROXY] Сайт заблокировал запрос (Код ${response.status})`);
-            return res.status(200).send(`<!DOCTYPE html><html><body style="text-align:center; padding:40px;"><h2 style="color:#dc3545;">🚫 Защита от ботов (${response.status})</h2><p>Попробуйте включить Анти-бот командой <b>/bypass on</b> в чате с ИИ.</p></body></html>`);
+            return res.status(200).send(`<!DOCTYPE html><html><body style="text-align:center; padding:40px;"><h2 style="color:#dc3545;">🚫 Защита от ботов (${response.status})</h2><p>Попробуйте включить Proxy командой <b>/proxy on</b> в чате с ИИ.</p></body></html>`);
         }
 
         const contentType = response.headers['content-type'] || '';
@@ -396,9 +379,7 @@ app.get('/', async (req, res) => {
                 if (href && href.startsWith('/')) href = baseUrl + href;
                 if (href) { 
                     try { 
-                        // Стили запрашиваем без рендера JS (render=false)
-                        const cssReq = getRequestConfig(href, isMobile, { timeout: 10000 }, false);
-                        const cssRes = await axios.get(cssReq.fetchUrl, cssReq.axiosConfig); 
+                        const cssRes = await axios.get(href, getAxiosConfig({ headers: getBrowserHeaders(isMobile), timeout: 10000 })); 
                         $(stylesheets[i]).replaceWith(`<style>${cssRes.data}</style>`); 
                     } catch (e) {} 
                 }
@@ -414,9 +395,7 @@ app.get('/', async (req, res) => {
                 if (src && !src.startsWith('data:') && src.startsWith('/')) src = baseUrl + src;
                 if (src && !src.startsWith('data:')) {
                     try { 
-                        // Картинки тоже без рендера JS
-                        const imgReq = getRequestConfig(src, isMobile, { responseType: 'arraybuffer', timeout: 10000 }, false);
-                        const imgRes = await axios.get(imgReq.fetchUrl, imgReq.axiosConfig);
+                        const imgRes = await axios.get(src, getAxiosConfig({ responseType: 'arraybuffer', headers: getBrowserHeaders(isMobile), timeout: 10000 }));
                         img.attr('src', `data:${imgRes.headers['content-type']};base64,${Buffer.from(imgRes.data, 'binary').toString('base64')}`);
                         img.removeAttr('srcset').removeAttr('data-src').removeAttr('loading'); 
                     } catch (e) {}
