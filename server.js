@@ -69,6 +69,21 @@ function getBrowserHeaders(isMobile = false) {
     };
 }
 
+function decodeBuffer(buffer, contentType) {
+    let charset = 'utf-8';
+    if (contentType.toLowerCase().includes('windows-1251')) {
+        charset = 'windows-1251';
+    } else {
+        const head = buffer.subarray(0, 2048).toString('ascii').toLowerCase();
+        if (head.includes('windows-1251')) charset = 'windows-1251';
+    }
+    try {
+        return new TextDecoder(charset).decode(buffer);
+    } catch(e) {
+        return buffer.toString('utf-8');
+    }
+}
+
 // ==========================================
 // ТЕЛЕМЕТРИЯ ЛИМИТОВ
 // ==========================================
@@ -349,7 +364,6 @@ app.get('/', async (req, res) => {
             const curlBin = path.join(TMP_DIR, 'curl-impersonate', 'curl_chrome110'); 
             const proxyStr = SOCKS5_PROXY.replace('socks5://', 'socks5h://');
             
-            // Добавлен флаг --compressed и явный вызов через bash
             await execPromise(`bash "${curlBin}" --compressed -m 15 -s -L -x "${proxyStr}" -D "${headFile}" -o "${bodyFile}" "${targetUrl}"`);
             
             const headContent = fs.readFileSync(headFile, 'utf8');
@@ -363,13 +377,10 @@ app.get('/', async (req, res) => {
                 }
             }
             
-            if ([401, 403, 406, 429, 503].includes(responseStatus)) {
-                return res.status(200).send(`<!DOCTYPE html><html><body style="text-align:center; padding:40px;"><h2 style="color:#dc3545;">🚫 Защита от ботов (${responseStatus})</h2></body></html>`);
-            }
-
             if (contentType.includes('text/html')) {
                 isHtml = true;
-                htmlContent = fs.readFileSync(bodyFile, 'utf8');
+                const bodyBuffer = fs.readFileSync(bodyFile);
+                htmlContent = decodeBuffer(bodyBuffer, contentType);
                 fs.unlinkSync(bodyFile); fs.unlinkSync(headFile);
             } else {
                 downloadFilePath = bodyFile; 
@@ -383,10 +394,6 @@ app.get('/', async (req, res) => {
             contentType = response.headers['content-type'] || '';
             contentDisp = response.headers['content-disposition'] || '';
             
-            if ([401, 403, 406, 429, 503].includes(responseStatus)) {
-                return res.status(200).send(`<!DOCTYPE html><html><body style="text-align:center; padding:40px;"><h2 style="color:#dc3545;">🚫 Защита от ботов (${responseStatus})</h2></body></html>`);
-            }
-
             if (contentType.includes('text/html')) {
                 isHtml = true;
                 let chunks = []; let htmlBytes = 0;
@@ -394,7 +401,8 @@ app.get('/', async (req, res) => {
                     chunks.push(chunk); htmlBytes += chunk.length;
                     if (htmlBytes > 20 * 1024 * 1024) { response.data.destroy(); return res.status(400).send("Слишком тяжелая страница."); }
                 }
-                htmlContent = Buffer.concat(chunks).toString('utf-8');
+                const bodyBuffer = Buffer.concat(chunks);
+                htmlContent = decodeBuffer(bodyBuffer, contentType);
             } else {
                 downloadStream = response.data;
             }
@@ -510,4 +518,4 @@ app.get('/', async (req, res) => {
 });
 
 app.listen(process.env.PORT || 8080);
-    
+            
