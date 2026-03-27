@@ -152,7 +152,7 @@ app.post('/gemini', async (req, res) => {
 <code>/logs</code> — Логи Northflank<br>
 <code>/download [путь]</code> — Скачать файл (до 15 МБ)<br>
 <code>/upload</code> — Загрузить файл на сервер<br>
-<code>/search [запрос]</code> — Поиск в сети (поддерживает <i>site:</i> и <i>filetype:</i>)<br>
+<code>/search [запрос]</code> — Поиск в сети с помощью Tavily API (лимит 1000 запросов в месяц, поддерживает <i>site:</i> и <i>filetype:</i>)<br>
 <code>/search download:[url]</code> — Прямая загрузка файла<br><br>
 💻 <b>Терминал:</b><br>
 <i>Путь контейнера: <code>/usr/src/app</code></i><br>
