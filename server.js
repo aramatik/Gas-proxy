@@ -10,7 +10,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const util = require('util');
-const { exec, spawn } = require('child_process');
+const { exec } = require('child_process');
 const execPromise = util.promisify(exec);
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const { SocksProxyAgent } = require('socks-proxy-agent');
@@ -27,6 +27,7 @@ const TMP_DIR = '/tmp';
 const PROXY_SECRET = process.env.PROXY_SECRET || "MySuperSecretPassword2026";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY || ""; 
+const SOCKS5_PROXY = process.env.SOCKS5_PROXY || ""; // socks5://user:pass@ip:port
 
 let genAI = null;
 let geminiHistory = []; 
@@ -55,16 +56,14 @@ const origErr = console.error; console.error = function(...args) { origErr.apply
 console.log("[SYSTEM] Сервер запущен. Часовой пояс: Europe/Kyiv");
 
 // ==========================================
-// СИСТЕМА VPN (CLOUDFLARE WARP SOCKS5)
+// СИСТЕМА ПРОКСИРОВАНИЯ (SOCKS5)
 // ==========================================
-let vpnProcess = null;
-let useWarp = false;
-const WARP_PORT = 1080;
+let useProxy = false;
 
 function getAxiosConfig(extraConfig = {}) {
     const config = { ...extraConfig };
-    if (useWarp) {
-        const agent = new SocksProxyAgent(`socks5://127.0.0.1:${WARP_PORT}`);
+    if (useProxy && SOCKS5_PROXY) {
+        const agent = new SocksProxyAgent(SOCKS5_PROXY);
         config.httpAgent = agent;
         config.httpsAgent = agent;
     }
@@ -140,64 +139,41 @@ app.post('/gemini', async (req, res) => {
     if (userText === '/help') {
         const respHtml = `🤖 <b>СИСТЕМА CHATOPS:</b><br><br>
 <code>/status</code> — Состояние сервера<br>
-<code>/limit</code> — Состояние моделей<br>
+<code>/limit</code> — Состояние моделей (Блокировки)<br>
 <code>/logs</code> — Логи Northflank<br>
-<code>/vpn on</code> | <code>/vpn off</code> — Управление Cloudflare WARP<br>
+<code>/proxy on</code> | <code>/proxy off</code> — Управление SOCKS5 Proxy<br>
 <code>/download [путь]</code> — Скачать файл (до 15 МБ)<br>
 <code>/upload</code> — Загрузить файл<br>
 <code>/search [запрос]</code> — Поиск в сети (поддерживает <i>site:</i> и <i>filetype:</i>)<br>
 <code>/search download:[url]</code> — Прямая загрузка файла<br><br>
 💻 <b>Терминал:</b><br>
-<code>! [команда]</code> — Консоль Linux`;
+<code>! [команда]</code> — Консоль Linux<br>
+<i>Пример: <code>!ls -la /tmp</code></i>`;
         return res.json({ ok: true, text: respHtml });
     }
 
-    // --- УПРАВЛЕНИЕ VPN ---
-    if (userText === '/vpn on') {
-        if (useWarp) return res.json({ok: true, text: "✅ VPN (Cloudflare WARP) уже работает."});
-        try {
-            console.log("[VPN] Попытка запуска Cloudflare WARP...");
-            const warpBin = path.join(TMP_DIR, 'warp-plus');
-            const localWarp = path.join(__dirname, 'warp-plus'); 
-            
-            if (!fs.existsSync(warpBin)) {
-                if (fs.existsSync(localWarp)) {
-                    console.log("[VPN] Найден локальный клиент, копирование в /tmp...");
-                    fs.copyFileSync(localWarp, warpBin);
-                    fs.chmodSync(warpBin, 0o755); 
-                    console.log("[VPN] Файл подготовлен к запуску.");
-                } else {
-                    throw new Error("Файл warp-plus не найден в корне репозитория! Положите распакованный файл рядом с server.js.");
-                }
-            }
-            
-            vpnProcess = spawn(warpBin, ['-b', `127.0.0.1:${WARP_PORT}`], { detached: true, stdio: 'ignore' });
-            vpnProcess.unref();
-            useWarp = true;
-            
-            await new Promise(r => setTimeout(r, 3000));
-            console.log("[VPN] Успешно запущен локальный SOCKS5 прокси на порту " + WARP_PORT);
-            return res.json({ok: true, text: "🚀 <b>VPN включен!</b><br>Веб-парсинг и скачивание теперь идут через Cloudflare WARP."});
-        } catch (err) {
-            console.error("[VPN ERROR]", err.message);
-            return res.json({ok: true, text: `❌ Ошибка VPN: ${err.message}`});
-        }
+    // --- УПРАВЛЕНИЕ PROXY ---
+    if (userText === '/proxy on') {
+        if (!SOCKS5_PROXY) return res.json({ok: true, text: "❌ Переменная SOCKS5_PROXY не настроена в Northflank."});
+        useProxy = true;
+        console.log("[PROXY] Включен обход блокировок через внешний сервер.");
+        return res.json({ok: true, text: "🚀 <b>Proxy включен!</b><br>Веб-парсинг и скачивание теперь идут через твой внешний сервер."});
     }
 
-    if (userText === '/vpn off') {
-        useWarp = false;
-        if (vpnProcess) { vpnProcess.kill(); vpnProcess = null; }
-        await execPromise('pkill warp-plus').catch(() => {});
-        console.log("[VPN] Отключен. Трафик идет напрямую.");
-        return res.json({ok: true, text: "🛑 <b>VPN выключен.</b><br>Запросы идут через родной IP сервера."});
+    if (userText === '/proxy off') {
+        useProxy = false;
+        console.log("[PROXY] Отключен. Трафик идет напрямую с Northflank.");
+        return res.json({ok: true, text: "🛑 <b>Proxy выключен.</b><br>Запросы идут через родной IP дата-центра."});
     }
 
     if (userText === '/limit') {
-        if (Object.keys(geminiLimits).length === 0) return res.json({ ok: true, text: `📊 Отправьте запрос ИИ, чтобы начать отслеживание статуса моделей.` });
-        let tableHtml = `<table style="width:100%; border-collapse:collapse; font-size:11px; margin-top:5px; background:#fff; color:#333;"><tr style="background:#1a73e8; color:white;"><th style="padding:4px; border:1px solid #ccc;">Модель</th><th style="padding:4px; border:1px solid #ccc;">Статус</th><th style="padding:4px; border:1px solid #ccc;">Сброс</th></tr>`;
+        if (Object.keys(geminiLimits).length === 0) {
+            return res.json({ ok: true, text: `📊 <b>Состояние API-моделей:</b><br><br>Google больше не передает остаток лимитов заранее. Сервер узнает точный лимит только при достижении потолка (ошибке 429). Сделайте запрос к ИИ, чтобы начать отслеживание статуса.` });
+        }
+        let tableHtml = `<table style="width:100%; border-collapse:collapse; font-size:11px; margin-top:5px; background:#fff; color:#333;"><tr style="background:#1a73e8; color:white;"><th style="padding:4px; border:1px solid #ccc;">Модель</th><th style="padding:4px; border:1px solid #ccc;">Статус</th><th style="padding:4px; border:1px solid #ccc;">Макс.</th><th style="padding:4px; border:1px solid #ccc;">Сброс</th><th style="padding:4px; border:1px solid #ccc;">Обновлено</th></tr>`;
         for (const [model, data] of Object.entries(geminiLimits)) {
             const statusColor = data.status === 'OK' ? '#28a745' : '#dc3545'; 
-            tableHtml += `<tr><td style="padding:4px; border:1px solid #ccc; font-weight:bold;">${model}</td><td style="padding:4px; border:1px solid #ccc; text-align:center; font-weight:bold; color:${statusColor};">${data.status}</td><td style="padding:4px; border:1px solid #ccc; text-align:center;">${data.reset}</td></tr>`;
+            tableHtml += `<tr><td style="padding:4px; border:1px solid #ccc; font-weight:bold;">${model}</td><td style="padding:4px; border:1px solid #ccc; text-align:center; font-weight:bold; color:${statusColor};">${data.status}</td><td style="padding:4px; border:1px solid #ccc; text-align:center;">${data.limit}</td><td style="padding:4px; border:1px solid #ccc; text-align:center;">${data.reset}</td><td style="padding:4px; border:1px solid #ccc; text-align:center; color:#666;">${data.lastUpdated}</td></tr>`;
         }
         tableHtml += `</table>`;
         return res.json({ ok: true, text: `📊 <b>Мониторинг блокировок:</b><br>${tableHtml}` });
@@ -205,37 +181,48 @@ app.post('/gemini', async (req, res) => {
 
     if (userText.startsWith('/download ')) {
         const targetPath = userText.substring(10).trim();
-        if (!fs.existsSync(targetPath)) return res.json({ok: true, text: `❌ Файл не найден.`});
+        if (!fs.existsSync(targetPath)) return res.json({ok: true, text: `❌ Файл не найден: <code>${targetPath}</code>`});
         const stat = fs.statSync(targetPath);
-        if (stat.isDirectory()) return res.json({ok: true, text: `❌ Это папка. Сначала запакуйте её: <code>!zip -r /tmp/dir.zip ${targetPath}</code>`});
+        if (stat.isDirectory()) return res.json({ok: true, text: `❌ Это папка. Сначала запакуйте её:<br><code>!zip -r /tmp/dir.zip ${targetPath}</code>`});
+
         const mb = (stat.size / 1024 / 1024).toFixed(2);
-        if (stat.size > 15 * 1024 * 1024) return res.json({ok: true, text: `⚠️ Файл слишком большой (${mb} МБ). Максимум 15 МБ.`});
+        if (stat.size > 15 * 1024 * 1024) {
+            return res.json({ok: true, text: `⚠️ Файл слишком большой для прокси Google (${mb} МБ). Максимум 15 МБ.<br>Разрежьте его на части:<br><code>!zip -s 14m /tmp/archive.zip ${targetPath}</code>`});
+        }
+        
+        console.log(`[DOWNLOAD] Подготовлен файл для скачивания: ${targetPath} (${mb} MB)`);
         const fakeUrl = `http://system.local/dl?path=${encodeURIComponent(targetPath)}`;
-        return res.json({ok: true, text: `📦 <b>Файл готов (${mb} MB)</b><br><a href="${fakeUrl}" style="display:inline-block; margin-top:8px; padding:8px 12px; background:#28a745; color:white; text-decoration:none; border-radius:5px; font-weight:bold;">📥 Загрузить на телефон</a>`});
+        const respHtml = `📦 <b>Файл готов (${mb} MB)</b><br><a href="${fakeUrl}" style="display:inline-block; margin-top:8px; padding:8px 12px; background:#28a745; color:white; text-decoration:none; border-radius:5px; font-weight:bold;">📥 Загрузить на телефон</a>`;
+        return res.json({ok: true, text: respHtml});
     }
 
     if (userText === '/logs') {
         const logsHtml = serverLogs.length ? serverLogs.join('\n') : "Логи пусты.";
-        return res.json({ ok: true, text: `🖥 <b>Логи:</b><br><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#e0e0e0; padding:8px; border-radius:5px; white-space:pre-wrap;">${logsHtml}</div>` });
+        return res.json({ ok: true, text: `🖥 <b>Логи Northflank:</b><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#e0e0e0; color:#333; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${logsHtml}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#999; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
     }
     
     if (userText === '/status') {
         const mem = process.memoryUsage();
         const uptime = Math.floor(process.uptime());
-        return res.json({ ok: true, text: `🖥 <b>Статус контейнера:</b><br>⏱ Uptime: <b>${Math.floor(uptime/3600)}ч ${Math.floor((uptime%3600)/60)}м</b><br>💾 Память: <b>${(mem.rss / 1024 / 1024).toFixed(1)} MB</b><br>🔒 VPN: <b>${useWarp ? '<span style="color:green">ВКЛЮЧЕН</span>' : '<span style="color:red">ВЫКЛЮЧЕН</span>'}</b><br>🧠 Контекст: <b>${geminiHistory.length} сообщений</b>` });
+        const hours = Math.floor(uptime / 3600);
+        const mins = Math.floor((uptime % 3600) / 60);
+        return res.json({ ok: true, text: `🖥 <b>Статус контейнера:</b><br>⏱ Uptime: <b>${hours}ч ${mins}м</b><br>💾 Память (RSS): <b>${(mem.rss / 1024 / 1024).toFixed(1)} MB</b><br>🔒 Proxy: <b>${useProxy ? '<span style="color:green">ВКЛЮЧЕН</span>' : '<span style="color:red">ВЫКЛЮЧЕН</span>'}</b><br>🧠 Контекст ИИ: <b>${geminiHistory.length} сообщений</b>` });
     }
 
     if (userText.startsWith('!')) {
         const cmd = userText.substring(1).trim();
-        if (!cmd) return res.json({ ok: true, text: "⚠️ Введите команду." });
+        if (!cmd) return res.json({ ok: true, text: "⚠️ Введите команду после знака '!'." });
         try {
+            console.log(`[CHATOPS] Выполнение в консоли: ${cmd}`);
             const { stdout, stderr } = await execPromise(cmd, { timeout: 15000 }); 
-            let output = stdout; if (stderr) output += `\n[STDERR]:\n${stderr}`;
-            if (!output) output = "[Выполнено успешно]";
-            if (output.length > 3000) output = output.substring(0, 3000) + "\n...[ОБРЕЗАН]...";
-            return res.json({ ok: true, text: `<b>$</b> <code>${cmd}</code><br><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#1e1e1e; color:#0f0; padding:8px; border-radius:5px; white-space:pre-wrap;">${output}</div>` });
+            let output = stdout;
+            if (stderr) output += `\n[STDERR]:\n${stderr}`;
+            if (!output) output = "[Выполнено успешно, вывода нет]";
+            if (output.length > 3000) output = output.substring(0, 3000) + "\n...[ВЫВОД ОБРЕЗАН]...";
+            return res.json({ ok: true, text: `<b>$</b> <code>${cmd}</code><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#1e1e1e; color:#00ff00; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${output}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#555; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
         } catch (err) {
-            return res.json({ ok: true, text: `<b>$</b> <code>${cmd}</code><br><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#3b1313; color:#f66; padding:8px; border-radius:5px; white-space:pre-wrap;">${err.message}</div>` });
+            console.error(`[CHATOPS] Ошибка выполнения: ${cmd}`, err.message);
+            return res.json({ ok: true, text: `<b>$</b> <code>${cmd}</code><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#3b1313; color:#ff6b6b; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${err.message}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#773333; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
         }
     }
 
@@ -256,7 +243,7 @@ app.post('/gemini', async (req, res) => {
                 let filename = (path.basename(parsed.pathname) || `dl_${Date.now()}`).replace(/[^a-zA-Z0-9.\-_]/g, '_');
                 const savePath = path.join(TMP_DIR, filename);
 
-                // ИСПОЛЬЗУЕМ SOCKS5 VPN ЕСЛИ ОН ВКЛЮЧЕН
+                // ИСПОЛЬЗУЕМ SOCKS5 PROXY ЕСЛИ ОН ВКЛЮЧЕН
                 const response = await axios.get(dlUrl, getAxiosConfig({ 
                     responseType: 'stream', 
                     headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36' },
@@ -374,7 +361,7 @@ app.get('/', async (req, res) => {
     }
 
     try {
-        // ИСПОЛЬЗУЕМ SOCKS5 VPN ЕСЛИ ОН ВКЛЮЧЕН ДЛЯ ЗАПРОСА СТРАНИЦ
+        // ИСПОЛЬЗУЕМ SOCKS5 PROXY ЕСЛИ ОН ВКЛЮЧЕН
         const response = await axios.get(targetUrl, getAxiosConfig({ 
             responseType: 'stream',
             headers: { 'User-Agent': userAgentStr, 'Accept': 'text/html,*/*;q=0.8', 'Cache-Control': 'no-cache' },
@@ -384,7 +371,7 @@ app.get('/', async (req, res) => {
         
         if ([401, 403, 406, 429, 503].includes(response.status)) {
             console.warn(`[PROXY] Сайт заблокировал запрос (Код ${response.status})`);
-            return res.status(200).send(`<!DOCTYPE html><html><body style="text-align:center; padding:40px;"><h2 style="color:#dc3545;">🚫 Защита от ботов (${response.status})</h2><p>Попробуйте включить VPN командой <b>/vpn on</b> в чате с ИИ.</p></body></html>`);
+            return res.status(200).send(`<!DOCTYPE html><html><body style="text-align:center; padding:40px;"><h2 style="color:#dc3545;">🚫 Защита от ботов (${response.status})</h2><p>Попробуйте включить Proxy командой <b>/proxy on</b> в чате с ИИ.</p></body></html>`);
         }
 
         const contentType = response.headers['content-type'] || '';
@@ -498,4 +485,4 @@ app.get('/', async (req, res) => {
 });
 
 app.listen(process.env.PORT || 8080);
-        
+                                           
