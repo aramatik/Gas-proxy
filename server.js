@@ -158,10 +158,24 @@ app.post('/gemini', async (req, res) => {
         try {
             console.log("[VPN] Попытка запуска Cloudflare WARP...");
             const warpBin = path.join(TMP_DIR, 'warp-plus');
+            
             if (!fs.existsSync(warpBin)) {
-                console.log("[VPN] Скачивание клиента warp-plus...");
-                await execPromise(`curl -sL -o ${warpBin} https://github.com/bepass-org/warp-plus/releases/latest/download/warp-plus-linux-amd64 && chmod +x ${warpBin}`);
+                console.log("[VPN] Скачивание клиента warp-plus через axios...");
+                const dlUrl = "https://github.com/bepass-org/warp-plus/releases/latest/download/warp-plus-linux-amd64";
+                const response = await axios.get(dlUrl, { 
+                    responseType: 'stream',
+                    maxRedirects: 5 
+                });
+                const writer = fs.createWriteStream(warpBin);
+                response.data.pipe(writer);
+                await new Promise((resolve, reject) => { 
+                    writer.on('finish', resolve); 
+                    writer.on('error', reject); 
+                });
+                fs.chmodSync(warpBin, 0o755); 
+                console.log("[VPN] Скачивание завершено, файл сделан исполняемым.");
             }
+            
             vpnProcess = spawn(warpBin, ['-b', `127.0.0.1:${WARP_PORT}`], { detached: true, stdio: 'ignore' });
             vpnProcess.unref();
             useWarp = true;
@@ -489,4 +503,4 @@ app.get('/', async (req, res) => {
 });
 
 app.listen(process.env.PORT || 8080);
-        
+                                                            
