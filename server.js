@@ -158,28 +158,23 @@ app.post('/gemini', async (req, res) => {
         try {
             console.log("[VPN] Попытка запуска Cloudflare WARP...");
             const warpBin = path.join(TMP_DIR, 'warp-plus');
+            const localWarp = path.join(__dirname, 'warp-plus'); 
             
             if (!fs.existsSync(warpBin)) {
-                console.log("[VPN] Скачивание клиента warp-plus через axios...");
-                const dlUrl = "https://github.com/bepass-org/warp-plus/releases/latest/download/warp-plus-linux-amd64";
-                const response = await axios.get(dlUrl, { 
-                    responseType: 'stream',
-                    maxRedirects: 5 
-                });
-                const writer = fs.createWriteStream(warpBin);
-                response.data.pipe(writer);
-                await new Promise((resolve, reject) => { 
-                    writer.on('finish', resolve); 
-                    writer.on('error', reject); 
-                });
-                fs.chmodSync(warpBin, 0o755); 
-                console.log("[VPN] Скачивание завершено, файл сделан исполняемым.");
+                if (fs.existsSync(localWarp)) {
+                    console.log("[VPN] Найден локальный клиент, копирование в /tmp...");
+                    fs.copyFileSync(localWarp, warpBin);
+                    fs.chmodSync(warpBin, 0o755); 
+                    console.log("[VPN] Файл подготовлен к запуску.");
+                } else {
+                    throw new Error("Файл warp-plus не найден в корне репозитория! Положите распакованный файл рядом с server.js.");
+                }
             }
             
             vpnProcess = spawn(warpBin, ['-b', `127.0.0.1:${WARP_PORT}`], { detached: true, stdio: 'ignore' });
             vpnProcess.unref();
             useWarp = true;
-            // Ждем 3 секунды, чтобы VPN успел поднять соединение
+            
             await new Promise(r => setTimeout(r, 3000));
             console.log("[VPN] Успешно запущен локальный SOCKS5 прокси на порту " + WARP_PORT);
             return res.json({ok: true, text: "🚀 <b>VPN включен!</b><br>Веб-парсинг и скачивание теперь идут через Cloudflare WARP."});
@@ -503,4 +498,4 @@ app.get('/', async (req, res) => {
 });
 
 app.listen(process.env.PORT || 8080);
-                                                            
+        
