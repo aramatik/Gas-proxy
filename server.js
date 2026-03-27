@@ -27,7 +27,7 @@ const TMP_DIR = '/tmp';
 const PROXY_SECRET = process.env.PROXY_SECRET || "MySuperSecretPassword2026";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY || ""; 
-const SOCKS5_PROXY = process.env.SOCKS5_PROXY || ""; // socks5://user:pass@ip:port
+const SOCKS5_PROXY = process.env.SOCKS5_PROXY || ""; 
 
 let genAI = null;
 let geminiHistory = []; 
@@ -68,6 +68,30 @@ function getAxiosConfig(extraConfig = {}) {
         config.httpsAgent = agent;
     }
     return config;
+}
+
+// ==========================================
+// ИДЕАЛЬНЫЕ ЗАГОЛОВКИ БРАУЗЕРА (АНТИ-БОТ)
+// ==========================================
+function getBrowserHeaders(isMobile = false) {
+    const ua = isMobile 
+        ? 'Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36'
+        : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+    
+    return {
+        'User-Agent': ua,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+        'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Cache-Control': 'max-age=0',
+        'sec-ch-ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        'sec-ch-ua-mobile': isMobile ? '?1' : '?0',
+        'sec-ch-ua-platform': isMobile ? '"Android"' : '"Windows"',
+        'sec-fetch-dest': 'document',
+        'sec-fetch-mode': 'navigate',
+        'sec-fetch-site': 'none',
+        'sec-fetch-user': '?1',
+        'upgrade-insecure-requests': '1'
+    };
 }
 
 // ==========================================
@@ -144,11 +168,10 @@ app.post('/gemini', async (req, res) => {
 <code>/proxy on</code> | <code>/proxy off</code> — Управление SOCKS5 Proxy<br>
 <code>/download [путь]</code> — Скачать файл (до 15 МБ)<br>
 <code>/upload</code> — Загрузить файл<br>
-<code>/search [запрос]</code> — Поиск в сети (поддерживает <i>site:</i> и <i>filetype:</i>)<br>
+<code>/search [запрос]</code> — Поиск в сети<br>
 <code>/search download:[url]</code> — Прямая загрузка файла<br><br>
 💻 <b>Терминал:</b><br>
-<code>! [команда]</code> — Консоль Linux<br>
-<i>Пример: <code>!ls -la /tmp</code></i>`;
+<code>! [команда]</code> — Консоль Linux`;
         return res.json({ ok: true, text: respHtml });
     }
 
@@ -167,9 +190,7 @@ app.post('/gemini', async (req, res) => {
     }
 
     if (userText === '/limit') {
-        if (Object.keys(geminiLimits).length === 0) {
-            return res.json({ ok: true, text: `📊 <b>Состояние API-моделей:</b><br><br>Google больше не передает остаток лимитов заранее. Сервер узнает точный лимит только при достижении потолка (ошибке 429). Сделайте запрос к ИИ, чтобы начать отслеживание статуса.` });
-        }
+        if (Object.keys(geminiLimits).length === 0) return res.json({ ok: true, text: `📊 <b>Состояние API-моделей:</b><br><br>Google больше не передает остаток лимитов заранее.` });
         let tableHtml = `<table style="width:100%; border-collapse:collapse; font-size:11px; margin-top:5px; background:#fff; color:#333;"><tr style="background:#1a73e8; color:white;"><th style="padding:4px; border:1px solid #ccc;">Модель</th><th style="padding:4px; border:1px solid #ccc;">Статус</th><th style="padding:4px; border:1px solid #ccc;">Макс.</th><th style="padding:4px; border:1px solid #ccc;">Сброс</th><th style="padding:4px; border:1px solid #ccc;">Обновлено</th></tr>`;
         for (const [model, data] of Object.entries(geminiLimits)) {
             const statusColor = data.status === 'OK' ? '#28a745' : '#dc3545'; 
@@ -184,16 +205,10 @@ app.post('/gemini', async (req, res) => {
         if (!fs.existsSync(targetPath)) return res.json({ok: true, text: `❌ Файл не найден: <code>${targetPath}</code>`});
         const stat = fs.statSync(targetPath);
         if (stat.isDirectory()) return res.json({ok: true, text: `❌ Это папка. Сначала запакуйте её:<br><code>!zip -r /tmp/dir.zip ${targetPath}</code>`});
-
         const mb = (stat.size / 1024 / 1024).toFixed(2);
-        if (stat.size > 15 * 1024 * 1024) {
-            return res.json({ok: true, text: `⚠️ Файл слишком большой для прокси Google (${mb} МБ). Максимум 15 МБ.<br>Разрежьте его на части:<br><code>!zip -s 14m /tmp/archive.zip ${targetPath}</code>`});
-        }
-        
-        console.log(`[DOWNLOAD] Подготовлен файл для скачивания: ${targetPath} (${mb} MB)`);
+        if (stat.size > 15 * 1024 * 1024) return res.json({ok: true, text: `⚠️ Файл слишком большой (${mb} МБ). Максимум 15 МБ.`});
         const fakeUrl = `http://system.local/dl?path=${encodeURIComponent(targetPath)}`;
-        const respHtml = `📦 <b>Файл готов (${mb} MB)</b><br><a href="${fakeUrl}" style="display:inline-block; margin-top:8px; padding:8px 12px; background:#28a745; color:white; text-decoration:none; border-radius:5px; font-weight:bold;">📥 Загрузить на телефон</a>`;
-        return res.json({ok: true, text: respHtml});
+        return res.json({ok: true, text: `📦 <b>Файл готов (${mb} MB)</b><br><a href="${fakeUrl}" style="display:inline-block; margin-top:8px; padding:8px 12px; background:#28a745; color:white; text-decoration:none; border-radius:5px; font-weight:bold;">📥 Загрузить на телефон</a>`});
     }
 
     if (userText === '/logs') {
@@ -206,22 +221,19 @@ app.post('/gemini', async (req, res) => {
         const uptime = Math.floor(process.uptime());
         const hours = Math.floor(uptime / 3600);
         const mins = Math.floor((uptime % 3600) / 60);
-        return res.json({ ok: true, text: `🖥 <b>Статус контейнера:</b><br>⏱ Uptime: <b>${hours}ч ${mins}м</b><br>💾 Память (RSS): <b>${(mem.rss / 1024 / 1024).toFixed(1)} MB</b><br>🔒 Proxy: <b>${useProxy ? '<span style="color:green">ВКЛЮЧЕН</span>' : '<span style="color:red">ВЫКЛЮЧЕН</span>'}</b><br>🧠 Контекст ИИ: <b>${geminiHistory.length} сообщений</b>` });
+        return res.json({ ok: true, text: `🖥 <b>Статус контейнера:</b><br>⏱ Uptime: <b>${hours}ч ${mins}м</b><br>💾 Память: <b>${(mem.rss / 1024 / 1024).toFixed(1)} MB</b><br>🔒 Proxy: <b>${useProxy ? '<span style="color:green">ВКЛЮЧЕН</span>' : '<span style="color:red">ВЫКЛЮЧЕН</span>'}</b><br>🧠 Контекст ИИ: <b>${geminiHistory.length} сообщений</b>` });
     }
 
     if (userText.startsWith('!')) {
         const cmd = userText.substring(1).trim();
-        if (!cmd) return res.json({ ok: true, text: "⚠️ Введите команду после знака '!'." });
+        if (!cmd) return res.json({ ok: true, text: "⚠️ Введите команду." });
         try {
-            console.log(`[CHATOPS] Выполнение в консоли: ${cmd}`);
             const { stdout, stderr } = await execPromise(cmd, { timeout: 15000 }); 
-            let output = stdout;
-            if (stderr) output += `\n[STDERR]:\n${stderr}`;
-            if (!output) output = "[Выполнено успешно, вывода нет]";
-            if (output.length > 3000) output = output.substring(0, 3000) + "\n...[ВЫВОД ОБРЕЗАН]...";
+            let output = stdout; if (stderr) output += `\n[STDERR]:\n${stderr}`;
+            if (!output) output = "[Выполнено успешно]";
+            if (output.length > 3000) output = output.substring(0, 3000) + "\n...[ОБРЕЗАН]...";
             return res.json({ ok: true, text: `<b>$</b> <code>${cmd}</code><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#1e1e1e; color:#00ff00; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${output}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#555; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
         } catch (err) {
-            console.error(`[CHATOPS] Ошибка выполнения: ${cmd}`, err.message);
             return res.json({ ok: true, text: `<b>$</b> <code>${cmd}</code><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#3b1313; color:#ff6b6b; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${err.message}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#773333; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
         }
     }
@@ -243,10 +255,9 @@ app.post('/gemini', async (req, res) => {
                 let filename = (path.basename(parsed.pathname) || `dl_${Date.now()}`).replace(/[^a-zA-Z0-9.\-_]/g, '_');
                 const savePath = path.join(TMP_DIR, filename);
 
-                // ИСПОЛЬЗУЕМ SOCKS5 PROXY ЕСЛИ ОН ВКЛЮЧЕН
                 const response = await axios.get(dlUrl, getAxiosConfig({ 
                     responseType: 'stream', 
-                    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36' },
+                    headers: getBrowserHeaders(false),
                     timeout: 60000
                 }));
                 
@@ -318,7 +329,6 @@ app.post('/gemini', async (req, res) => {
         geminiHistory = await chat.getHistory();
         return res.json({ ok: true, text: result.response.text() });
     } catch (err) {
-        console.error("[GEMINI ERROR]", err.message);
         return res.status(500).json({ ok: false, error: err.message });
     }
 });
@@ -343,9 +353,7 @@ app.get('/', async (req, res) => {
     if (!targetUrl) return res.status(400).send('Укажите URL: ?url=https://example.com');
 
     let imgLim = req.query.img_limit !== undefined ? parseInt(req.query.img_limit) : 10;
-    let userAgentStr = req.query.mobile_ua === 'true' 
-        ? 'Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36'
-        : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36';
+    let isMobile = req.query.mobile_ua === 'true';
 
     const parsedTarget = new URL.URL(targetUrl);
     const nfFileId = parsedTarget.searchParams.get('nf_fileId');
@@ -361,10 +369,10 @@ app.get('/', async (req, res) => {
     }
 
     try {
-        // ИСПОЛЬЗУЕМ SOCKS5 PROXY ЕСЛИ ОН ВКЛЮЧЕН
+        // ИСПОЛЬЗУЕМ ИДЕАЛЬНЫЕ ЗАГОЛОВКИ И SOCKS5
         const response = await axios.get(targetUrl, getAxiosConfig({ 
             responseType: 'stream',
-            headers: { 'User-Agent': userAgentStr, 'Accept': 'text/html,*/*;q=0.8', 'Cache-Control': 'no-cache' },
+            headers: getBrowserHeaders(isMobile),
             timeout: 15000,
             validateStatus: () => true 
         }));
@@ -390,7 +398,7 @@ app.get('/', async (req, res) => {
             for (let i = 0; i < Math.min(stylesheets.length, 5); i++) {
                 let href = $(stylesheets[i]).attr('href');
                 if (href && href.startsWith('/')) href = baseUrl + href;
-                if (href) { try { const cssRes = await axios.get(href, getAxiosConfig({ timeout: 3000 })); $(stylesheets[i]).replaceWith(`<style>${cssRes.data}</style>`); } catch (e) {} }
+                if (href) { try { const cssRes = await axios.get(href, getAxiosConfig({ headers: getBrowserHeaders(isMobile), timeout: 3000 })); $(stylesheets[i]).replaceWith(`<style>${cssRes.data}</style>`); } catch (e) {} }
             }
 
             const images = $('img').toArray();
@@ -403,7 +411,7 @@ app.get('/', async (req, res) => {
                 if (src && !src.startsWith('data:') && src.startsWith('/')) src = baseUrl + src;
                 if (src && !src.startsWith('data:')) {
                     try { 
-                        const imgRes = await axios.get(src, getAxiosConfig({ responseType: 'arraybuffer', timeout: 3500 }));
+                        const imgRes = await axios.get(src, getAxiosConfig({ responseType: 'arraybuffer', headers: getBrowserHeaders(isMobile), timeout: 3500 }));
                         img.attr('src', `data:${imgRes.headers['content-type']};base64,${Buffer.from(imgRes.data, 'binary').toString('base64')}`);
                         img.removeAttr('srcset').removeAttr('data-src').removeAttr('loading'); 
                     } catch (e) {}
@@ -485,4 +493,4 @@ app.get('/', async (req, res) => {
 });
 
 app.listen(process.env.PORT || 8080);
-                                           
+        
