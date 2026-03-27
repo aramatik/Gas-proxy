@@ -159,11 +159,26 @@ app.post('/gemini', async (req, res) => {
                 await new Promise((res, rej) => { writer.on('finish', res); writer.on('error', rej); });
                 
                 await execPromise(`tar -xzf ${tarPath} -C ${curlDir}`);
-                console.log("[PROXY] curl-impersonate успешно установлен.");
+                console.log("[PROXY] curl-impersonate распакован.");
             } catch (e) {
                 return res.json({ok: true, text: `❌ Ошибка загрузки curl-impersonate: ${e.message}`});
             }
         }
+
+        // Фикс для Alpine Linux: Устанавливаем gcompat
+        try {
+            if (fs.existsSync('/etc/os-release')) {
+                const osRelease = fs.readFileSync('/etc/os-release', 'utf8');
+                if (osRelease.includes('Alpine')) {
+                    console.log("[PROXY] Обнаружен Alpine Linux. Установка gcompat...");
+                    await execPromise(`apk add --no-cache gcompat libc6-compat`);
+                    console.log("[PROXY] Успешно установлен слой совместимости gcompat.");
+                }
+            }
+        } catch (e) {
+            console.log("[PROXY WARNING] Ошибка установки gcompat (возможно нет прав root):", e.message);
+        }
+
         return res.json({ok: true, text: "🚀 <b>Ghost Proxy включен!</b><br>Трафик идет через SOCKS5 с идеальной подменой JA3 (Chrome)."});
     }
 
@@ -196,7 +211,7 @@ app.post('/gemini', async (req, res) => {
 
     if (userText === '/logs') {
         const logsHtml = serverLogs.length ? serverLogs.join('\n') : "Логи пусты.";
-        return res.json({ ok: true, text: `🖥 <b>Логи:</b><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#e0e0e0; padding:8px; border-radius:5px; white-space:pre-wrap;">${logsHtml}</div></div>` });
+        return res.json({ ok: true, text: `🖥 <b>Логи Northflank:</b><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#e0e0e0; color:#333; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${logsHtml}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#999; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
     }
     
     if (userText === '/status') {
@@ -213,9 +228,9 @@ app.post('/gemini', async (req, res) => {
             let output = stdout; if (stderr) output += `\n[STDERR]:\n${stderr}`;
             if (!output) output = "[Выполнено успешно]";
             if (output.length > 3000) output = output.substring(0, 3000) + "\n...[ОБРЕЗАН]...";
-            return res.json({ ok: true, text: `<b>$</b> <code>${cmd}</code><br><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#1e1e1e; color:#0f0; padding:8px; border-radius:5px; white-space:pre-wrap;">${output}</div>` });
+            return res.json({ ok: true, text: `<b>$</b> <code>${cmd}</code><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#1e1e1e; color:#00ff00; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${output}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#555; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
         } catch (err) {
-            return res.json({ ok: true, text: `<b>$</b> <code>${cmd}</code><br><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#3b1313; color:#f66; padding:8px; border-radius:5px; white-space:pre-wrap;">${err.message}</div>` });
+            return res.json({ ok: true, text: `<b>$</b> <code>${cmd}</code><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#3b1313; color:#ff6b6b; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${err.message}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#773333; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
         }
     }
 
@@ -501,4 +516,4 @@ app.get('/', async (req, res) => {
 });
 
 app.listen(process.env.PORT || 8080);
-            
+        
