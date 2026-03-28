@@ -158,7 +158,7 @@ app.post('/gemini', async (req, res) => {
     if (userText === '/help') {
         const respHtml = `🤖 <b>СИСТЕМА CHATOPS:</b><br><br>
 <code>/status</code> — Состояние сервера<br>
-<code>/proxy on</code> | <code>/proxy off</code> — Ghost Proxy (curl-impersonate)<br>
+<code>/proxy on</code> | <code>/proxy off</code> — Ghost Proxy (curl-impersonate локальный)<br>
 <code>/limit</code> — Состояние моделей<br>
 <code>/download [путь]</code> — Скачать файл<br>
 <code>/search [запрос]</code> — Поиск в сети<br><br>
@@ -170,27 +170,20 @@ app.post('/gemini', async (req, res) => {
         if (!SOCKS5_PROXY) return res.json({ok: true, text: "❌ Переменная SOCKS5_PROXY не настроена."});
         useProxy = true;
         
-        const curlDir = path.join(TMP_DIR, 'curl-impersonate');
-        const curlBin = path.join(curlDir, 'curl_chrome110'); 
+        const curlDir = path.join(__dirname, 'curl-impersonate');
+        const curlBin = path.join(curlDir, 'curl_chrome116'); 
         
         if (!fs.existsSync(curlBin)) {
-            console.log("[PROXY] Скачивание curl-impersonate...");
-            try {
-                fs.mkdirSync(curlDir, { recursive: true });
-                const tarPath = path.join(TMP_DIR, 'curl-imp.tar.gz');
-                const dlUrl = "https://github.com/lwthiker/curl-impersonate/releases/download/v0.5.4/curl-impersonate-v0.5.4.x86_64-linux-gnu.tar.gz";
-                
-                const response = await axios.get(dlUrl, { responseType: 'stream' });
-                const writer = fs.createWriteStream(tarPath);
-                response.data.pipe(writer);
-                await new Promise((res, rej) => { writer.on('finish', res); writer.on('error', rej); });
-                
-                await execPromise(`tar -xzf ${tarPath} -C ${curlDir}`);
-                console.log("[PROXY] curl-impersonate распакован.");
-            } catch (e) {
-                console.error("[PROXY ERROR]", e.message);
-                return res.json({ok: true, text: `❌ Ошибка загрузки curl-impersonate: ${e.message}`});
-            }
+            console.error("[PROXY ERROR] Папка curl-impersonate не найдена в корне проекта!");
+            return res.json({ok: true, text: `❌ Ошибка: Не найдена локальная папка curl-impersonate. Проверьте GitHub репозиторий.`});
+        }
+
+        try {
+            fs.chmodSync(curlBin, 0o755);
+            fs.chmodSync(path.join(curlDir, 'curl-impersonate-chrome'), 0o755);
+            console.log("[PROXY] Права на выполнение бинарников успешно обновлены.");
+        } catch (e) {
+            console.warn("[PROXY WARNING] Не удалось обновить права файлов:", e.message);
         }
 
         try {
@@ -206,8 +199,8 @@ app.post('/gemini', async (req, res) => {
             console.log("[PROXY WARNING] Ошибка установки зависимостей:", e.message);
         }
 
-        console.log("[PROXY] Ghost Proxy успешно активирован.");
-        return res.json({ok: true, text: "🚀 <b>Ghost Proxy включен!</b><br>Трафик идет через SOCKS5 с идеальной подменой JA3 (Chrome)."});
+        console.log("[PROXY] Ghost Proxy успешно активирован (Локальная версия).");
+        return res.json({ok: true, text: "🚀 <b>Ghost Proxy включен!</b><br>Трафик идет через SOCKS5 с локальным curl-impersonate."});
     }
 
     if (userText === '/proxy off') {
@@ -280,8 +273,8 @@ app.post('/gemini', async (req, res) => {
                 const savePath = path.join(TMP_DIR, filename);
 
                 if (useProxy && SOCKS5_PROXY) {
-                    console.log(`[WEB SEARCH] Скачивание через Ghost Proxy: ${dlUrl}`);
-                    const curlBin = path.join(TMP_DIR, 'curl-impersonate', 'curl_chrome110'); 
+                    console.log(`[WEB SEARCH] Скачивание через локальный Ghost Proxy: ${dlUrl}`);
+                    const curlBin = path.join(__dirname, 'curl-impersonate', 'curl_chrome116'); 
                     const proxyStr = SOCKS5_PROXY.replace('socks5://', 'socks5h://');
                     await execPromise(`bash "${curlBin}" --compressed -m 60 -s -L -x "${proxyStr}" -o "${savePath}" "${dlUrl}"`);
                 } else {
@@ -400,11 +393,11 @@ app.get('/', async (req, res) => {
 
     try {
         if (useProxy && SOCKS5_PROXY) {
-            console.log(`[PROXY] Использование Ghost Proxy (curl-impersonate)...`);
+            console.log(`[PROXY] Использование Ghost Proxy (локальный curl-impersonate)...`);
             const reqId = crypto.randomUUID();
             const headFile = path.join(TMP_DIR, `${reqId}_head.txt`);
             const bodyFile = path.join(TMP_DIR, `${reqId}_body.bin`);
-            const curlBin = path.join(TMP_DIR, 'curl-impersonate', 'curl_chrome110'); 
+            const curlBin = path.join(__dirname, 'curl-impersonate', 'curl_chrome116'); 
             const proxyStr = SOCKS5_PROXY.replace('socks5://', 'socks5h://');
             
             await execPromise(`bash "${curlBin}" --compressed -m 15 -s -L -x "${proxyStr}" -D "${headFile}" -o "${bodyFile}" "${targetUrl}"`);
@@ -591,4 +584,4 @@ app.get('/', async (req, res) => {
 });
 
 app.listen(process.env.PORT || 8080);
-    
+        
