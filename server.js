@@ -153,20 +153,6 @@ app.post('/gemini', async (req, res) => {
         }
     }
 
-    // Обработка запроса списка моделей
-    if (['get_models', 'models', 'getModels'].includes(req.body.action)) {
-        try {
-            console.log("[GEMINI] Запрошено обновление списка моделей...");
-            const response = await axios.get(`https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_API_KEY}`);
-            // Отдаем чистый оригинальный ответ Google.
-            // Наш обновленный скрипт Gas(last).gs сам прекрасно очистит 'models/' и создаст правильные ID.
-            return res.json({ ok: true, models: response.data.models, data: response.data });
-        } catch (err) {
-            console.error("[GEMINI ERROR] Ошибка получения моделей:", err.message);
-            return res.status(500).json({ ok: false, error: err.message });
-        }
-    }
-
     let userText = req.body.text ? req.body.text.trim() : "";
     
     if (userText === '/help') {
@@ -338,12 +324,7 @@ app.post('/gemini', async (req, res) => {
         if (userText === 'clear') return res.json({ok: true, text: "История очищена"}); 
     }
 
-    // --- ИСПРАВЛЕНИЕ ОШИБКИ 'undefined' ---
-    let modelName = req.body.model;
-    if (!modelName || modelName === "undefined" || modelName === "null") {
-        modelName = "gemini-2.5-flash"; // Fallback на дефолтную модель, если браузер прислал мусор
-    }
-    
+    const modelName = req.body.model || "gemini-2.5-flash"; 
     const msgParts = [];
     if (userText) msgParts.push(userText);
     if (req.body.b64 && req.body.mimeType) {
