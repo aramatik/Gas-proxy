@@ -153,6 +153,18 @@ app.post('/gemini', async (req, res) => {
         }
     }
 
+    // Обработка запроса списка моделей от GAS
+    if (['get_models', 'models', 'getModels'].includes(req.body.action)) {
+        try {
+            console.log("[GEMINI] Запрошено обновление списка моделей...");
+            const response = await axios.get(`https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_API_KEY}`);
+            return res.json({ ok: true, models: response.data.models, data: response.data });
+        } catch (err) {
+            console.error("[GEMINI ERROR] Ошибка получения моделей:", err.message);
+            return res.status(500).json({ ok: false, error: err.message });
+        }
+    }
+
     let userText = req.body.text ? req.body.text.trim() : "";
     
     if (userText === '/help') {
@@ -590,4 +602,4 @@ app.get('/', async (req, res) => {
 });
 
 app.listen(process.env.PORT || 8080);
-        
+    
