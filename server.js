@@ -153,22 +153,14 @@ app.post('/gemini', async (req, res) => {
         }
     }
 
-    // Обработка запроса списка моделей от GAS
+    // Обработка запроса списка моделей
     if (['get_models', 'models', 'getModels'].includes(req.body.action)) {
         try {
             console.log("[GEMINI] Запрошено обновление списка моделей...");
             const response = await axios.get(`https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_API_KEY}`);
-            
-            // Очищаем названия от префикса 'models/'
-            const cleanedModels = response.data.models.map(m => {
-                const modelCopy = { ...m };
-                if (modelCopy.name && modelCopy.name.startsWith('models/')) {
-                    modelCopy.name = modelCopy.name.substring(7);
-                }
-                return modelCopy;
-            });
-
-            return res.json({ ok: true, models: cleanedModels, data: response.data });
+            // Отдаем чистый оригинальный ответ Google.
+            // Наш обновленный скрипт Gas(last).gs сам прекрасно очистит 'models/' и создаст правильные ID.
+            return res.json({ ok: true, models: response.data.models, data: response.data });
         } catch (err) {
             console.error("[GEMINI ERROR] Ошибка получения моделей:", err.message);
             return res.status(500).json({ ok: false, error: err.message });
@@ -280,7 +272,7 @@ app.post('/gemini', async (req, res) => {
             const { stdout, stderr } = await execPromise(cmd, { timeout: 15000 }); 
             let output = stdout; if (stderr) output += `\n[STDERR]:\n${stderr}`;
             if (!output) output = "[Выполнено успешно]";
-            if (output.length > 20000) output = output.substring(0, 20000) + "\n...[ОБРЕЗАН]...";
+            if (output.length > 300000) output = output.substring(0, 300000) + "\n...[ОБРЕЗАН]...";
             return res.json({ ok: true, text: `<b>$</b> <code>${cmd}</code><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#1e1e1e; color:#0f0; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${output}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#555; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
         } catch (err) {
             return res.json({ ok: true, text: `<b>$</b> <code>${cmd}</code><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#3b1313; color:#f66; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${err.message}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#773333; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
@@ -346,7 +338,12 @@ app.post('/gemini', async (req, res) => {
         if (userText === 'clear') return res.json({ok: true, text: "История очищена"}); 
     }
 
-    const modelName = req.body.model || "gemini-2.5-flash"; 
+    // --- ИСПРАВЛЕНИЕ ОШИБКИ 'undefined' ---
+    let modelName = req.body.model;
+    if (!modelName || modelName === "undefined" || modelName === "null") {
+        modelName = "gemini-2.5-flash"; // Fallback на дефолтную модель, если браузер прислал мусор
+    }
+    
     const msgParts = [];
     if (userText) msgParts.push(userText);
     if (req.body.b64 && req.body.mimeType) {
@@ -612,3 +609,4 @@ app.get('/', async (req, res) => {
 });
 
 app.listen(process.env.PORT || 8080);
+                
