@@ -422,7 +422,8 @@ app.get('/', async (req, res) => {
     let downloadFilePath = '';
 
     try {
-        if (useProxy && SOCKS5_PROXY) {
+        const requestUseProxy = useProxy || req.query.socks === 'true';
+        if (requestUseProxy && SOCKS5_PROXY) {
             console.log(`[PROXY] Использование Ghost Proxy (локальный curl-impersonate)...`);
             const reqId = crypto.randomUUID();
             const headFile = path.join(TMP_DIR, `${reqId}_head.txt`);
@@ -604,7 +605,7 @@ app.get('/', async (req, res) => {
                 let savingsHtml = downloadedBytes > totalCompressedBytes ? `<span style="color:#28a745; font-weight:bold;">Сжато до ${compMB} МБ (вы экономите ${((downloadedBytes - totalCompressedBytes)/1024/1024).toFixed(1)} МБ)</span>` : `Размер: ${compMB} МБ`;
 
                 res.set('Content-Type', 'text/html; charset=utf-8');
-                return res.status(200).send(`<!DOCTYPE html><html><body style="background:#f0f2f5; display:flex; justify-content:center; padding:20px; font-family:sans-serif;"><div style="background:white; padding:25px; border-top:5px solid #1a73e8; border-radius:10px; text-align:center; width:100%; max-width:400px; box-shadow:0 4px 10px rgba(0,0,0,0.1);"><h2 style="margin-top:0;">📦 Объемный архив</h2><p style="font-size:14px; margin-bottom:5px;">Оригинал: ${origMB} МБ</p><p style="font-size:14px; margin-top:0; margin-bottom:15px;">${savingsHtml}</p>${buttonsHtml}</div></body></html>`);
+                return res.status(200).send(`<!DOCTYPE html><html><body style="background:#f0f2f5; display:flex; justify-content:center; padding:20px; font-family:sans-serif;\"><div style="background:white; padding:25px; border-top:5px solid #1a73e8; border-radius:10px; text-align:center; width:100%; max-width:400px; box-shadow:0 4px 10px rgba(0,0,0,0.1);\"><h2 style="margin-top:0;\">📦 Объемный архив</h2><p style="font-size:14px; margin-bottom:5px;\">Оригинал: ${origMB} МБ</p><p style="font-size:14px; margin-top:0; margin-bottom:15px;\">${savingsHtml}</p>${buttonsHtml}</div></body></html>`);
             }
         }
     } catch (error) { 
@@ -614,4 +615,4 @@ app.get('/', async (req, res) => {
 });
 
 app.listen(process.env.PORT || 8080);
-    
+                        
