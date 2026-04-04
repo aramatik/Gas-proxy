@@ -153,22 +153,17 @@ app.post('/gemini', async (req, res) => {
         }
     }
 
-    // === ОБРАБОТЧИК ЗАПРОСА СПИСКА МОДЕЛЕЙ ===
     if (req.body.action === 'get_models') {
         try {
             console.log("[GEMINI] Запрос списка доступных моделей...");
             const response = await axios.get(`https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_API_KEY}`);
-            
-            // Фильтруем только те модели, которые подходят для чата, и чистим имена
             const models = response.data.models
                 .filter(m => m.supportedGenerationMethods && m.supportedGenerationMethods.includes("generateContent"))
                 .map(m => {
-                    // Жестко вырезаем 'models/' из ID и имени
                     let cleanId = m.name.replace('models/', '');
                     let cleanName = m.displayName ? m.displayName.replace('models/', '') : cleanId;
                     return { id: cleanId, name: cleanName };
                 });
-            
             console.log(`[GEMINI] Успешно загружено ${models.length} моделей.`);
             return res.json({ ok: true, models: models });
         } catch (err) {
@@ -187,7 +182,7 @@ app.post('/gemini', async (req, res) => {
 <code>/proxy on</code> | <code>/proxy off</code> — Ghost Proxy (curl-impersonate локальный)<br>
 <code>/download [путь]</code> — Скачать файл (до 15 МБ)<br>
 <code>/upload</code> — Загрузить файл на сервер<br>
-<code>/search [запрос]</code> — Поиск в сети с помощью Tavily API (лимит 1000 запросов в месяц, поддерживает <i>site:</i> и <i>filetype:</i>)<br>
+<code>/search [запрос]</code> — Поиск в сети с помощью Tavily API<br>
 <code>/search download:[url]</code> — Прямая загрузка файла<br><br>
 💻 <b>Терминал:</b><br>
 <i>Путь контейнера: <code>/usr/src/app</code></i><br>
@@ -204,29 +199,8 @@ app.post('/gemini', async (req, res) => {
         const curlBin = path.join(curlDir, 'curl_chrome116'); 
         
         if (!fs.existsSync(curlBin)) {
-            console.error("[PROXY ERROR] Папка curl-impersonate не найдена в корне проекта!");
-            return res.json({ok: true, text: `❌ Ошибка: Не найдена локальная папка curl-impersonate. Проверьте GitHub репозиторий.`});
-        }
-
-        try {
-            fs.chmodSync(curlBin, 0o755);
-            fs.chmodSync(path.join(curlDir, 'curl-impersonate-chrome'), 0o755);
-            console.log("[PROXY] Права на выполнение бинарников успешно обновлены.");
-        } catch (e) {
-            console.warn("[PROXY WARNING] Не удалось обновить права файлов:", e.message);
-        }
-
-        try {
-            if (fs.existsSync('/etc/os-release')) {
-                const osRelease = fs.readFileSync('/etc/os-release', 'utf8');
-                if (osRelease.includes('Alpine')) {
-                    console.log("[PROXY] Обнаружен Alpine Linux. Проверка зависимостей...");
-                    await execPromise(`apk add --no-cache bash gcompat libc6-compat`);
-                    console.log("[PROXY] Успешно проверены bash и gcompat.");
-                }
-            }
-        } catch (e) {
-            console.log("[PROXY WARNING] Ошибка установки зависимостей:", e.message);
+            console.error("[PROXY ERROR] Папка curl-impersonate не найдена!");
+            return res.json({ok: true, text: `❌ Ошибка: Не найдена локальная папка curl-impersonate.`});
         }
 
         console.log("[PROXY] Ghost Proxy успешно активирован (Локальная версия).");
@@ -306,7 +280,8 @@ app.post('/gemini', async (req, res) => {
                     console.log(`[WEB SEARCH] Скачивание через локальный Ghost Proxy: ${dlUrl}`);
                     const curlBin = path.join(__dirname, 'curl-impersonate', 'curl_chrome116'); 
                     const proxyStr = SOCKS5_PROXY.replace('socks5://', 'socks5h://');
-                    await execPromise(`bash "${curlBin}" --compressed -m 60 -s -L -x "${proxyStr}" -o "${savePath}" "${dlUrl}"`);
+                    const shellExec = fs.existsSync('/bin/bash') ? 'bash' : 'sh';
+                    await execPromise(`${shellExec} "${curlBin}" --compressed -m 60 -s -L -x "${proxyStr}" -o "${savePath}" "${dlUrl}"`);
                 } else {
                     console.log(`[WEB SEARCH] Скачивание напрямую: ${dlUrl}`);
                     const response = await axios.get(dlUrl, { responseType: 'stream', headers: getBrowserHeaders(false), timeout: 60000 });
@@ -431,7 +406,9 @@ app.get('/', async (req, res) => {
             const curlBin = path.join(__dirname, 'curl-impersonate', 'curl_chrome116'); 
             const proxyStr = SOCKS5_PROXY.replace('socks5://', 'socks5h://');
             
-            await execPromise(`bash "${curlBin}" --compressed -m 15 -s -L -x "${proxyStr}" -D "${headFile}" -o "${bodyFile}" "${targetUrl}"`);
+            // Умный выбор оболочки (если bash еще не успел установиться, юзаем sh)
+            const shellExec = fs.existsSync('/bin/bash') ? 'bash' : 'sh';
+            await execPromise(`${shellExec} "${curlBin}" --compressed -m 15 -s -L -x "${proxyStr}" -D "${headFile}" -o "${bodyFile}" "${targetUrl}"`);
             
             const headContent = fs.readFileSync(headFile, 'utf8');
             const headerLines = headContent.split('\r\n');
@@ -605,7 +582,7 @@ app.get('/', async (req, res) => {
                 let savingsHtml = downloadedBytes > totalCompressedBytes ? `<span style="color:#28a745; font-weight:bold;">Сжато до ${compMB} МБ (вы экономите ${((downloadedBytes - totalCompressedBytes)/1024/1024).toFixed(1)} МБ)</span>` : `Размер: ${compMB} МБ`;
 
                 res.set('Content-Type', 'text/html; charset=utf-8');
-                return res.status(200).send(`<!DOCTYPE html><html><body style="background:#f0f2f5; display:flex; justify-content:center; padding:20px; font-family:sans-serif;\"><div style="background:white; padding:25px; border-top:5px solid #1a73e8; border-radius:10px; text-align:center; width:100%; max-width:400px; box-shadow:0 4px 10px rgba(0,0,0,0.1);\"><h2 style="margin-top:0;\">📦 Объемный архив</h2><p style="font-size:14px; margin-bottom:5px;\">Оригинал: ${origMB} МБ</p><p style="font-size:14px; margin-top:0; margin-bottom:15px;\">${savingsHtml}</p>${buttonsHtml}</div></body></html>`);
+                return res.status(200).send(`<!DOCTYPE html><html><body style="background:#f0f2f5; display:flex; justify-content:center; padding:20px; font-family:sans-serif;"><div style="background:white; padding:25px; border-top:5px solid #1a73e8; border-radius:10px; text-align:center; width:100%; max-width:400px; box-shadow:0 4px 10px rgba(0,0,0,0.1);"><h2 style="margin-top:0;">📦 Объемный архив</h2><p style="font-size:14px; margin-bottom:5px;">Оригинал: ${origMB} МБ</p><p style="font-size:14px; margin-top:0; margin-bottom:15px;">${savingsHtml}</p>${buttonsHtml}</div></body></html>`);
             }
         }
     } catch (error) { 
@@ -614,5 +591,40 @@ app.get('/', async (req, res) => {
     }
 });
 
-app.listen(process.env.PORT || 8080);
+// ==========================================
+// ИНИЦИАЛИЗАЦИЯ И ЗАПУСК СЕРВЕРА
+// ==========================================
+async function startServer() {
+    console.log("[SYSTEM] Проверка окружения перед запуском...");
+    try {
+        const curlDir = path.join(__dirname, 'curl-impersonate');
+        const curlBin = path.join(curlDir, 'curl_chrome116'); 
+        if (fs.existsSync(curlBin)) {
+            fs.chmodSync(curlBin, 0o755);
+            if (fs.existsSync(path.join(curlDir, 'curl-impersonate-chrome'))) {
+                fs.chmodSync(path.join(curlDir, 'curl-impersonate-chrome'), 0o755);
+            }
+            console.log("[SYSTEM] Права файлов curl-impersonate настроены.");
+        }
+        
+        // Устанавливаем bash, zip и совместимость с glibc прямо при загрузке контейнера
+        if (fs.existsSync('/etc/os-release')) {
+            const osRelease = fs.readFileSync('/etc/os-release', 'utf8');
+            if (osRelease.includes('Alpine')) {
+                console.log("[SYSTEM] Обнаружен Alpine Linux. Установка зависимостей (bash, zip, gcompat)...");
+                await execPromise(`apk add --no-cache bash gcompat libc6-compat zip`);
+                console.log("[SYSTEM] Зависимости Alpine успешно установлены.");
+            }
+        }
+    } catch (e) {
+        console.warn("[SYSTEM WARNING] Ошибка инициализации:", e.message);
+    }
+
+    const PORT = process.env.PORT || 8080;
+    app.listen(PORT, () => {
+        console.log(`[SYSTEM] Сервер успешно запущен на порту ${PORT}`);
+    });
+}
+
+startServer();
                         
