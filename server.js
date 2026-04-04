@@ -153,6 +153,30 @@ app.post('/gemini', async (req, res) => {
         }
     }
 
+    // === ОБРАБОТЧИК ЗАПРОСА СПИСКА МОДЕЛЕЙ ===
+    if (req.body.action === 'get_models') {
+        try {
+            console.log("[GEMINI] Запрос списка доступных моделей...");
+            const response = await axios.get(`https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_API_KEY}`);
+            
+            // Фильтруем только те модели, которые подходят для чата, и чистим имена
+            const models = response.data.models
+                .filter(m => m.supportedGenerationMethods && m.supportedGenerationMethods.includes("generateContent"))
+                .map(m => {
+                    // Жестко вырезаем 'models/' из ID и имени
+                    let cleanId = m.name.replace('models/', '');
+                    let cleanName = m.displayName ? m.displayName.replace('models/', '') : cleanId;
+                    return { id: cleanId, name: cleanName };
+                });
+            
+            console.log(`[GEMINI] Успешно загружено ${models.length} моделей.`);
+            return res.json({ ok: true, models: models });
+        } catch (err) {
+            console.error("[GEMINI ERROR] Сбой загрузки списка моделей:", err.message);
+            return res.status(500).json({ ok: false, error: err.message });
+        }
+    }
+
     let userText = req.body.text ? req.body.text.trim() : "";
     
     if (userText === '/help') {
@@ -590,4 +614,4 @@ app.get('/', async (req, res) => {
 });
 
 app.listen(process.env.PORT || 8080);
-        
+    
