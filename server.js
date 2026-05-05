@@ -30,7 +30,7 @@ const SOCKS5_PROXY = process.env.SOCKS5_PROXY || "";
 
 let genAI = null;
 let geminiHistory = [];
-let adminMode = false;   // флаг режима администратора
+let adminMode = false;
 
 if (GEMINI_API_KEY) {
     genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
@@ -377,12 +377,16 @@ app.post('/gemini', async (req, res) => {
 async function handleAdminMessage(userText, req, res) {
     if (!GEMINI_API_KEY) return res.status(500).json({ok: false, error: "Отсутствует GEMINI_API_KEY"});
 
-    const model = genAI.getGenerativeModel({
-        model: "gemini-2.5-flash",
-        systemInstruction: "Ты полезный администратор сервера. Ты можешь выполнять команды терминала Linux и искать информацию в интернете. Проанализируй запрос пользователя, при необходимости используй инструменты, чтобы выполнить задачу. После каждого вызова функции дождись результата и прими решение о следующем шаге. Когда задача будет выполнена, дай окончательный текстовый ответ."
-    });
+    const preferredModel = req.body.model || "gemini-2.5-flash";
+    const isGemma = preferredModel.toLowerCase().includes('gemma');
 
-    // Инструменты: команда и поиск
+    const modelConfig = { model: preferredModel };
+    if (!isGemma) {
+        modelConfig.systemInstruction = "Ты полезный администратор сервера. Ты можешь выполнять команды терминала Linux и искать информацию в интернете. Проанализируй запрос пользователя, при необходимости используй инструменты, чтобы выполнить задачу. После каждого вызова функции дождись результата и прими решение о следующем шаге. Когда задача будет выполнена, дай окончательный текстовый ответ. В ответе обязательно перечисли выполненные тобой команды терминала и их результаты.";
+    }
+
+    const model = genAI.getGenerativeModel(modelConfig);
+
     const tools = [{
         functionDeclarations: [
             {
@@ -426,6 +430,7 @@ async function handleAdminMessage(userText, req, res) {
     }];
 
     const chat = model.startChat({ tools: tools });
+    const executedCommands = []; // сохраняем историю выполненных команд
 
     let iterations = 0;
     const maxIterations = 10;
@@ -451,6 +456,8 @@ async function handleAdminMessage(userText, req, res) {
                     } catch (err) {
                         execResult = `Ошибка: ${err.message}`;
                     }
+                    // Сохраняем в историю
+                    executedCommands.push({ command: cmd, result: execResult });
                     console.log(`[ADMIN] Результат: ${execResult.substring(0, 200)}`);
                     const funcResponse = {
                         name: call.name,
@@ -480,7 +487,6 @@ async function handleAdminMessage(userText, req, res) {
                             const filename = (path.basename(parsed.pathname) || `dl_${Date.now()}`).replace(/[^a-zA-Z0-9.\-_]/g, '_');
                             const savePath = path.join(TMP_DIR, filename);
                             
-                            // Используем существующий механизм загрузки (прямой или через прокси)
                             if (useProxy && SOCKS5_PROXY) {
                                 const curlBin = path.join(__dirname, 'curl-impersonate', 'curl_chrome116');
                                 const proxyStr = SOCKS5_PROXY.replace('socks5://', 'socks5h://');
@@ -505,26 +511,51 @@ async function handleAdminMessage(userText, req, res) {
                     };
                     result = await chat.sendMessage([{ functionResponse: funcResponse }]);
                 } else {
-                    // Неизвестная функция
                     console.log("[ADMIN] Неизвестная функция:", call.name);
                     break;
                 }
             } else {
-                // Текстовый ответ — финальный
-                const text = parts.map(p => p.text).join('');
-                console.log(`[ADMIN] Финальный ответ: ${text.substring(0, 200)}`);
-                return res.json({ ok: true, text: text });
+                // Текстовый ответ – финальный
+                let finalText = parts.map(p => p.text).join('');
+                // Добавляем отчёт о выполненных командах
+                if (executedCommands.length > 0) {
+                    finalText += "\n\n📋 <b>Выполненные команды:</b>\n";
+                    executedCommands.forEach((cmd, index) => {
+                        // Обрезаем результат до 200 символов для компактности, если длинный
+                        const shortResult = cmd.result.length > 200 ? cmd.result.substring(0, 200) + "..." : cmd.result;
+                        finalText += `\n${index + 1}. <code>${cmd.command}</code>\n   ↳ ${shortResult}`;
+                    });
+                }
+                console.log(`[ADMIN] Финальный ответ: ${finalText.substring(0, 200)}`);
+                return res.json({ ok: true, text: finalText });
             }
             iterations++;
             if (iterations >= maxIterations) {
                 console.log("[ADMIN] Достигнут лимит итераций.");
-                return res.json({ ok: true, text: "⚠️ Достигнут лимит операций. Завершаю работу." });
+                let limitText = "⚠️ Достигнут лимит операций. Завершаю работу.";
+                if (executedCommands.length > 0) {
+                    limitText += "\n\n📋 <b>Выполненные команды:</b>\n";
+                    executedCommands.forEach((cmd, index) => {
+                        const shortResult = cmd.result.length > 200 ? cmd.result.substring(0, 200) + "..." : cmd.result;
+                        limitText += `\n${index + 1}. <code>${cmd.command}</code>\n   ↳ ${shortResult}`;
+                    });
+                }
+                return res.json({ ok: true, text: limitText });
             }
         }
         return res.json({ ok: true, text: "Не удалось получить ответ от ИИ." });
     } catch (err) {
         console.error("[ADMIN ERROR]", err.message);
-        return res.status(500).json({ ok: false, error: err.message });
+        // Даже при ошибке можем вернуть список частично выполненных команд
+        let errorText = `Ошибка: ${err.message}`;
+        if (executedCommands.length > 0) {
+            errorText += "\n\n📋 <b>Выполненные команды до ошибки:</b>\n";
+            executedCommands.forEach((cmd, index) => {
+                const shortResult = cmd.result.length > 200 ? cmd.result.substring(0, 200) + "..." : cmd.result;
+                errorText += `\n${index + 1}. <code>${cmd.command}</code>\n   ↳ ${shortResult}`;
+            });
+        }
+        return res.status(500).json({ ok: false, error: errorText });
     }
 }
 
