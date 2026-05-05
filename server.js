@@ -29,8 +29,9 @@ const TAVILY_API_KEY = process.env.TAVILY_API_KEY || "";
 const SOCKS5_PROXY = process.env.SOCKS5_PROXY || "";
 
 let genAI = null;
-let geminiHistory = [];
+let geminiHistory = [];          // история обычного чата
 let adminMode = false;
+let adminHistory = [];           // отдельная история для режима администратора
 
 if (GEMINI_API_KEY) {
     genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
@@ -197,11 +198,13 @@ app.post('/gemini', async (req, res) => {
     // Режим администратора
     if (userText === '/admin on') {
         adminMode = true;
+        adminHistory = [];   // сбрасываем историю при включении
         console.log("[ADMIN] Режим администратора ВКЛЮЧЕН.");
         return res.json({ ok: true, text: "🔧 <b>Режим администратора активирован.</b> Все последующие сообщения будут выполняться как автономные задачи с доступом к терминалу и поиску в интернете." });
     }
     if (userText === '/admin off') {
         adminMode = false;
+        adminHistory = [];   // очищаем контекст
         console.log("[ADMIN] Режим администратора ОТКЛЮЧЕН.");
         return res.json({ ok: true, text: "🛑 <b>Режим администратора отключен.</b>" });
     }
@@ -264,7 +267,8 @@ app.post('/gemini', async (req, res) => {
         const adminStatus = adminMode
             ? '<span style="color:green; font-weight:bold;">✅ ВКЛЮЧЕН</span>'
             : '<span style="color:red;">❌ ВЫКЛЮЧЕН</span>';
-        return res.json({ ok: true, text: `🖥 <b>Статус:</b><br>⏱ Uptime: <b>${Math.floor(uptime/3600)}ч ${Math.floor((uptime%3600)/60)}м</b><br>💾 Память: <b>${(mem.rss / 1024 / 1024).toFixed(1)} MB</b><br>🔒 Ghost Proxy: <b>${useProxy ? '<span style="color:green">ВКЛЮЧЕН</span>' : '<span style="color:red">ВЫКЛЮЧЕН</span>'}</b><br>🔧 Режим администратора: ${adminStatus}<br>🧠 Контекст: <b>${geminiHistory.length} сообщений</b>` });
+        const adminCtx = adminMode ? `<br>🧠 Контекст админа: <b>${adminHistory.length} сообщений</b>` : '';
+        return res.json({ ok: true, text: `🖥 <b>Статус:</b><br>⏱ Uptime: <b>${Math.floor(uptime/3600)}ч ${Math.floor((uptime%3600)/60)}м</b><br>💾 Память: <b>${(mem.rss / 1024 / 1024).toFixed(1)} MB</b><br>🔒 Ghost Proxy: <b>${useProxy ? '<span style="color:green">ВКЛЮЧЕН</span>' : '<span style="color:red">ВЫКЛЮЧЕН</span>'}</b><br>🔧 Режим администратора: ${adminStatus}${adminCtx}<br>🧠 Контекст обычного чата: <b>${geminiHistory.length} сообщений</b>` });
     }
 
     if (userText.startsWith('!')) {
@@ -338,6 +342,7 @@ app.post('/gemini', async (req, res) => {
     if (!GEMINI_API_KEY) return res.status(500).json({ok: false, error: "Отсутствует GEMINI_API_KEY"});
     if (req.body.clear === 'true') {
         geminiHistory = [];
+        adminHistory = [];   // заодно чистим админский контекст
         console.log("[GEMINI] Память контекста нейросети очищена.");
         if (userText === 'clear') return res.json({ok: true, text: "История очищена"});
     }
@@ -390,7 +395,6 @@ async function handleAdminMessage(userText, req, res) {
     }
 
     const model = genAI.getGenerativeModel(modelConfig);
-
     const tools = [{
         functionDeclarations: [
             {
@@ -433,8 +437,9 @@ async function handleAdminMessage(userText, req, res) {
         ]
     }];
 
-    const chat = model.startChat({ tools: tools });
-    const executedCommands = []; // сохраняем историю выполненных команд
+    // Используем сохранённую историю администратора
+    const chat = model.startChat({ history: adminHistory, tools: tools });
+    const executedCommands = [];
 
     let iterations = 0;
     const maxIterations = 10;
@@ -460,7 +465,6 @@ async function handleAdminMessage(userText, req, res) {
                     } catch (err) {
                         execResult = `Ошибка: ${err.message}`;
                     }
-                    // Сохраняем полный результат
                     executedCommands.push({ command: cmd, result: execResult });
                     console.log(`[ADMIN] Результат: ${execResult.substring(0, 200)}`);
                     const funcResponse = {
@@ -519,16 +523,17 @@ async function handleAdminMessage(userText, req, res) {
                     break;
                 }
             } else {
-                // Текстовый ответ – финальный
+                // Финальный ответ
                 let finalText = parts.map(p => p.text).join('');
-                // Добавляем отчёт о выполненных командах с полными результатами
                 if (executedCommands.length > 0) {
                     finalText += "\n\n📋 <b>Выполненные команды:</b>\n";
                     executedCommands.forEach((cmd, index) => {
                         finalText += `\n${index + 1}. <code>${cmd.command}</code>\n   ↳ ${cmd.result}`;
                     });
                 }
-                console.log(`[ADMIN] Финальный ответ: ${finalText.substring(0, 200)}`);
+                // Сохраняем обновлённую историю
+                adminHistory = await chat.getHistory();
+                console.log(`[ADMIN] Финальный ответ. Контекст админа теперь: ${adminHistory.length} сообщений`);
                 return res.json({ ok: true, text: finalText });
             }
             iterations++;
@@ -541,9 +546,11 @@ async function handleAdminMessage(userText, req, res) {
                         limitText += `\n${index + 1}. <code>${cmd.command}</code>\n   ↳ ${cmd.result}`;
                     });
                 }
+                adminHistory = await chat.getHistory();
                 return res.json({ ok: true, text: limitText });
             }
         }
+        adminHistory = await chat.getHistory();
         return res.json({ ok: true, text: "Не удалось получить ответ от ИИ." });
     } catch (err) {
         console.error("[ADMIN ERROR]", err.message);
@@ -554,6 +561,8 @@ async function handleAdminMessage(userText, req, res) {
                 errorText += `\n${index + 1}. <code>${cmd.command}</code>\n   ↳ ${cmd.result}`;
             });
         }
+        // Попытаемся сохранить историю даже при ошибке
+        try { adminHistory = await chat.getHistory(); } catch (e) {}
         return res.status(500).json({ ok: false, error: errorText });
     }
 }
