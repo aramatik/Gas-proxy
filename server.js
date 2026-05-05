@@ -257,10 +257,14 @@ app.post('/gemini', async (req, res) => {
         return res.json({ ok: true, text: `🖥 <b>Логи Northflank:</b><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#e0e0e0; color:#333; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${logsHtml}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#999; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
     }
 
+    // ---------- ОБНОВЛЁННЫЙ /status ----------
     if (userText === '/status') {
         const mem = process.memoryUsage();
         const uptime = Math.floor(process.uptime());
-        return res.json({ ok: true, text: `🖥 <b>Статус:</b><br>⏱ Uptime: <b>${Math.floor(uptime/3600)}ч ${Math.floor((uptime%3600)/60)}м</b><br>💾 Память: <b>${(mem.rss / 1024 / 1024).toFixed(1)} MB</b><br>🔒 Ghost Proxy: <b>${useProxy ? '<span style="color:green">ВКЛЮЧЕН</span>' : '<span style="color:red">ВЫКЛЮЧЕН</span>'}</b><br>🧠 Контекст: <b>${geminiHistory.length} сообщений</b>` });
+        const adminStatus = adminMode
+            ? '<span style="color:green; font-weight:bold;">✅ ВКЛЮЧЕН</span>'
+            : '<span style="color:red;">❌ ВЫКЛЮЧЕН</span>';
+        return res.json({ ok: true, text: `🖥 <b>Статус:</b><br>⏱ Uptime: <b>${Math.floor(uptime/3600)}ч ${Math.floor((uptime%3600)/60)}м</b><br>💾 Память: <b>${(mem.rss / 1024 / 1024).toFixed(1)} MB</b><br>🔒 Ghost Proxy: <b>${useProxy ? '<span style="color:green">ВКЛЮЧЕН</span>' : '<span style="color:red">ВЫКЛЮЧЕН</span>'}</b><br>🔧 Режим администратора: ${adminStatus}<br>🧠 Контекст: <b>${geminiHistory.length} сообщений</b>` });
     }
 
     if (userText.startsWith('!')) {
@@ -456,7 +460,7 @@ async function handleAdminMessage(userText, req, res) {
                     } catch (err) {
                         execResult = `Ошибка: ${err.message}`;
                     }
-                    // Сохраняем в историю
+                    // Сохраняем полный результат
                     executedCommands.push({ command: cmd, result: execResult });
                     console.log(`[ADMIN] Результат: ${execResult.substring(0, 200)}`);
                     const funcResponse = {
@@ -517,13 +521,11 @@ async function handleAdminMessage(userText, req, res) {
             } else {
                 // Текстовый ответ – финальный
                 let finalText = parts.map(p => p.text).join('');
-                // Добавляем отчёт о выполненных командах
+                // Добавляем отчёт о выполненных командах с полными результатами
                 if (executedCommands.length > 0) {
                     finalText += "\n\n📋 <b>Выполненные команды:</b>\n";
                     executedCommands.forEach((cmd, index) => {
-                        // Обрезаем результат до 200 символов для компактности, если длинный
-                        const shortResult = cmd.result.length > 200 ? cmd.result.substring(0, 200) + "..." : cmd.result;
-                        finalText += `\n${index + 1}. <code>${cmd.command}</code>\n   ↳ ${shortResult}`;
+                        finalText += `\n${index + 1}. <code>${cmd.command}</code>\n   ↳ ${cmd.result}`;
                     });
                 }
                 console.log(`[ADMIN] Финальный ответ: ${finalText.substring(0, 200)}`);
@@ -536,8 +538,7 @@ async function handleAdminMessage(userText, req, res) {
                 if (executedCommands.length > 0) {
                     limitText += "\n\n📋 <b>Выполненные команды:</b>\n";
                     executedCommands.forEach((cmd, index) => {
-                        const shortResult = cmd.result.length > 200 ? cmd.result.substring(0, 200) + "..." : cmd.result;
-                        limitText += `\n${index + 1}. <code>${cmd.command}</code>\n   ↳ ${shortResult}`;
+                        limitText += `\n${index + 1}. <code>${cmd.command}</code>\n   ↳ ${cmd.result}`;
                     });
                 }
                 return res.json({ ok: true, text: limitText });
@@ -546,13 +547,11 @@ async function handleAdminMessage(userText, req, res) {
         return res.json({ ok: true, text: "Не удалось получить ответ от ИИ." });
     } catch (err) {
         console.error("[ADMIN ERROR]", err.message);
-        // Даже при ошибке можем вернуть список частично выполненных команд
         let errorText = `Ошибка: ${err.message}`;
         if (executedCommands.length > 0) {
             errorText += "\n\n📋 <b>Выполненные команды до ошибки:</b>\n";
             executedCommands.forEach((cmd, index) => {
-                const shortResult = cmd.result.length > 200 ? cmd.result.substring(0, 200) + "..." : cmd.result;
-                errorText += `\n${index + 1}. <code>${cmd.command}</code>\n   ↳ ${shortResult}`;
+                errorText += `\n${index + 1}. <code>${cmd.command}</code>\n   ↳ ${cmd.result}`;
             });
         }
         return res.status(500).json({ ok: false, error: errorText });
