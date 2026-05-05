@@ -20,16 +20,17 @@ app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 app.use(express.json({ limit: '50mb' }));
 
 const MAX_FILE_SIZE = 130 * 1024 * 1024;
-const CHUNK_SIZE_MB = 15; 
+const CHUNK_SIZE_MB = 15;
 const TMP_DIR = '/tmp';
 
 const PROXY_SECRET = process.env.PROXY_SECRET || "MySuperSecretPassword2026";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
-const TAVILY_API_KEY = process.env.TAVILY_API_KEY || ""; 
-const SOCKS5_PROXY = process.env.SOCKS5_PROXY || ""; 
+const TAVILY_API_KEY = process.env.TAVILY_API_KEY || "";
+const SOCKS5_PROXY = process.env.SOCKS5_PROXY || "";
 
 let genAI = null;
-let geminiHistory = []; 
+let geminiHistory = [];
+let adminMode = false;   // флаг режима администратора
 
 if (GEMINI_API_KEY) {
     genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
@@ -49,15 +50,15 @@ function captureLog(msg) {
     serverLogs.push(`[${getKyivTime()}] ${msg}`);
     if (serverLogs.length > MAX_LOG_LINES) serverLogs.shift();
 }
-const origLog = console.log; 
-console.log = function(...args) { 
-    origLog.apply(console, args); 
-    captureLog(util.format(...args)); 
+const origLog = console.log;
+console.log = function(...args) {
+    origLog.apply(console, args);
+    captureLog(util.format(...args));
 };
-const origErr = console.error; 
-console.error = function(...args) { 
-    origErr.apply(console, args); 
-    captureLog("ERROR: " + util.format(...args)); 
+const origErr = console.error;
+console.error = function(...args) {
+    origErr.apply(console, args);
+    captureLog("ERROR: " + util.format(...args));
 };
 
 console.log("[SYSTEM] Сервер запущен. Часовой пояс: Europe/Kyiv");
@@ -65,7 +66,7 @@ console.log("[SYSTEM] Сервер запущен. Часовой пояс: Euro
 let useProxy = false;
 
 function getBrowserHeaders(isMobile = false) {
-    const ua = isMobile 
+    const ua = isMobile
         ? 'Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36'
         : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
     return {
@@ -105,7 +106,7 @@ if (fs.existsSync(LIMITS_FILE)) {
 const originalFetch = global.fetch;
 global.fetch = async (input, init) => {
     const response = await originalFetch(input, init);
-    let url = typeof input === 'string' ? input : (input && input.url ? input.url : ''); 
+    let url = typeof input === 'string' ? input : (input && input.url ? input.url : '');
     if (url && url.includes('generativelanguage.googleapis.com/v1beta/models/')) {
         const match = url.match(/models\/([^:]+)(?::generateContent|:streamGenerateContent)/);
         if (match && match[1]) {
@@ -147,9 +148,9 @@ app.post('/gemini', async (req, res) => {
             fs.writeFileSync(savePath, Buffer.from(req.body.b64, 'base64'));
             console.log(`[UPLOAD] Файл сохранен: ${savePath}`);
             return res.json({ok: true, text: `✅ Файл <b>${filename}</b> загружен!<br>Путь: <code>${savePath}</code>`});
-        } catch (err) { 
+        } catch (err) {
             console.error("[UPLOAD ERROR]", err.message);
-            return res.status(500).json({ok: false, error: err.message}); 
+            return res.status(500).json({ok: false, error: err.message});
         }
     }
 
@@ -173,7 +174,7 @@ app.post('/gemini', async (req, res) => {
     }
 
     let userText = req.body.text ? req.body.text.trim() : "";
-    
+
     if (userText === '/help') {
         const respHtml = `🤖 <b>СИСТЕМА CHATOPS:</b><br><br>
 <code>/status</code> — Состояние сервера<br>
@@ -183,7 +184,9 @@ app.post('/gemini', async (req, res) => {
 <code>/download [путь]</code> — Скачать файл (до 15 МБ)<br>
 <code>/upload</code> — Загрузить файл на сервер<br>
 <code>/search [запрос]</code> — Поиск в сети с помощью Tavily API<br>
-<code>/search download:[url]</code> — Прямая загрузка файла<br><br>
+<code>/search download:[url]</code> — Прямая загрузка файла<br>
+<code>/admin on</code> — Включить режим администратора (автовыполнение команд)<br>
+<code>/admin off</code> — Выключить режим администратора<br><br>
 💻 <b>Терминал:</b><br>
 <i>Путь контейнера: <code>/usr/src/app</code></i><br>
 <code>! [команда]</code> — Консоль Linux<br>
@@ -191,12 +194,24 @@ app.post('/gemini', async (req, res) => {
         return res.json({ ok: true, text: respHtml });
     }
 
+    // Режим администратора
+    if (userText === '/admin on') {
+        adminMode = true;
+        console.log("[ADMIN] Режим администратора ВКЛЮЧЕН.");
+        return res.json({ ok: true, text: "🔧 <b>Режим администратора активирован.</b> Все последующие сообщения будут выполняться как автономные задачи с доступом к терминалу и поиску в интернете." });
+    }
+    if (userText === '/admin off') {
+        adminMode = false;
+        console.log("[ADMIN] Режим администратора ОТКЛЮЧЕН.");
+        return res.json({ ok: true, text: "🛑 <b>Режим администратора отключен.</b>" });
+    }
+
     if (userText === '/proxy on') {
         if (!SOCKS5_PROXY) return res.json({ok: true, text: "❌ Переменная SOCKS5_PROXY не настроена."});
         useProxy = true;
         
         const curlDir = path.join(__dirname, 'curl-impersonate');
-        const curlBin = path.join(curlDir, 'curl_chrome116'); 
+        const curlBin = path.join(curlDir, 'curl_chrome116');
         
         if (!fs.existsSync(curlBin)) {
             console.error("[PROXY ERROR] Папка curl-impersonate не найдена!");
@@ -217,7 +232,7 @@ app.post('/gemini', async (req, res) => {
         if (Object.keys(geminiLimits).length === 0) return res.json({ ok: true, text: `📊 <b>Состояние моделей:</b> Отправьте запрос ИИ.` });
         let tableHtml = `<table style="width:100%; border-collapse:collapse; font-size:11px; margin-top:5px; background:#fff; color:#333;"><tr style="background:#1a73e8; color:white;"><th style="padding:4px; border:1px solid #ccc;">Модель</th><th style="padding:4px; border:1px solid #ccc;">Статус</th><th style="padding:4px; border:1px solid #ccc;">Сброс</th></tr>`;
         for (const [model, data] of Object.entries(geminiLimits)) {
-            const statusColor = data.status === 'OK' ? '#28a745' : '#dc3545'; 
+            const statusColor = data.status === 'OK' ? '#28a745' : '#dc3545';
             tableHtml += `<tr><td style="padding:4px; border:1px solid #ccc; font-weight:bold;">${model}</td><td style="padding:4px; border:1px solid #ccc; text-align:center; font-weight:bold; color:${statusColor};">${data.status}</td><td style="padding:4px; border:1px solid #ccc; text-align:center;">${data.reset}</td></tr>`;
         }
         tableHtml += `</table>`;
@@ -241,7 +256,7 @@ app.post('/gemini', async (req, res) => {
         const logsHtml = serverLogs.length ? serverLogs.join('\n') : "Логи пусты.";
         return res.json({ ok: true, text: `🖥 <b>Логи Northflank:</b><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#e0e0e0; color:#333; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${logsHtml}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#999; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
     }
-    
+
     if (userText === '/status') {
         const mem = process.memoryUsage();
         const uptime = Math.floor(process.uptime());
@@ -253,7 +268,7 @@ app.post('/gemini', async (req, res) => {
         if (!cmd) return res.json({ ok: true, text: "⚠️ Введите команду." });
         try {
             console.log(`[CHATOPS] Выполнение: ${cmd}`);
-            const { stdout, stderr } = await execPromise(cmd, { timeout: 15000 }); 
+            const { stdout, stderr } = await execPromise(cmd, { timeout: 15000 });
             let output = stdout; if (stderr) output += `\n[STDERR]:\n${stderr}`;
             if (!output) output = "[Выполнено успешно]";
             if (output.length > 300000) output = output.substring(0, 300000) + "\n...[ОБРЕЗАН]...";
@@ -278,7 +293,7 @@ app.post('/gemini', async (req, res) => {
 
                 if (useProxy && SOCKS5_PROXY) {
                     console.log(`[WEB SEARCH] Скачивание через локальный Ghost Proxy: ${dlUrl}`);
-                    const curlBin = path.join(__dirname, 'curl-impersonate', 'curl_chrome116'); 
+                    const curlBin = path.join(__dirname, 'curl-impersonate', 'curl_chrome116');
                     const proxyStr = SOCKS5_PROXY.replace('socks5://', 'socks5h://');
                     const shellExec = fs.existsSync('/bin/bash') ? 'bash' : 'sh';
                     await execPromise(`${shellExec} "${curlBin}" --compressed -m 60 -s -L -x "${proxyStr}" -o "${savePath}" "${dlUrl}"`);
@@ -310,20 +325,26 @@ app.post('/gemini', async (req, res) => {
                 } else { searchResultsText = `По запросу «${query}» ничего не найдено.`; }
             }
             userText = `Команда /search "${query}". Данные:\n\n${searchResultsText}\n\nПроанализируй и дай ответ.`;
-        } catch (err) { 
+        } catch (err) {
             console.error(`[WEB SEARCH ERROR]`, err.message);
-            userText = `Ошибка поиска "${query}": ${err.message}.`; 
+            userText = `Ошибка поиска "${query}": ${err.message}.`;
         }
     }
 
     if (!GEMINI_API_KEY) return res.status(500).json({ok: false, error: "Отсутствует GEMINI_API_KEY"});
-    if (req.body.clear === 'true') { 
-        geminiHistory = []; 
+    if (req.body.clear === 'true') {
+        geminiHistory = [];
         console.log("[GEMINI] Память контекста нейросети очищена.");
-        if (userText === 'clear') return res.json({ok: true, text: "История очищена"}); 
+        if (userText === 'clear') return res.json({ok: true, text: "История очищена"});
     }
 
-    const modelName = req.body.model || "gemini-2.5-flash"; 
+    // Если включён режим администратора и сообщение не начинается со служебного символа,
+    // передаём управление автономному агенту
+    if (adminMode && userText && !userText.startsWith('/') && !userText.startsWith('!')) {
+        return handleAdminMessage(userText, req, res);
+    }
+
+    const modelName = req.body.model || "gemini-2.5-flash";
     const msgParts = [];
     if (userText) msgParts.push(userText);
     if (req.body.b64 && req.body.mimeType) {
@@ -344,14 +365,171 @@ app.post('/gemini', async (req, res) => {
         const result = await chat.sendMessage(msgParts);
         geminiHistory = await chat.getHistory();
         return res.json({ ok: true, text: result.response.text() });
-    } catch (err) { 
+    } catch (err) {
         console.error("[GEMINI ERROR]", err.message);
-        return res.status(500).json({ ok: false, error: err.message }); 
+        return res.status(500).json({ ok: false, error: err.message });
     }
 });
 
 // ==========================================
-// ОСНОВНОЙ ПРОКСИ
+// АВТОНОМНЫЙ АДМИНИСТРАТОР С ИНСТРУМЕНТАМИ
+// ==========================================
+async function handleAdminMessage(userText, req, res) {
+    if (!GEMINI_API_KEY) return res.status(500).json({ok: false, error: "Отсутствует GEMINI_API_KEY"});
+
+    const model = genAI.getGenerativeModel({
+        model: "gemini-2.5-flash",
+        systemInstruction: "Ты полезный администратор сервера. Ты можешь выполнять команды терминала Linux и искать информацию в интернете. Проанализируй запрос пользователя, при необходимости используй инструменты, чтобы выполнить задачу. После каждого вызова функции дождись результата и прими решение о следующем шаге. Когда задача будет выполнена, дай окончательный текстовый ответ."
+    });
+
+    // Инструменты: команда и поиск
+    const tools = [{
+        functionDeclarations: [
+            {
+                name: "exec_command",
+                description: "Execute a shell command and return stdout and stderr.",
+                parameters: {
+                    type: "OBJECT",
+                    properties: {
+                        command: {
+                            type: "STRING",
+                            description: "The shell command to execute."
+                        }
+                    },
+                    required: ["command"]
+                }
+            },
+            {
+                name: "search_web",
+                description: "Search the web using Tavily API or download a file directly. Use 'query' for search, or 'download' with a URL to download a file.",
+                parameters: {
+                    type: "OBJECT",
+                    properties: {
+                        action: {
+                            type: "STRING",
+                            enum: ["search", "download"],
+                            description: "Search the web for information or download a file from URL."
+                        },
+                        query: {
+                            type: "STRING",
+                            description: "Search query (required for action=search)"
+                        },
+                        url: {
+                            type: "STRING",
+                            description: "URL to download (required for action=download)"
+                        }
+                    },
+                    required: ["action"]
+                }
+            }
+        ]
+    }];
+
+    const chat = model.startChat({ tools: tools });
+
+    let iterations = 0;
+    const maxIterations = 10;
+
+    try {
+        let result = await chat.sendMessage(userText);
+        while (result.response && result.response.candidates && result.response.candidates[0]) {
+            const candidate = result.response.candidates[0];
+            const parts = candidate.content.parts;
+            
+            const functionCall = parts.find(part => part.functionCall);
+            if (functionCall) {
+                const call = functionCall.functionCall;
+                if (call.name === "exec_command") {
+                    const cmd = call.args.command;
+                    console.log(`[ADMIN] Выполнение команды: ${cmd}`);
+                    let execResult;
+                    try {
+                        const { stdout, stderr } = await execPromise(cmd, { timeout: 15000 });
+                        execResult = stdout;
+                        if (stderr) execResult += '\n[STDERR]: ' + stderr;
+                        if (!execResult.trim()) execResult = "[Команда выполнена успешно, вывод пуст]";
+                    } catch (err) {
+                        execResult = `Ошибка: ${err.message}`;
+                    }
+                    console.log(`[ADMIN] Результат: ${execResult.substring(0, 200)}`);
+                    const funcResponse = {
+                        name: call.name,
+                        response: { result: execResult }
+                    };
+                    result = await chat.sendMessage([{ functionResponse: funcResponse }]);
+                } else if (call.name === "search_web") {
+                    const action = call.args.action;
+                    console.log(`[ADMIN] Поиск/загрузка: action=${action}`);
+                    let searchResult = "";
+                    try {
+                        if (action === "search") {
+                            const query = call.args.query;
+                            if (!query) throw new Error("No query provided");
+                            if (!TAVILY_API_KEY) throw new Error("TAVILY_API_KEY not set");
+                            const requestBody = { api_key: TAVILY_API_KEY, query: query, max_results: 5, search_depth: "basic" };
+                            const tavRes = await axios.post('https://api.tavily.com/search', requestBody);
+                            if (tavRes.data && tavRes.data.results) {
+                                searchResult = tavRes.data.results.map((r, i) => `[${i+1}] ${r.title}\n${r.content}\n${r.url}`).join('\n\n');
+                            } else {
+                                searchResult = "Ничего не найдено.";
+                            }
+                        } else if (action === "download") {
+                            const url = call.args.url;
+                            if (!url) throw new Error("No URL provided");
+                            const parsed = new URL.URL(url);
+                            const filename = (path.basename(parsed.pathname) || `dl_${Date.now()}`).replace(/[^a-zA-Z0-9.\-_]/g, '_');
+                            const savePath = path.join(TMP_DIR, filename);
+                            
+                            // Используем существующий механизм загрузки (прямой или через прокси)
+                            if (useProxy && SOCKS5_PROXY) {
+                                const curlBin = path.join(__dirname, 'curl-impersonate', 'curl_chrome116');
+                                const proxyStr = SOCKS5_PROXY.replace('socks5://', 'socks5h://');
+                                const shell = fs.existsSync('/bin/bash') ? 'bash' : 'sh';
+                                await execPromise(`${shell} "${curlBin}" --compressed -m 60 -s -L -x "${proxyStr}" -o "${savePath}" "${url}"`);
+                            } else {
+                                const response = await axios.get(url, { responseType: 'stream', headers: getBrowserHeaders(false), timeout: 60000 });
+                                const writer = fs.createWriteStream(savePath);
+                                response.data.pipe(writer);
+                                await new Promise((resolve, reject) => { writer.on('finish', resolve); writer.on('error', reject); });
+                            }
+                            const stat = fs.statSync(savePath);
+                            searchResult = `Файл загружен: ${savePath} (${(stat.size/1024).toFixed(1)} KB)`;
+                        }
+                    } catch (err) {
+                        searchResult = `Ошибка поиска/загрузки: ${err.message}`;
+                    }
+                    console.log(`[ADMIN] Результат операции: ${searchResult.substring(0, 200)}`);
+                    const funcResponse = {
+                        name: call.name,
+                        response: { result: searchResult }
+                    };
+                    result = await chat.sendMessage([{ functionResponse: funcResponse }]);
+                } else {
+                    // Неизвестная функция
+                    console.log("[ADMIN] Неизвестная функция:", call.name);
+                    break;
+                }
+            } else {
+                // Текстовый ответ — финальный
+                const text = parts.map(p => p.text).join('');
+                console.log(`[ADMIN] Финальный ответ: ${text.substring(0, 200)}`);
+                return res.json({ ok: true, text: text });
+            }
+            iterations++;
+            if (iterations >= maxIterations) {
+                console.log("[ADMIN] Достигнут лимит итераций.");
+                return res.json({ ok: true, text: "⚠️ Достигнут лимит операций. Завершаю работу." });
+            }
+        }
+        return res.json({ ok: true, text: "Не удалось получить ответ от ИИ." });
+    } catch (err) {
+        console.error("[ADMIN ERROR]", err.message);
+        return res.status(500).json({ ok: false, error: err.message });
+    }
+}
+
+// ==========================================
+// ОСНОВНОЙ ПРОКСИ (без изменений)
 // ==========================================
 app.get('/', async (req, res) => {
     const reqToken = req.query.token;
@@ -403,10 +581,9 @@ app.get('/', async (req, res) => {
             const reqId = crypto.randomUUID();
             const headFile = path.join(TMP_DIR, `${reqId}_head.txt`);
             const bodyFile = path.join(TMP_DIR, `${reqId}_body.bin`);
-            const curlBin = path.join(__dirname, 'curl-impersonate', 'curl_chrome116'); 
+            const curlBin = path.join(__dirname, 'curl-impersonate', 'curl_chrome116');
             const proxyStr = SOCKS5_PROXY.replace('socks5://', 'socks5h://');
             
-            // Умный выбор оболочки (если bash еще не успел установиться, юзаем sh)
             const shellExec = fs.existsSync('/bin/bash') ? 'bash' : 'sh';
             await execPromise(`${shellExec} "${curlBin}" --compressed -m 15 -s -L -x "${proxyStr}" -D "${headFile}" -o "${bodyFile}" "${targetUrl}"`);
             
@@ -427,13 +604,13 @@ app.get('/', async (req, res) => {
                 htmlContent = decodeBuffer(bodyBuffer, contentType);
                 fs.unlinkSync(bodyFile); fs.unlinkSync(headFile);
             } else {
-                downloadFilePath = bodyFile; 
+                downloadFilePath = bodyFile;
                 fs.unlinkSync(headFile);
             }
         } else {
             console.log(`[PROXY] Запрос напрямую (axios)...`);
-            const response = await axios.get(targetUrl, { 
-                responseType: 'stream', headers: getBrowserHeaders(isMobile), timeout: 15000, validateStatus: () => true 
+            const response = await axios.get(targetUrl, {
+                responseType: 'stream', headers: getBrowserHeaders(isMobile), timeout: 15000, validateStatus: () => true
             });
             responseStatus = response.status;
             contentType = response.headers['content-type'] || '';
@@ -474,11 +651,11 @@ app.get('/', async (req, res) => {
             for (let i = 0; i < Math.min(stylesheets.length, 5); i++) {
                 let href = $(stylesheets[i]).attr('href');
                 if (href && href.startsWith('/')) href = baseUrl + href;
-                if (href) { 
-                    try { 
-                        const cssRes = await axios.get(href, { headers: getBrowserHeaders(isMobile), timeout: 3000 }); 
-                        $(stylesheets[i]).replaceWith(`<style>${cssRes.data}</style>`); 
-                    } catch (e) {} 
+                if (href) {
+                    try {
+                        const cssRes = await axios.get(href, { headers: getBrowserHeaders(isMobile), timeout: 3000 });
+                        $(stylesheets[i]).replaceWith(`<style>${cssRes.data}</style>`);
+                    } catch (e) {}
                 }
             }
 
@@ -491,10 +668,10 @@ app.get('/', async (req, res) => {
                 let src = img.attr('src') || img.attr('data-src') || img.attr('data-original');
                 if (src && !src.startsWith('data:') && src.startsWith('/')) src = baseUrl + src;
                 if (src && !src.startsWith('data:')) {
-                    try { 
+                    try {
                         const imgRes = await axios.get(src, { responseType: 'arraybuffer', headers: getBrowserHeaders(isMobile), timeout: 3500 });
                         img.attr('src', `data:${imgRes.headers['content-type']};base64,${Buffer.from(imgRes.data, 'binary').toString('base64')}`);
-                        img.removeAttr('srcset').removeAttr('data-src').removeAttr('loading'); 
+                        img.removeAttr('srcset').removeAttr('data-src').removeAttr('loading');
                     } catch (e) {}
                 }
             }
@@ -502,7 +679,7 @@ app.get('/', async (req, res) => {
             if (req.query.nf_dl_html === 'true') {
                 console.log(`[PROXY] Формирование HTML для скачивания: ${parsedTarget.hostname}`);
                 $('head').prepend(`<base href="${parsedTarget.origin}">`);
-                res.set('Content-Type', 'application/octet-stream'); 
+                res.set('Content-Type', 'application/octet-stream');
                 res.set('Content-Disposition', `attachment; filename="page_${parsedTarget.hostname.replace(/[^a-zA-Z0-9.-]/g, '_')}.html"`);
                 return res.send($.html());
             }
@@ -510,7 +687,7 @@ app.get('/', async (req, res) => {
             console.log(`[PROXY] Страница успешно обработана и отправлена.`);
             res.set('Content-Type', 'text/html; charset=utf-8');
             return res.send($.html());
-        } 
+        }
         
         // --- Обработка Загрузки файлов ---
         else {
@@ -560,21 +737,21 @@ app.get('/', async (req, res) => {
             } else {
                 console.log(`[PROXY] Файл больше ${CHUNK_SIZE_MB} МБ. Запущена упаковка в ZIP архив...`);
                 const zipBaseName = safeName + '.zip';
-                try { await execPromise(`cd "${fileDir}" && zip -s ${CHUNK_SIZE_MB}m "${zipBaseName}" "${safeName}"`); } 
-                catch (zipErr) { 
+                try { await execPromise(`cd "${fileDir}" && zip -s ${CHUNK_SIZE_MB}m "${zipBaseName}" "${safeName}"`); }
+                catch (zipErr) {
                     console.error(`[PROXY ERROR] Ошибка создания ZIP:`, zipErr.message);
-                    return res.status(500).send("Ошибка архивации"); 
+                    return res.status(500).send("Ошибка архивации");
                 }
                 
                 fs.unlinkSync(filePath);
-                const archiveParts = fs.readdirSync(fileDir).filter(f => f.startsWith(safeName + '.')).sort(); 
+                const archiveParts = fs.readdirSync(fileDir).filter(f => f.startsWith(safeName + '.')).sort();
                 
                 console.log(`[PROXY] Архив создан успешно (${archiveParts.length} частей).`);
 
-                let buttonsHtml = ''; let totalCompressedBytes = 0; 
+                let buttonsHtml = ''; let totalCompressedBytes = 0;
                 archiveParts.forEach((partName) => {
                     parsedTarget.searchParams.set('nf_fileId', fileId); parsedTarget.searchParams.set('nf_partName', partName);
-                    const stat = fs.statSync(path.join(fileDir, partName)); totalCompressedBytes += stat.size; 
+                    const stat = fs.statSync(path.join(fileDir, partName)); totalCompressedBytes += stat.size;
                     buttonsHtml += `<a href="${parsedTarget.toString()}" target="_blank" style="display:block; margin-bottom:10px; padding:12px; background:#1a73e8; color:white; text-decoration:none; border-radius:5px; font-weight:bold;">📥 Скачать ${partName} <span style="font-weight:normal; font-size:12px;">(${(stat.size/1024/1024).toFixed(1)} МБ)</span></a>`;
                 });
 
@@ -585,9 +762,9 @@ app.get('/', async (req, res) => {
                 return res.status(200).send(`<!DOCTYPE html><html><body style="background:#f0f2f5; display:flex; justify-content:center; padding:20px; font-family:sans-serif;"><div style="background:white; padding:25px; border-top:5px solid #1a73e8; border-radius:10px; text-align:center; width:100%; max-width:400px; box-shadow:0 4px 10px rgba(0,0,0,0.1);"><h2 style="margin-top:0;">📦 Объемный архив</h2><p style="font-size:14px; margin-bottom:5px;">Оригинал: ${origMB} МБ</p><p style="font-size:14px; margin-top:0; margin-bottom:15px;">${savingsHtml}</p>${buttonsHtml}</div></body></html>`);
             }
         }
-    } catch (error) { 
+    } catch (error) {
         console.error(`[PROXY ERROR] Ошибка шлюза:`, error.message);
-        res.status(500).send(`Ошибка шлюза: ${error.message}`); 
+        res.status(500).send(`Ошибка шлюза: ${error.message}`);
     }
 });
 
@@ -598,7 +775,7 @@ async function startServer() {
     console.log("[SYSTEM] Проверка окружения перед запуском...");
     try {
         const curlDir = path.join(__dirname, 'curl-impersonate');
-        const curlBin = path.join(curlDir, 'curl_chrome116'); 
+        const curlBin = path.join(curlDir, 'curl_chrome116');
         if (fs.existsSync(curlBin)) {
             fs.chmodSync(curlBin, 0o755);
             if (fs.existsSync(path.join(curlDir, 'curl-impersonate-chrome'))) {
@@ -607,7 +784,6 @@ async function startServer() {
             console.log("[SYSTEM] Права файлов curl-impersonate настроены.");
         }
         
-        // Устанавливаем bash, zip и совместимость с glibc прямо при загрузке контейнера
         if (fs.existsSync('/etc/os-release')) {
             const osRelease = fs.readFileSync('/etc/os-release', 'utf8');
             if (osRelease.includes('Alpine')) {
@@ -627,4 +803,3 @@ async function startServer() {
 }
 
 startServer();
-                        
