@@ -12,44 +12,7 @@ const crypto = require('crypto');
 const util = require('util');
 const { exec } = require('child_process');
 const execPromise = util.promisify(exec);
-
-// === ИНИЦИАЛИЗАЦИЯ GEMINI КЛИЕНТА С АВТООПРЕДЕЛЕНИЕМ ===
-const genaiPackage = require('@google/generative-ai');
-
-// Собираем все возможные конструкторы из пакета
-const candidateClasses = [
-    genaiPackage.GoogleAI,
-    genaiPackage.GoogleGenAI,
-    genaiPackage.GoogleGenerativeAI,
-    genaiPackage.GenerativeAI,
-    genaiPackage.Client,
-].filter(c => typeof c === 'function');
-
-let GoogleGenAI = null;
-const dummyKey = 'test-key';
-
-// Пытаемся найти конструктор, экземпляр которого имеет models и/или interactions
-for (const C of candidateClasses) {
-    try {
-        const instance = new C({ apiKey: dummyKey });
-        if (instance && (instance.models || instance.interactions)) {
-            GoogleGenAI = C;
-            console.log(`[SYSTEM] Выбран класс: ${C.name} (models: ${!!instance.models}, interactions: ${!!instance.interactions})`);
-            break;
-        }
-    } catch (e) {
-        // Пропускаем
-    }
-}
-
-// Если не нашли подходящий, берём первый попавшийся
-if (!GoogleGenAI) {
-    GoogleGenAI = candidateClasses[0] || null;
-    if (!GoogleGenAI) {
-        throw new Error("Не удалось найти ни одного конструктора Gemini-клиента в @google/generative-ai");
-    }
-    console.warn(`[SYSTEM] Подходящий клиент не найден, используется ${GoogleGenAI.name} (может не работать)`);
-}
+const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 const app = express();
 app.use(compression());
@@ -65,24 +28,13 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY || "";
 const SOCKS5_PROXY = process.env.SOCKS5_PROXY || "";
 
-let ai = null;
-let geminiHistory = [];
+let genAI = null;
+let geminiHistory = [];          // история обычного чата
 let adminMode = false;
-let adminHistory = [];
+let adminHistory = [];           // отдельная история для режима администратора
 
-if (GEMINI_API_KEY && GoogleGenAI) {
-    try {
-        ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
-        console.log(`[SYSTEM] Gemini клиент создан (класс: ${GoogleGenAI.name})`);
-        console.log(`[SYSTEM] Наличие models: ${!!ai.models}, interactions: ${!!ai.interactions}`);
-    } catch (err) {
-        console.error("[SYSTEM] Ошибка создания Gemini клиента:", err.message);
-        ai = null;
-    }
-} else if (!GEMINI_API_KEY) {
-    console.warn("[SYSTEM] GEMINI_API_KEY не задан. ИИ-функции отключены.");
-} else {
-    console.warn("[SYSTEM] Не найден подходящий конструктор Gemini, ИИ-функции отключены.");
+if (GEMINI_API_KEY) {
+    genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 }
 
 // ==========================================
@@ -185,31 +137,6 @@ global.fetch = async (input, init) => {
 };
 
 // ==========================================
-// АГЕНТ ANTIGRAVITY
-// ==========================================
-async function handleAgentTask(task, req, res) {
-    if (!ai) return res.status(500).json({ok: false, error: "GEMINI_API_KEY не настроен или клиент не создан"});
-    if (!ai.interactions) {
-        return res.status(500).json({ok: false, error: "Клиент Gemini не поддерживает agents (interactions). Требуется версия 0.22+ с GoogleGenAI."});
-    }
-    try {
-        console.log(`[AGENT] Запуск агента Antigravity с задачей: "${task.substring(0, 100)}..."`);
-        const interaction = await ai.interactions.create({
-            agent: "antigravity-preview-05-2026",
-        });
-        interaction.on('step', (step) => {
-            console.log(`[AGENT] Step: ${step.toolName}`, step.output?.substring(0, 200));
-        });
-        const response = await interaction.sendMessage(task);
-        console.log("[AGENT] Задача выполнена.");
-        return res.json({ ok: true, text: response.text });
-    } catch (err) {
-        console.error('[AGENT ERROR]', err.message);
-        return res.status(500).json({ ok: false, error: err.message });
-    }
-}
-
-// ==========================================
 // МАРШРУТ УПРАВЛЕНИЯ И GEMINI
 // ==========================================
 app.post('/gemini', async (req, res) => {
@@ -249,13 +176,6 @@ app.post('/gemini', async (req, res) => {
 
     let userText = req.body.text ? req.body.text.trim() : "";
 
-    // Команда /agent
-    if (userText.startsWith('/agent ')) {
-        const task = userText.substring(7).trim();
-        if (!task) return res.json({ ok: true, text: "⚠️ Укажите задачу для агента." });
-        return handleAgentTask(task, req, res);
-    }
-
     if (userText === '/help') {
         const respHtml = `🤖 <b>СИСТЕМА CHATOPS:</b><br><br>
 <code>/status</code> — Состояние сервера<br>
@@ -267,8 +187,7 @@ app.post('/gemini', async (req, res) => {
 <code>/search [запрос]</code> — Поиск в сети с помощью Tavily API<br>
 <code>/search download:[url]</code> — Прямая загрузка файла<br>
 <code>/admin on</code> — Включить режим администратора (автовыполнение команд)<br>
-<code>/admin off</code> — Выключить режим администратора<br>
-<code>/agent [задача]</code> — Агент Antigravity (среда выполнения)<br><br>
+<code>/admin off</code> — Выключить режим администратора<br><br>
 💻 <b>Терминал:</b><br>
 <i>Путь контейнера: <code>/usr/src/app</code></i><br>
 <code>! [команда]</code> — Консоль Linux<br>
@@ -276,15 +195,16 @@ app.post('/gemini', async (req, res) => {
         return res.json({ ok: true, text: respHtml });
     }
 
+    // Режим администратора
     if (userText === '/admin on') {
         adminMode = true;
-        adminHistory = [];
+        adminHistory = [];   // сбрасываем историю при включении
         console.log("[ADMIN] Режим администратора ВКЛЮЧЕН.");
         return res.json({ ok: true, text: "🔧 <b>Режим администратора активирован.</b> Все последующие сообщения будут выполняться как автономные задачи с доступом к терминалу и поиску в интернете." });
     }
     if (userText === '/admin off') {
         adminMode = false;
-        adminHistory = [];
+        adminHistory = [];   // очищаем контекст
         console.log("[ADMIN] Режим администратора ОТКЛЮЧЕН.");
         return res.json({ ok: true, text: "🛑 <b>Режим администратора отключен.</b>" });
     }
@@ -340,6 +260,7 @@ app.post('/gemini', async (req, res) => {
         return res.json({ ok: true, text: `🖥 <b>Логи Northflank:</b><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#e0e0e0; color:#333; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${logsHtml}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#999; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
     }
 
+    // ---------- ОБНОВЛЁННЫЙ /status ----------
     if (userText === '/status') {
         const mem = process.memoryUsage();
         const uptime = Math.floor(process.uptime());
@@ -421,11 +342,13 @@ app.post('/gemini', async (req, res) => {
     if (!GEMINI_API_KEY) return res.status(500).json({ok: false, error: "Отсутствует GEMINI_API_KEY"});
     if (req.body.clear === 'true') {
         geminiHistory = [];
-        adminHistory = [];
+        adminHistory = [];   // заодно чистим админский контекст
         console.log("[GEMINI] Память контекста нейросети очищена.");
         if (userText === 'clear') return res.json({ok: true, text: "История очищена"});
     }
 
+    // Если включён режим администратора и сообщение не начинается со служебного символа,
+    // передаём управление автономному агенту
     if (adminMode && userText && !userText.startsWith('/') && !userText.startsWith('!')) {
         return handleAdminMessage(userText, req, res);
     }
@@ -442,15 +365,11 @@ app.post('/gemini', async (req, res) => {
 
     console.log(`[GEMINI] Запрос к ИИ. Модель: [${modelName}]. Контекст в памяти: [${geminiHistory.length} сообщений]`);
 
-    if (!ai || !ai.models) {
-        return res.status(500).json({ok: false, error: "Клиент Gemini не поддерживает обычные модели (ai.models отсутствует)."});
-    }
-
     try {
         const isGemma = modelName.toLowerCase().includes('gemma');
         const modelConfig = { model: modelName };
         if (!isGemma) modelConfig.systemInstruction = "Ты — полезный ИИ-ассистент.";
-        const model = ai.models.getGenerativeModel(modelConfig);
+        const model = genAI.getGenerativeModel(modelConfig);
         const chat = model.startChat({ history: geminiHistory });
         const result = await chat.sendMessage(msgParts);
         geminiHistory = await chat.getHistory();
@@ -466,9 +385,6 @@ app.post('/gemini', async (req, res) => {
 // ==========================================
 async function handleAdminMessage(userText, req, res) {
     if (!GEMINI_API_KEY) return res.status(500).json({ok: false, error: "Отсутствует GEMINI_API_KEY"});
-    if (!ai || !ai.models) {
-        return res.status(500).json({ok: false, error: "Клиент Gemini не поддерживает модели (ai.models отсутствует)."});
-    }
 
     const preferredModel = req.body.model || "gemini-2.5-flash";
     const isGemma = preferredModel.toLowerCase().includes('gemma');
@@ -478,7 +394,7 @@ async function handleAdminMessage(userText, req, res) {
         modelConfig.systemInstruction = "Ты полезный администратор сервера. Ты можешь выполнять команды терминала Linux и искать информацию в интернете. Проанализируй запрос пользователя, при необходимости используй инструменты, чтобы выполнить задачу. После каждого вызова функции дождись результата и прими решение о следующем шаге. Когда задача будет выполнена, дай окончательный текстовый ответ. В ответе обязательно перечисли выполненные тобой команды терминала и их результаты.";
     }
 
-    const model = ai.models.getGenerativeModel(modelConfig);
+    const model = genAI.getGenerativeModel(modelConfig);
     const tools = [{
         functionDeclarations: [
             {
@@ -521,6 +437,7 @@ async function handleAdminMessage(userText, req, res) {
         ]
     }];
 
+    // Используем сохранённую историю администратора
     const chat = model.startChat({ history: adminHistory, tools: tools });
     const executedCommands = [];
 
@@ -606,6 +523,7 @@ async function handleAdminMessage(userText, req, res) {
                     break;
                 }
             } else {
+                // Финальный ответ
                 let finalText = parts.map(p => p.text).join('');
                 if (executedCommands.length > 0) {
                     finalText += "\n\n📋 <b>Выполненные команды:</b>\n";
@@ -613,6 +531,7 @@ async function handleAdminMessage(userText, req, res) {
                         finalText += `\n${index + 1}. <code>${cmd.command}</code>\n   ↳ ${cmd.result}`;
                     });
                 }
+                // Сохраняем обновлённую историю
                 adminHistory = await chat.getHistory();
                 console.log(`[ADMIN] Финальный ответ. Контекст админа теперь: ${adminHistory.length} сообщений`);
                 return res.json({ ok: true, text: finalText });
@@ -642,13 +561,14 @@ async function handleAdminMessage(userText, req, res) {
                 errorText += `\n${index + 1}. <code>${cmd.command}</code>\n   ↳ ${cmd.result}`;
             });
         }
+        // Попытаемся сохранить историю даже при ошибке
         try { adminHistory = await chat.getHistory(); } catch (e) {}
         return res.status(500).json({ ok: false, error: errorText });
     }
 }
 
 // ==========================================
-// ОСНОВНОЙ ПРОКСИ
+// ОСНОВНОЙ ПРОКСИ (без изменений)
 // ==========================================
 app.get('/', async (req, res) => {
     const reqToken = req.query.token;
@@ -749,6 +669,7 @@ app.get('/', async (req, res) => {
             }
         }
 
+        // --- УМНАЯ ЗАГЛУШКА АНТИ-БОТОВ ---
         if ([401, 403, 406, 429, 503].includes(responseStatus)) {
             console.warn(`[PROXY WARNING] Сайт заблокировал запрос. HTTP Код: ${responseStatus}`);
             return res.status(200).send(`<!DOCTYPE html><html><body style="font-family:sans-serif; text-align:center; padding:40px; background:#f8d7da; color:#721c24; border-radius:10px; margin:20px;"><h2 style="margin-top:0;">🚫 Доступ заблокирован (${responseStatus})</h2><p>Целевой сервер отклонил запрос. Попробуйте использовать команду <b>/proxy on</b> в чате.</p></body></html>`);
@@ -759,6 +680,7 @@ app.get('/', async (req, res) => {
              return res.status(200).send(`<!DOCTYPE html><html><body style="font-family:sans-serif; text-align:center; padding:40px; background:#fff3cd; color:#856404; border-radius:10px; margin:20px;"><h2 style="margin-top:0;">🤖 JS-Капча (Cloudflare)</h2><p>Сайт требует вычисления сложной JavaScript-капчи, которую невозможно выполнить через серверный прокси. Откройте эту ссылку в обычном браузере.</p></body></html>`);
         }
 
+        // --- Обработка HTML ---
         if (isHtml) {
             console.log(`[PROXY] HTML загружен успешно. Парсинг ресурсов...`);
             const $ = cheerio.load(htmlContent);
@@ -806,6 +728,7 @@ app.get('/', async (req, res) => {
             return res.send($.html());
         }
         
+        // --- Обработка Загрузки файлов ---
         else {
             console.log(`[PROXY] Обнаружен файл (${contentType}). Подготовка к загрузке...`);
             const fileId = crypto.randomUUID();
