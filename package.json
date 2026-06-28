@@ -1,13 +1,14 @@
 {
   "name": "proxy-server",
   "version": "1.0.0",
-  "description": "",
+  "description": "Proxy server with Gemini Agent capabilities",
   "main": "server.js",
+  "type": "module",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "@google/generative-ai": "^0.22.0",
+    "@google/genai": "^0.1.0",
     "axios": "^1.6.7",
     "cheerio": "^1.0.0-rc.12",
     "compression": "^1.7.4",
