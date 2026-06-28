@@ -1,21 +1,21 @@
-# Используем Node.js 20 (не alpine, чтобы избежать проблем с компиляцией нативных модулей)
-FROM node:20
+# Используем легковесный образ Node.js 20
+FROM node:20-alpine
 
-# Устанавливаем необходимые системные зависимости
-RUN apt-get update && apt-get install -y --no-cache zip python3 make g++
+# Устанавливаем системную утилиту zip для создания многотомных архивов
+RUN apk add --no-cache zip
 
+# Создаем директорию приложения
 WORKDIR /usr/src/app
 
-# Копируем package.json
+# Копируем package.json и устанавливаем зависимости
 COPY package*.json ./
-
-# Устанавливаем ВСЕ зависимости (не только production)
-# Это необходимо для компиляции нативных модулей SDK
-RUN npm install
+RUN npm install --production
 
 # Копируем исходный код
 COPY . .
 
+# Порт, который будет слушать контейнер
 EXPOSE 8080
 
+# Команда для запуска
 CMD [ "npm", "start" ]
