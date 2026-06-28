@@ -12,7 +12,8 @@ const crypto = require('crypto');
 const util = require('util');
 const { exec } = require('child_process');
 const execPromise = util.promisify(exec);
-const { GoogleGenerativeAI } = require('@google/generative-ai');
+// === AGENT ANTIGRAVITY: замена GoogleGenerativeAI на GoogleGenAI ===
+const { GoogleGenAI } = require('@google/generative-ai');
 
 const app = express();
 app.use(compression());
@@ -28,13 +29,14 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY || "";
 const SOCKS5_PROXY = process.env.SOCKS5_PROXY || "";
 
-let genAI = null;
+// === AGENT ANTIGRAVITY: инициализация нового клиента ===
+let ai = null;
 let geminiHistory = [];          // история обычного чата
 let adminMode = false;
 let adminHistory = [];           // отдельная история для режима администратора
 
 if (GEMINI_API_KEY) {
-    genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+    ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
 }
 
 // ==========================================
@@ -137,6 +139,29 @@ global.fetch = async (input, init) => {
 };
 
 // ==========================================
+// === AGENT ANTIGRAVITY: ОБРАБОТЧИК КОМАНДЫ /agent ===
+// ==========================================
+async function handleAgentTask(task, req, res) {
+    if (!ai) return res.status(500).json({ok: false, error: "GEMINI_API_KEY не настроен"});
+    try {
+        console.log(`[AGENT] Запуск агента Antigravity с задачей: "${task.substring(0, 100)}..."`);
+        const interaction = await ai.interactions.create({
+            agent: "antigravity-preview-05-2026",
+        });
+        // Логирование шагов (необязательно, но полезно для отладки)
+        interaction.on('step', (step) => {
+            console.log(`[AGENT] Step: ${step.toolName}`, step.output?.substring(0, 200));
+        });
+        const response = await interaction.sendMessage(task);
+        console.log("[AGENT] Задача выполнена.");
+        return res.json({ ok: true, text: response.text });
+    } catch (err) {
+        console.error('[AGENT ERROR]', err.message);
+        return res.status(500).json({ ok: false, error: err.message });
+    }
+}
+
+// ==========================================
 // МАРШРУТ УПРАВЛЕНИЯ И GEMINI
 // ==========================================
 app.post('/gemini', async (req, res) => {
@@ -176,6 +201,13 @@ app.post('/gemini', async (req, res) => {
 
     let userText = req.body.text ? req.body.text.trim() : "";
 
+    // === AGENT ANTIGRAVITY: перехват команды /agent ===
+    if (userText.startsWith('/agent ')) {
+        const task = userText.substring(7).trim();
+        if (!task) return res.json({ ok: true, text: "⚠️ Укажите задачу для агента." });
+        return handleAgentTask(task, req, res);
+    }
+
     if (userText === '/help') {
         const respHtml = `🤖 <b>СИСТЕМА CHATOPS:</b><br><br>
 <code>/status</code> — Состояние сервера<br>
@@ -187,7 +219,8 @@ app.post('/gemini', async (req, res) => {
 <code>/search [запрос]</code> — Поиск в сети с помощью Tavily API<br>
 <code>/search download:[url]</code> — Прямая загрузка файла<br>
 <code>/admin on</code> — Включить режим администратора (автовыполнение команд)<br>
-<code>/admin off</code> — Выключить режим администратора<br><br>
+<code>/admin off</code> — Выключить режим администратора<br>
+<code>/agent [задача]</code> — Агент Antigravity (среда выполнения)<br><br>
 💻 <b>Терминал:</b><br>
 <i>Путь контейнера: <code>/usr/src/app</code></i><br>
 <code>! [команда]</code> — Консоль Linux<br>
@@ -342,7 +375,7 @@ app.post('/gemini', async (req, res) => {
     if (!GEMINI_API_KEY) return res.status(500).json({ok: false, error: "Отсутствует GEMINI_API_KEY"});
     if (req.body.clear === 'true') {
         geminiHistory = [];
-        adminHistory = [];   // заодно чистим админский контекст
+        adminHistory = [];
         console.log("[GEMINI] Память контекста нейросети очищена.");
         if (userText === 'clear') return res.json({ok: true, text: "История очищена"});
     }
@@ -366,10 +399,11 @@ app.post('/gemini', async (req, res) => {
     console.log(`[GEMINI] Запрос к ИИ. Модель: [${modelName}]. Контекст в памяти: [${geminiHistory.length} сообщений]`);
 
     try {
+        // === AGENT ANTIGRAVITY: обновлённый вызов моделей ===
         const isGemma = modelName.toLowerCase().includes('gemma');
         const modelConfig = { model: modelName };
         if (!isGemma) modelConfig.systemInstruction = "Ты — полезный ИИ-ассистент.";
-        const model = genAI.getGenerativeModel(modelConfig);
+        const model = ai.models.getGenerativeModel(modelConfig);
         const chat = model.startChat({ history: geminiHistory });
         const result = await chat.sendMessage(msgParts);
         geminiHistory = await chat.getHistory();
@@ -394,7 +428,8 @@ async function handleAdminMessage(userText, req, res) {
         modelConfig.systemInstruction = "Ты полезный администратор сервера. Ты можешь выполнять команды терминала Linux и искать информацию в интернете. Проанализируй запрос пользователя, при необходимости используй инструменты, чтобы выполнить задачу. После каждого вызова функции дождись результата и прими решение о следующем шаге. Когда задача будет выполнена, дай окончательный текстовый ответ. В ответе обязательно перечисли выполненные тобой команды терминала и их результаты.";
     }
 
-    const model = genAI.getGenerativeModel(modelConfig);
+    // === AGENT ANTIGRAVITY: обновлённый вызов моделей ===
+    const model = ai.models.getGenerativeModel(modelConfig);
     const tools = [{
         functionDeclarations: [
             {
@@ -437,7 +472,6 @@ async function handleAdminMessage(userText, req, res) {
         ]
     }];
 
-    // Используем сохранённую историю администратора
     const chat = model.startChat({ history: adminHistory, tools: tools });
     const executedCommands = [];
 
@@ -523,7 +557,6 @@ async function handleAdminMessage(userText, req, res) {
                     break;
                 }
             } else {
-                // Финальный ответ
                 let finalText = parts.map(p => p.text).join('');
                 if (executedCommands.length > 0) {
                     finalText += "\n\n📋 <b>Выполненные команды:</b>\n";
@@ -531,7 +564,6 @@ async function handleAdminMessage(userText, req, res) {
                         finalText += `\n${index + 1}. <code>${cmd.command}</code>\n   ↳ ${cmd.result}`;
                     });
                 }
-                // Сохраняем обновлённую историю
                 adminHistory = await chat.getHistory();
                 console.log(`[ADMIN] Финальный ответ. Контекст админа теперь: ${adminHistory.length} сообщений`);
                 return res.json({ ok: true, text: finalText });
@@ -561,7 +593,6 @@ async function handleAdminMessage(userText, req, res) {
                 errorText += `\n${index + 1}. <code>${cmd.command}</code>\n   ↳ ${cmd.result}`;
             });
         }
-        // Попытаемся сохранить историю даже при ошибке
         try { adminHistory = await chat.getHistory(); } catch (e) {}
         return res.status(500).json({ ok: false, error: errorText });
     }
