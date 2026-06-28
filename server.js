@@ -12,10 +12,43 @@ const crypto = require('crypto');
 const util = require('util');
 const { exec } = require('child_process');
 const execPromise = util.promisify(exec);
+
+// === ИНИЦИАЛИЗАЦИЯ GEMINI КЛИЕНТА С АВТООПРЕДЕЛЕНИЕМ ===
 const genaiPackage = require('@google/generative-ai');
-const GoogleGenAI = genaiPackage.GoogleGenAI || genaiPackage.GoogleGenerativeAI || genaiPackage.GoogleAI;
+
+// Собираем все возможные конструкторы из пакета
+const candidateClasses = [
+    genaiPackage.GoogleAI,
+    genaiPackage.GoogleGenAI,
+    genaiPackage.GoogleGenerativeAI,
+    genaiPackage.GenerativeAI,
+    genaiPackage.Client,
+].filter(c => typeof c === 'function');
+
+let GoogleGenAI = null;
+const dummyKey = 'test-key';
+
+// Пытаемся найти конструктор, экземпляр которого имеет models и/или interactions
+for (const C of candidateClasses) {
+    try {
+        const instance = new C({ apiKey: dummyKey });
+        if (instance && (instance.models || instance.interactions)) {
+            GoogleGenAI = C;
+            console.log(`[SYSTEM] Выбран класс: ${C.name} (models: ${!!instance.models}, interactions: ${!!instance.interactions})`);
+            break;
+        }
+    } catch (e) {
+        // Пропускаем
+    }
+}
+
+// Если не нашли подходящий, берём первый попавшийся
 if (!GoogleGenAI) {
-    throw new Error("Не удалось найти GoogleGenAI в @google/generative-ai. Проверьте версию пакета.");
+    GoogleGenAI = candidateClasses[0] || null;
+    if (!GoogleGenAI) {
+        throw new Error("Не удалось найти ни одного конструктора Gemini-клиента в @google/generative-ai");
+    }
+    console.warn(`[SYSTEM] Подходящий клиент не найден, используется ${GoogleGenAI.name} (может не работать)`);
 }
 
 const app = express();
@@ -37,11 +70,19 @@ let geminiHistory = [];
 let adminMode = false;
 let adminHistory = [];
 
-if (GEMINI_API_KEY) {
-    ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
-    console.log(`[SYSTEM] Gemini клиент инициализирован (класс: ${GoogleGenAI.name})`);
-} else {
+if (GEMINI_API_KEY && GoogleGenAI) {
+    try {
+        ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+        console.log(`[SYSTEM] Gemini клиент создан (класс: ${GoogleGenAI.name})`);
+        console.log(`[SYSTEM] Наличие models: ${!!ai.models}, interactions: ${!!ai.interactions}`);
+    } catch (err) {
+        console.error("[SYSTEM] Ошибка создания Gemini клиента:", err.message);
+        ai = null;
+    }
+} else if (!GEMINI_API_KEY) {
     console.warn("[SYSTEM] GEMINI_API_KEY не задан. ИИ-функции отключены.");
+} else {
+    console.warn("[SYSTEM] Не найден подходящий конструктор Gemini, ИИ-функции отключены.");
 }
 
 // ==========================================
@@ -147,7 +188,10 @@ global.fetch = async (input, init) => {
 // АГЕНТ ANTIGRAVITY
 // ==========================================
 async function handleAgentTask(task, req, res) {
-    if (!ai) return res.status(500).json({ok: false, error: "GEMINI_API_KEY не настроен"});
+    if (!ai) return res.status(500).json({ok: false, error: "GEMINI_API_KEY не настроен или клиент не создан"});
+    if (!ai.interactions) {
+        return res.status(500).json({ok: false, error: "Клиент Gemini не поддерживает agents (interactions). Требуется версия 0.22+ с GoogleGenAI."});
+    }
     try {
         console.log(`[AGENT] Запуск агента Antigravity с задачей: "${task.substring(0, 100)}..."`);
         const interaction = await ai.interactions.create({
@@ -398,6 +442,10 @@ app.post('/gemini', async (req, res) => {
 
     console.log(`[GEMINI] Запрос к ИИ. Модель: [${modelName}]. Контекст в памяти: [${geminiHistory.length} сообщений]`);
 
+    if (!ai || !ai.models) {
+        return res.status(500).json({ok: false, error: "Клиент Gemini не поддерживает обычные модели (ai.models отсутствует)."});
+    }
+
     try {
         const isGemma = modelName.toLowerCase().includes('gemma');
         const modelConfig = { model: modelName };
@@ -418,6 +466,9 @@ app.post('/gemini', async (req, res) => {
 // ==========================================
 async function handleAdminMessage(userText, req, res) {
     if (!GEMINI_API_KEY) return res.status(500).json({ok: false, error: "Отсутствует GEMINI_API_KEY"});
+    if (!ai || !ai.models) {
+        return res.status(500).json({ok: false, error: "Клиент Gemini не поддерживает модели (ai.models отсутствует)."});
+    }
 
     const preferredModel = req.body.model || "gemini-2.5-flash";
     const isGemma = preferredModel.toLowerCase().includes('gemma');
