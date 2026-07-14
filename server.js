@@ -38,7 +38,6 @@ if (GEMINI_API_KEY) {
     genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 }
 
-
 async function getCronPattern(humanText) {
     const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
     const result = await model.generateContent("Переведи фразу на cron-pattern (5 звезд) и верни только строку, например '* * * * *'. Фраза: " + humanText);
@@ -374,15 +373,34 @@ app.post('/gemini', async (req, res) => {
     let userText = req.body.text ? req.body.text.trim() : "";
 
     if (userText.startsWith('/task ')) {
-        const parts = userText.substring(10).trim().split(' ');
-        if (parts.length < 6) {
-            return res.json({ ok: true, text: "❌ Некорректный синтаксис. Шаблон: <code>/task * * * * * Текст задачи для ИИ</code>" });
+        // Отрезаем ровно 6 символов ("/task ")
+        const payload = userText.substring(6).trim();
+        if (!payload) {
+            return res.json({ ok: true, text: "❌ Некорректный синтаксис. Шаблон: <code>/task * * * * * Текст задачи</code> или <code>/task каждые 5 минут проверяй...</code>" });
         }
-        const pattern = parts.slice(0, 5).join(' ');
-        const taskText = parts.slice(5).join(' ').trim();
-        
+
+        const parts = payload.split(' ');
+        let pattern = "";
+        let taskText = "";
+
+        // Проверяем, передал ли пользователь классический cron-pattern (5 элементов)
+        const potentialCron = parts.slice(0, 5).join(' ');
+        if (parts.length >= 6 && cron.validate(potentialCron)) {
+            pattern = potentialCron;
+            taskText = parts.slice(5).join(' ').trim();
+        } else {
+            // Если классического cron нет, просим Gemini вытащить расписание из текста
+            try {
+                pattern = await getCronPattern(payload);
+                // Отдаем весь текст задачи ИИ, он сам поймет, что нужно делать
+                taskText = payload; 
+            } catch (err) {
+                return res.json({ ok: true, text: "❌ Ошибка генерации cron-паттерна: " + err.message });
+            }
+        }
+
         if (!cron.validate(pattern)) {
-            return res.json({ ok: true, text: "❌ Невалидный cron-pattern: <code>" + pattern + "</code>" });
+            return res.json({ ok: true, text: `❌ Не удалось определить валидный cron-pattern для: <code>${payload}</code>` });
         }
         
         const jobId = 'job_' + Date.now();
@@ -401,7 +419,8 @@ app.post('/gemini', async (req, res) => {
         return res.json({ ok: true, text: `✅ <b>Задача планировщика создана!</b><br>ID: <code>${jobId}</code><br>Расписание: <code>${pattern}</code><br>Задача: <i>${taskText}</i><br><br>ИИ выполнит её в фоновом режиме и сохранит результат во входящие.` });
     }
 
-    if (userText === '/jobs') {
+    // Изменено с /jobs на /tasks
+    if (userText === '/tasks') {
         if (scheduledJobs.length === 0) {
             return res.json({ ok: true, text: "📝 Активных фоновых задач планировщика нет." });
         }
@@ -412,7 +431,8 @@ app.post('/gemini', async (req, res) => {
         return res.json({ ok: true, text: jobsListHtml });
     }
 
-    if (userText === '/clear_jobs') {
+    // Изменено с /clear_jobs на /deltask
+    if (userText === '/deltask') {
         scheduledJobs.forEach(j => {
             if (activeCronTasks[j.id]) {
                 activeCronTasks[j.id].stop();
@@ -426,9 +446,11 @@ app.post('/gemini', async (req, res) => {
 
     if (userText === '/help') {
         const respHtml = `🤖 <b>СИСТЕМА CHATOPS (с поддержкой фонового планировщика):</b><br><br>
-<code>/task [cron-pattern] [текст запроса]</code> — Запланировать автономную задачу для ИИ (пример: <code>/task */5 * * * * Какая цена BTC сейчас?</code>)<br>
-<code>/jobs</code> — Список активных задач планировщика<br>
-<code>/clear_jobs</code> — Удалить все активные фоновые задачи<br><br>
+<code>/task [cron-pattern или текст] [запрос]</code> — Запланировать автономную задачу для ИИ<br>
+<i>Пример 1: <code>/task */5 * * * * Какая цена BTC сейчас?</code></i><br>
+<i>Пример 2: <code>/task каждые 3 минуты проверяй курс eth на bybit</code></i><br>
+<code>/tasks</code> — Список активных задач планировщика<br>
+<code>/deltask</code> — Удалить все активные фоновые задачи<br><br>
 <code>/status</code> — Состояние сервера<br>
 <code>/limit</code> — Состояние моделей<br>
 <code>/logs</code> — Логи Northflank<br>
