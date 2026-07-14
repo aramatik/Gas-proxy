@@ -40,7 +40,7 @@ if (GEMINI_API_KEY) {
 
 async function getCronPattern(humanText) {
     const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
-    const result = await model.generateContent("Переведи фразу на cron-pattern (5 звезд) и верни только строку, например '* * * * *'. Фраза: " + humanText);
+    const result = await model.generateContent("Переведи фразу строго в стандартный cron-pattern из 5 параметров (минуты, часы, день, месяц, день недели). Верни ТОЛЬКО строку, например '*/2 * * * *'. Никаких других символов. Фраза: " + humanText);
     let pattern = result.response.text().trim();
     if (!cron.validate(pattern)) return "* * * * *"; // fallback
     return pattern;
@@ -100,7 +100,8 @@ function startCronTask(job) {
             }
             const modelName = job.model || "gemini-2.5-flash";
             const modelConfig = { model: modelName };
-            modelConfig.systemInstruction = "Ты полезный администратор сервера. Ты можешь выполнять команды терминала Linux и искать информацию в интернете. Проанализируй запрос пользователя, при необходимости используй инструменты, чтобы выполнить задачу. После каждого вызова функции дождись результата и прими решение о следующем шаге. Когда задача будет выполнена, дай окончательный текстовый ответ. В ответе обязательно перечисли выполненные тобой команды терминала и их результаты.";
+            // Обновленная инструкция: запрещаем циклы и sleep
+            modelConfig.systemInstruction = "Ты — автономный агент, выполняющий задачу по расписанию (cron). Твоя цель — выполнить запрошенное действие ЕДИНОРАЗОВО прямо сейчас и вернуть результат. КАТЕГОРИЧЕСКИ ЗАПРЕЩАЕТСЯ создавать bash-скрипты с бесконечными циклами (while true, sleep) или свои планировщики. Просто выполни разовую проверку (например, вызови curl или python-скрипт), проанализируй ответ и заверши работу. В ответе обязательно перечисли выполненные команды.";
             
             const model = genAI.getGenerativeModel(modelConfig);
             // Создаем отдельный независимый чат для этой задачи с инструментами терминала и поиска
@@ -373,7 +374,6 @@ app.post('/gemini', async (req, res) => {
     let userText = req.body.text ? req.body.text.trim() : "";
 
     if (userText.startsWith('/task ')) {
-        // Отрезаем ровно 6 символов ("/task ")
         const payload = userText.substring(6).trim();
         if (!payload) {
             return res.json({ ok: true, text: "❌ Некорректный синтаксис. Шаблон: <code>/task * * * * * Текст задачи</code> или <code>/task каждые 5 минут проверяй...</code>" });
@@ -383,16 +383,13 @@ app.post('/gemini', async (req, res) => {
         let pattern = "";
         let taskText = "";
 
-        // Проверяем, передал ли пользователь классический cron-pattern (5 элементов)
         const potentialCron = parts.slice(0, 5).join(' ');
         if (parts.length >= 6 && cron.validate(potentialCron)) {
             pattern = potentialCron;
             taskText = parts.slice(5).join(' ').trim();
         } else {
-            // Если классического cron нет, просим Gemini вытащить расписание из текста
             try {
                 pattern = await getCronPattern(payload);
-                // Отдаем весь текст задачи ИИ, он сам поймет, что нужно делать
                 taskText = payload; 
             } catch (err) {
                 return res.json({ ok: true, text: "❌ Ошибка генерации cron-паттерна: " + err.message });
@@ -419,7 +416,6 @@ app.post('/gemini', async (req, res) => {
         return res.json({ ok: true, text: `✅ <b>Задача планировщика создана!</b><br>ID: <code>${jobId}</code><br>Расписание: <code>${pattern}</code><br>Задача: <i>${taskText}</i><br><br>ИИ выполнит её в фоновом режиме и сохранит результат во входящие.` });
     }
 
-    // Изменено с /jobs на /tasks
     if (userText === '/tasks') {
         if (scheduledJobs.length === 0) {
             return res.json({ ok: true, text: "📝 Активных фоновых задач планировщика нет." });
@@ -431,7 +427,6 @@ app.post('/gemini', async (req, res) => {
         return res.json({ ok: true, text: jobsListHtml });
     }
 
-    // Изменено с /clear_jobs на /deltask
     if (userText === '/deltask') {
         scheduledJobs.forEach(j => {
             if (activeCronTasks[j.id]) {
@@ -620,10 +615,9 @@ app.post('/gemini', async (req, res) => {
         if (userText === 'clear') return res.json({ok: true, text: "История очищена"});
     }
 
-    // Если включён режим администратора и сообщение не начинается со служебного символа,
-    // передаём управление автономному агенту
+    // Передаем cronNotificationsHtml в функцию администратора
     if (adminMode && userText && !userText.startsWith('/') && !userText.startsWith('!')) {
-        return handleAdminMessage(userText, req, res);
+        return handleAdminMessage(userText, req, res, cronNotificationsHtml);
     }
 
     const modelName = req.body.model || "gemini-2.5-flash";
@@ -657,7 +651,8 @@ app.post('/gemini', async (req, res) => {
 // ==========================================
 // АВТОНОМНЫЙ АДМИНИСТРАТОР С ИНСТРУМЕНТАМИ
 // ==========================================
-async function handleAdminMessage(userText, req, res) {
+// Добавлен аргумент cronNotificationsHtml
+async function handleAdminMessage(userText, req, res, cronNotificationsHtml = "") {
     if (!GEMINI_API_KEY) return res.status(500).json({ok: false, error: "Отсутствует GEMINI_API_KEY"});
 
     const preferredModel = req.body.model || "gemini-2.5-flash";
