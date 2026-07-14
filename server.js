@@ -526,7 +526,7 @@ async function handleAdminMessage(userText, req, res) {
                 // Финальный ответ
                 let finalText = parts.map(p => p.text).join('');
                 if (executedCommands.length > 0) {
-                    finalText += `\n\n<details><summary>📋 <b>Выполненные команды</b> (нажмите, чтобы развернуть)</summary>\n`;
+                    finalText += `\n\n<details><summary>📋 <b>Терминал</b> (нажмите, чтобы развернуть)</summary>\n`;
                     executedCommands.forEach((cmd, index) => {
                         finalText += `\n${index + 1}. <code>${cmd.command}</code>\n   ↳ ${cmd.result}`;
                     });
@@ -542,7 +542,7 @@ async function handleAdminMessage(userText, req, res) {
                 console.log("[ADMIN] Достигнут лимит итераций.");
                 let limitText = "⚠️ Достигнут лимит операций. Завершаю работу.";
                 if (executedCommands.length > 0) {
-                    limitText += `\n\n<details><summary>📋 <b>Выполненные команды</b> (нажмите, чтобы развернуть)</summary>\n`;
+                    limitText += `\n\n<details><summary>📋 <b>Терминал</b> (нажмите, чтобы развернуть)</summary>\n`;
                     executedCommands.forEach((cmd, index) => {
                         limitText += `\n${index + 1}. <code>${cmd.command}</code>\n   ↳ ${cmd.result}`;
                     });
