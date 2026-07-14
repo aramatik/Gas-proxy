@@ -526,10 +526,11 @@ async function handleAdminMessage(userText, req, res) {
                 // Финальный ответ
                 let finalText = parts.map(p => p.text).join('');
                 if (executedCommands.length > 0) {
-                    finalText += "\n\n📋 <b>Выполненные команды:</b>\n";
+                    finalText += `\n\n<details><summary>📋 <b>Выполненные команды</b> (нажмите, чтобы развернуть)</summary>\n`;
                     executedCommands.forEach((cmd, index) => {
                         finalText += `\n${index + 1}. <code>${cmd.command}</code>\n   ↳ ${cmd.result}`;
                     });
+                    finalText += `\n</details>`;
                 }
                 // Сохраняем обновлённую историю
                 adminHistory = await chat.getHistory();
@@ -541,10 +542,11 @@ async function handleAdminMessage(userText, req, res) {
                 console.log("[ADMIN] Достигнут лимит итераций.");
                 let limitText = "⚠️ Достигнут лимит операций. Завершаю работу.";
                 if (executedCommands.length > 0) {
-                    limitText += "\n\n📋 <b>Выполненные команды:</b>\n";
+                    limitText += `\n\n<details><summary>📋 <b>Выполненные команды</b> (нажмите, чтобы развернуть)</summary>\n`;
                     executedCommands.forEach((cmd, index) => {
                         limitText += `\n${index + 1}. <code>${cmd.command}</code>\n   ↳ ${cmd.result}`;
                     });
+                    limitText += `\n</details>`;
                 }
                 adminHistory = await chat.getHistory();
                 return res.json({ ok: true, text: limitText });
@@ -556,10 +558,11 @@ async function handleAdminMessage(userText, req, res) {
         console.error("[ADMIN ERROR]", err.message);
         let errorText = `Ошибка: ${err.message}`;
         if (executedCommands.length > 0) {
-            errorText += "\n\n📋 <b>Выполненные команды до ошибки:</b>\n";
+            errorText += `\n\n<details><summary>📋 <b>Выполненные команды до ошибки</b> (нажмите, чтобы развернуть)</summary>\n`;
             executedCommands.forEach((cmd, index) => {
                 errorText += `\n${index + 1}. <code>${cmd.command}</code>\n   ↳ ${cmd.result}`;
             });
+            errorText += `\n</details>`;
         }
         // Попытаемся сохранить историю даже при ошибке
         try { adminHistory = await chat.getHistory(); } catch (e) {}
