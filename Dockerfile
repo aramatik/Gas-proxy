@@ -2,7 +2,7 @@
 FROM node:20-alpine
 
 # Устанавливаем системную утилиту zip, python3 и pip
-RUN apk add --no-cache zip node-cron python3 py3-pip
+RUN apk add --no-cache zip python3 py3-pip
 
 # Устанавливаем временные инструменты сборки, необходимые для компиляции крипто-библиотек Python
 RUN apk add --no-cache --virtual .build-deps gcc musl-dev libffi-dev python3-dev
