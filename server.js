@@ -100,8 +100,8 @@ function startCronTask(job) {
             }
             const modelName = job.model || "gemini-2.5-flash";
             const modelConfig = { model: modelName };
-            // Обновленная инструкция: запрещаем циклы и sleep
-            modelConfig.systemInstruction = "Ты — автономный агент, выполняющий задачу по расписанию (cron). Твоя цель — выполнить запрошенное действие ЕДИНОРАЗОВО прямо сейчас и вернуть результат. КАТЕГОРИЧЕСКИ ЗАПРЕЩАЕТСЯ создавать bash-скрипты с бесконечными циклами (while true, sleep) или свои планировщики. Просто выполни разовую проверку (например, вызови curl или python-скрипт), проанализируй ответ и заверши работу. В ответе обязательно перечисли выполненные команды.";
+            // Инструкция обновлена: просим молчать о деталях выполнения команд
+            modelConfig.systemInstruction = "Ты — автономный агент, выполняющий задачу по расписанию (cron). Твоя цель — выполнить запрошенное действие ЕДИНОРАЗОВО прямо сейчас и вернуть ТОЛЬКО краткий конечный результат. КАТЕГОРИЧЕСКИ ЗАПРЕЩАЕТСЯ создавать bash-скрипты с бесконечными циклами (while true, sleep) или свои планировщики. НЕ ОПИСЫВАЙ шаги, которые ты делал, и не перечисляй выполненные команды — система сама добавит их в лог для пользователя. Дай только ответ на суть задачи (например, только текущий курс или статус).";
             
             const model = genAI.getGenerativeModel(modelConfig);
             // Создаем отдельный независимый чат для этой задачи с инструментами терминала и поиска
@@ -427,16 +427,35 @@ app.post('/gemini', async (req, res) => {
         return res.json({ ok: true, text: jobsListHtml });
     }
 
-    if (userText === '/deltask') {
-        scheduledJobs.forEach(j => {
-            if (activeCronTasks[j.id]) {
-                activeCronTasks[j.id].stop();
-                delete activeCronTasks[j.id];
+    // Обработка /deltask с поддержкой конкретных ID
+    if (userText.startsWith('/deltask')) {
+        const parts = userText.split(' ');
+        if (parts.length > 1) {
+            const jobId = parts[1].trim();
+            const jobIndex = scheduledJobs.findIndex(j => j.id === jobId);
+            
+            if (jobIndex !== -1) {
+                if (activeCronTasks[jobId]) {
+                    activeCronTasks[jobId].stop();
+                    delete activeCronTasks[jobId];
+                }
+                scheduledJobs.splice(jobIndex, 1);
+                saveJobs();
+                return res.json({ ok: true, text: `🗑️ <b>Задача <code>${jobId}</code> успешно удалена!</b>` });
+            } else {
+                return res.json({ ok: true, text: `❌ Задача с ID <code>${jobId}</code> не найдена.` });
             }
-        });
-        scheduledJobs = [];
-        saveJobs();
-        return res.json({ ok: true, text: "🧹 <b>Все фоновые cron-задачи удалены!</b>" });
+        } else {
+            scheduledJobs.forEach(j => {
+                if (activeCronTasks[j.id]) {
+                    activeCronTasks[j.id].stop();
+                    delete activeCronTasks[j.id];
+                }
+            });
+            scheduledJobs = [];
+            saveJobs();
+            return res.json({ ok: true, text: "🧹 <b>Все фоновые cron-задачи удалены!</b>" });
+        }
     }
 
     if (userText === '/help') {
@@ -445,7 +464,8 @@ app.post('/gemini', async (req, res) => {
 <i>Пример 1: <code>/task */5 * * * * Какая цена BTC сейчас?</code></i><br>
 <i>Пример 2: <code>/task каждые 3 минуты проверяй курс eth на bybit</code></i><br>
 <code>/tasks</code> — Список активных задач планировщика<br>
-<code>/deltask</code> — Удалить все активные фоновые задачи<br><br>
+<code>/deltask</code> — Удалить все активные фоновые задачи<br>
+<code>/deltask [ID]</code> — Удалить конкретную задачу по ID<br><br>
 <code>/status</code> — Состояние сервера<br>
 <code>/limit</code> — Состояние моделей<br>
 <code>/logs</code> — Логи Northflank<br>
@@ -528,7 +548,7 @@ app.post('/gemini', async (req, res) => {
         return res.json({ ok: true, text: `🖥 <b>Логи Northflank:</b><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#e0e0e0; color:#333; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${logsHtml}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#999; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
     }
 
-    // ---------- ОБНОВЛЁННЫЙ /status ----------
+    // Обновленный /status с уведомлениями и количеством задач
     if (userText === '/status') {
         const mem = process.memoryUsage();
         const uptime = Math.floor(process.uptime());
@@ -536,7 +556,15 @@ app.post('/gemini', async (req, res) => {
             ? '<span style="color:green; font-weight:bold;">✅ ВКЛЮЧЕН</span>'
             : '<span style="color:red;">❌ ВЫКЛЮЧЕН</span>';
         const adminCtx = adminMode ? `<br>🧠 Контекст админа: <b>${adminHistory.length} сообщений</b>` : '';
-        return res.json({ ok: true, text: `🖥 <b>Статус:</b><br>⏱ Uptime: <b>${Math.floor(uptime/3600)}ч ${Math.floor((uptime%3600)/60)}м</b><br>💾 Память: <b>${(mem.rss / 1024 / 1024).toFixed(1)} MB</b><br>🔒 Ghost Proxy: <b>${useProxy ? '<span style="color:green">ВКЛЮЧЕН</span>' : '<span style="color:red">ВЫКЛЮЧЕН</span>'}</b><br>🔧 Режим администратора: ${adminStatus}${adminCtx}<br>🧠 Контекст обычного чата: <b>${geminiHistory.length} сообщений</b>` });
+        const tasksCount = scheduledJobs.length;
+
+        let statusText = `🖥 <b>Статус:</b><br>⏱ Uptime: <b>${Math.floor(uptime/3600)}ч ${Math.floor((uptime%3600)/60)}м</b><br>💾 Память: <b>${(mem.rss / 1024 / 1024).toFixed(1)} MB</b><br>🔒 Ghost Proxy: <b>${useProxy ? '<span style="color:green">ВКЛЮЧЕН</span>' : '<span style="color:red">ВЫКЛЮЧЕН</span>'}</b><br>🔧 Режим администратора: ${adminStatus}${adminCtx}<br>🧠 Контекст обычного чата: <b>${geminiHistory.length} сообщений</b><br>⚙️ Фоновых задач: <b>${tasksCount}</b>`;
+
+        if (cronNotificationsHtml) {
+            statusText = cronNotificationsHtml + '<br>' + statusText;
+        }
+
+        return res.json({ ok: true, text: statusText });
     }
 
     if (userText.startsWith('!')) {
