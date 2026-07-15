@@ -14,6 +14,7 @@ const { exec } = require('child_process');
 const execPromise = util.promisify(exec);
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const cron = require('node-cron');
+const FormData = require('form-data');
 
 const app = express();
 app.use(compression());
@@ -28,6 +29,8 @@ const PROXY_SECRET = process.env.PROXY_SECRET || "MySuperSecretPassword2026";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY || "";
 const SOCKS5_PROXY = process.env.SOCKS5_PROXY || "";
+const TG_TOKEN = process.env.TG_TOKEN || "";
+const TG_CHAT_ID = process.env.TG_CHAT_ID || "";
 
 let genAI = null;
 let geminiHistory = [];          // история обычного чата
@@ -92,10 +95,9 @@ function addMessageToInbox(msgText) {
     saveInbox();
 }
 
-// Карта для хранения активных объектов cron-задач (чтобы иметь возможность их останавливать)
+// Карта для хранения активных объектов cron-задач
 const activeCronTasks = {};
 
-// Функция для инициализации/запуска cron-задачи в памяти
 function startCronTask(job) {
     if (activeCronTasks[job.id]) {
         activeCronTasks[job.id].stop();
@@ -225,7 +227,6 @@ function startCronTask(job) {
     activeCronTasks[job.id] = task;
 }
 
-// Функция для инициализации всех сохраненных задач при старте сервера
 function initAllCronJobs() {
     console.log(`[CRON] Инициализация сохраненных задач: ${scheduledJobs.length}`);
     scheduledJobs.forEach(job => {
@@ -338,7 +339,7 @@ global.fetch = async (input, init) => {
 app.post('/gemini', async (req, res) => {
     if (req.query.token !== PROXY_SECRET) return res.status(403).json({ok: false, error: "Auth failed"});
 
-    // *** ОБРАБОТЧИК ОПРОСА УВЕДОМЛЕНИЙ ПЛАНИРОВЩИКА ***
+    // Обработчик опроса уведомлений планировщика
     if (req.body.action === 'poll_inbox') {
         const notifications = messageInbox.map(msg => ({
             time: msg.time,
@@ -507,7 +508,6 @@ app.post('/gemini', async (req, res) => {
     // Режим администратора
     if (userText === '/admin on') {
         adminMode = true;
-        // Инициализация истории администратора системным промптом
         adminHistory = [
             { role: "user", parts: [{ text: "Инструкции администратора" }] },
             { role: "model", parts: [{ text: adminSystemPrompt || "Инструкции не загружены." }] }
@@ -663,7 +663,6 @@ app.post('/gemini', async (req, res) => {
     if (req.body.clear === 'true') {
         geminiHistory = [];
         if (adminMode) {
-            // Сброс истории администратора к системному промпту
             adminHistory = [
                 { role: "user", parts: [{ text: "Инструкции администратора" }] },
                 { role: "model", parts: [{ text: adminSystemPrompt || "Инструкции не загружены." }] }
@@ -761,11 +760,46 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                     },
                     required: ["action"]
                 }
+            },
+            {
+                name: "send_message_to_telegram",
+                description: "Send a text message to a specific Telegram chat. If chat_id is not provided, the default TG_CHAT_ID from environment will be used.",
+                parameters: {
+                    type: "OBJECT",
+                    properties: {
+                        chat_id: {
+                            type: "STRING",
+                            description: "Target chat ID (optional, defaults to TG_CHAT_ID)"
+                        },
+                        text: {
+                            type: "STRING",
+                            description: "Message text (HTML allowed)"
+                        }
+                    },
+                    required: ["text"]
+                }
+            },
+            {
+                name: "send_file_to_telegram",
+                description: "Send a file from the server to a specific Telegram chat. Provide the full path to the file on the server. If chat_id is not provided, the default TG_CHAT_ID will be used.",
+                parameters: {
+                    type: "OBJECT",
+                    properties: {
+                        chat_id: {
+                            type: "STRING",
+                            description: "Target chat ID (optional, defaults to TG_CHAT_ID)"
+                        },
+                        file_path: {
+                            type: "STRING",
+                            description: "Absolute path to the file on the server (e.g., '/tmp/report.pdf')"
+                        }
+                    },
+                    required: ["file_path"]
+                }
             }
         ]
     }];
 
-    // Используем сохранённую историю администратора
     const chat = model.startChat({ history: adminHistory, tools: tools });
     const executedCommands = [];
 
@@ -846,6 +880,63 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                         response: { result: searchResult }
                     };
                     result = await chat.sendMessage([{ functionResponse: funcResponse }]);
+                } else if (call.name === "send_message_to_telegram") {
+                    let execResult;
+                    if (!TG_TOKEN) {
+                        execResult = "Ошибка: TG_TOKEN не настроен";
+                    } else {
+                        const chatId = call.args.chat_id || TG_CHAT_ID;
+                        if (!chatId) {
+                            execResult = "Ошибка: не указан chat_id и не задан TG_CHAT_ID";
+                        } else {
+                            const msgText = call.args.text;
+                            try {
+                                await axios.post(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+                                    chat_id: chatId,
+                                    text: msgText,
+                                    parse_mode: 'HTML'
+                                });
+                                execResult = `Сообщение успешно отправлено в чат ${chatId}`;
+                            } catch (err) {
+                                execResult = `Ошибка отправки сообщения: ${err.message}`;
+                            }
+                        }
+                    }
+                    console.log(`[ADMIN] send_message_to_telegram: ${execResult}`);
+                    const funcResponse = { name: call.name, response: { result: execResult } };
+                    result = await chat.sendMessage([{ functionResponse: funcResponse }]);
+                } else if (call.name === "send_file_to_telegram") {
+                    let execResult;
+                    if (!TG_TOKEN) {
+                        execResult = "Ошибка: TG_TOKEN не настроен";
+                    } else {
+                        const chatId = call.args.chat_id || TG_CHAT_ID;
+                        if (!chatId) {
+                            execResult = "Ошибка: не указан chat_id и не задан TG_CHAT_ID";
+                        } else {
+                            const filePath = call.args.file_path;
+                            if (!fs.existsSync(filePath)) {
+                                execResult = `Файл не найден: ${filePath}`;
+                            } else {
+                                try {
+                                    const fileName = path.basename(filePath);
+                                    const fileStream = fs.createReadStream(filePath);
+                                    const form = new FormData();
+                                    form.append('chat_id', chatId);
+                                    form.append('document', fileStream, fileName);
+                                    await axios.post(`https://api.telegram.org/bot${TG_TOKEN}/sendDocument`, form, {
+                                        headers: form.getHeaders()
+                                    });
+                                    execResult = `Файл ${fileName} успешно отправлен в чат ${chatId}`;
+                                } catch (err) {
+                                    execResult = `Ошибка отправки файла: ${err.message}`;
+                                }
+                            }
+                        }
+                    }
+                    console.log(`[ADMIN] send_file_to_telegram: ${execResult}`);
+                    const funcResponse = { name: call.name, response: { result: execResult } };
+                    result = await chat.sendMessage([{ functionResponse: funcResponse }]);
                 } else {
                     console.log("[ADMIN] Неизвестная функция:", call.name);
                     break;
@@ -903,7 +994,7 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
 }
 
 // ==========================================
-// ОСНОВНОЙ ПРОКСИ
+// ОСНОВНОЙ ПРОКСИ (без изменений)
 // ==========================================
 app.get('/', async (req, res) => {
     const reqToken = req.query.token;
@@ -1173,7 +1264,6 @@ async function startServer() {
     const PORT = process.env.PORT || 8080;
     app.listen(PORT, () => {
         console.log(`[SYSTEM] Сервер успешно запущен на порту ${PORT}`);
-        // Запускаем сохраненные cron-задачи
         initAllCronJobs();
     });
 }
