@@ -331,6 +331,21 @@ global.fetch = async (input, init) => {
 app.post('/gemini', async (req, res) => {
     if (req.query.token !== PROXY_SECRET) return res.status(403).json({ok: false, error: "Auth failed"});
 
+    // *** НОВЫЙ ОБРАБОТЧИК: ОПРОС УВЕДОМЛЕНИЙ ПЛАНИРОВЩИКА ***
+    if (req.body.action === 'poll_inbox') {
+        const notifications = messageInbox.map(msg => ({
+            time: msg.time,   // уже содержит Kyiv time
+            text: msg.text
+        }));
+        messageInbox = [];          // очищаем после отправки
+        saveInbox();
+        return res.json({
+            ok: true,
+            inbox: notifications,
+            admin_mode: adminMode
+        });
+    }
+
     // Проверяем входящие накопленные ответы от отработавших cron-задач
     let cronNotificationsHtml = "";
     if (messageInbox.length > 0) {
