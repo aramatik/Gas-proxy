@@ -34,6 +34,15 @@ let geminiHistory = [];          // история обычного чата
 let adminMode = false;
 let adminHistory = [];           // отдельная история для режима администратора
 
+// Системный промпт администратора из файла
+let adminSystemPrompt = "";
+try {
+    adminSystemPrompt = fs.readFileSync(path.join(__dirname, 'admin.md'), 'utf8').trim();
+    console.log("[SYSTEM] Системный промпт администратора загружен из admin.md");
+} catch (e) {
+    console.warn("[SYSTEM] admin.md не найден, используется пустой промпт");
+}
+
 if (GEMINI_API_KEY) {
     genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 }
@@ -100,11 +109,9 @@ function startCronTask(job) {
             }
             const modelName = job.model || "gemini-2.5-flash";
             const modelConfig = { model: modelName };
-            // Инструкция обновлена: просим молчать о деталях выполнения команд
             modelConfig.systemInstruction = "Ты — автономный агент, выполняющий задачу по расписанию (cron). Твоя цель — выполнить запрошенное действие ЕДИНОРАЗОВО прямо сейчас и вернуть ТОЛЬКО краткий конечный результат. КАТЕГОРИЧЕСКИ ЗАПРЕЩАЕТСЯ создавать bash-скрипты с бесконечными циклами (while true, sleep) или свои планировщики. НЕ ОПИСЫВАЙ шаги, которые ты делал, и не перечисляй выполненные команды — система сама добавит их в лог для пользователя. Дай только ответ на суть задачи (например, только текущий курс или статус).";
             
             const model = genAI.getGenerativeModel(modelConfig);
-            // Создаем отдельный независимый чат для этой задачи с инструментами терминала и поиска
             const tools = [{
                 functionDeclarations: [
                     {
@@ -331,13 +338,13 @@ global.fetch = async (input, init) => {
 app.post('/gemini', async (req, res) => {
     if (req.query.token !== PROXY_SECRET) return res.status(403).json({ok: false, error: "Auth failed"});
 
-    // *** НОВЫЙ ОБРАБОТЧИК: ОПРОС УВЕДОМЛЕНИЙ ПЛАНИРОВЩИКА ***
+    // *** ОБРАБОТЧИК ОПРОСА УВЕДОМЛЕНИЙ ПЛАНИРОВЩИКА ***
     if (req.body.action === 'poll_inbox') {
         const notifications = messageInbox.map(msg => ({
-            time: msg.time,   // уже содержит Kyiv time
+            time: msg.time,
             text: msg.text
         }));
-        messageInbox = [];          // очищаем после отправки
+        messageInbox = [];
         saveInbox();
         return res.json({
             ok: true,
@@ -442,7 +449,6 @@ app.post('/gemini', async (req, res) => {
         return res.json({ ok: true, text: jobsListHtml });
     }
 
-    // Обработка /deltask с поддержкой конкретных ID
     if (userText.startsWith('/deltask')) {
         const parts = userText.split(' ');
         if (parts.length > 1) {
@@ -501,13 +507,17 @@ app.post('/gemini', async (req, res) => {
     // Режим администратора
     if (userText === '/admin on') {
         adminMode = true;
-        adminHistory = [];   // сбрасываем историю при включении
-        console.log("[ADMIN] Режим администратора ВКЛЮЧЕН.");
+        // Инициализация истории администратора системным промптом
+        adminHistory = [
+            { role: "user", parts: [{ text: "Инструкции администратора" }] },
+            { role: "model", parts: [{ text: adminSystemPrompt || "Инструкции не загружены." }] }
+        ];
+        console.log("[ADMIN] Режим администратора ВКЛЮЧЕН. История инициализирована системным промптом.");
         return res.json({ ok: true, text: "🔧 <b>Режим администратора активирован.</b> Все последующие сообщения будут выполняться как автономные задачи с доступом к терминалу и поиску в интернете." });
     }
     if (userText === '/admin off') {
         adminMode = false;
-        adminHistory = [];   // очищаем контекст
+        adminHistory = [];
         console.log("[ADMIN] Режим администратора ОТКЛЮЧЕН.");
         return res.json({ ok: true, text: "🛑 <b>Режим администратора отключен.</b>" });
     }
@@ -563,7 +573,6 @@ app.post('/gemini', async (req, res) => {
         return res.json({ ok: true, text: `🖥 <b>Логи Northflank:</b><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#e0e0e0; color:#333; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${logsHtml}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#999; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
     }
 
-    // Обновленный /status с уведомлениями и количеством задач
     if (userText === '/status') {
         const mem = process.memoryUsage();
         const uptime = Math.floor(process.uptime());
@@ -653,7 +662,15 @@ app.post('/gemini', async (req, res) => {
     if (!GEMINI_API_KEY) return res.status(500).json({ok: false, error: "Отсутствует GEMINI_API_KEY"});
     if (req.body.clear === 'true') {
         geminiHistory = [];
-        adminHistory = [];   // заодно чистим админский контекст
+        if (adminMode) {
+            // Сброс истории администратора к системному промпту
+            adminHistory = [
+                { role: "user", parts: [{ text: "Инструкции администратора" }] },
+                { role: "model", parts: [{ text: adminSystemPrompt || "Инструкции не загружены." }] }
+            ];
+        } else {
+            adminHistory = [];
+        }
         console.log("[GEMINI] Память контекста нейросети очищена.");
         if (userText === 'clear') return res.json({ok: true, text: "История очищена"});
     }
@@ -694,7 +711,6 @@ app.post('/gemini', async (req, res) => {
 // ==========================================
 // АВТОНОМНЫЙ АДМИНИСТРАТОР С ИНСТРУМЕНТАМИ
 // ==========================================
-// Добавлен аргумент cronNotificationsHtml
 async function handleAdminMessage(userText, req, res, cronNotificationsHtml = "") {
     if (!GEMINI_API_KEY) return res.status(500).json({ok: false, error: "Отсутствует GEMINI_API_KEY"});
 
@@ -703,7 +719,7 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
 
     const modelConfig = { model: preferredModel };
     if (!isGemma) {
-        modelConfig.systemInstruction = "Ты полезный администратор сервера. Ты можешь выполнять команды терминала Linux и искать информацию в интернете. Проанализируй запрос пользователя, при необходимости используй инструменты, чтобы выполнить задачу. После каждого вызова функции дождись результата и прими решение о следующем шаге. Когда задача будет выполнена, дай окончательный текстовый ответ. В ответе обязательно перечисли выполненные тобой команды терминала и их результаты.";
+        modelConfig.systemInstruction = adminSystemPrompt || "Ты полезный администратор сервера...";
     }
 
     const model = genAI.getGenerativeModel(modelConfig);
@@ -881,14 +897,13 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
             });
             errorText += `\n</details>`;
         }
-        // Попытаемся сохранить историю даже при ошибке
         try { adminHistory = await chat.getHistory(); } catch (e) {}
         return res.status(500).json({ ok: false, error: errorText });
     }
 }
 
 // ==========================================
-// ОСНОВНОЙ ПРОКСИ (без изменений)
+// ОСНОВНОЙ ПРОКСИ
 // ==========================================
 app.get('/', async (req, res) => {
     const reqToken = req.query.token;
