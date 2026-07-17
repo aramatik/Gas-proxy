@@ -189,7 +189,7 @@ function startCronTask(job) {
                         result = await chat.sendMessage([{ functionResponse: funcResponse }]);
                     } else if (call.name === "search_web" && action === "download") {
                         const url = call.args.url;
-                        const filename = (path.basename(url) || `dl_${Date.now()}`).replace(/[^a-zA-Z0-9.-_]/g, '_');
+                        const filename = (path.basename(url) || `dl_${Date.now()}`).replace(/[^a-zA-Z0-9.\-_]/g, '_');
                         const savePath = path.join(TMP_DIR, filename);
                         try {
                             const response = await axios.get(url, { responseType: 'stream', timeout: 30000 });
@@ -525,15 +525,12 @@ app.post('/gemini', async (req, res) => {
     if (userText === '/proxy on') {
         if (!SOCKS5_PROXY) return res.json({ok: true, text: "❌ Переменная SOCKS5_PROXY не настроена."});
         useProxy = true;
-        
         const curlDir = path.join(__dirname, 'curl-impersonate');
         const curlBin = path.join(curlDir, 'curl_chrome116');
-        
         if (!fs.existsSync(curlBin)) {
             console.error("[PROXY ERROR] Папка curl-impersonate не найдена!");
             return res.json({ok: true, text: `❌ Ошибка: Не найдена локальная папка curl-impersonate.`});
         }
-
         console.log("[PROXY] Ghost Proxy успешно активирован (Локальная версия).");
         return res.json({ok: true, text: "🚀 <b>Ghost Proxy включен!</b><br>Трафик идет через SOCKS5 с локальным curl-impersonate."});
     }
@@ -730,71 +727,71 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                 parameters: {
                     type: "OBJECT",
                     properties: {
-                        command: {
-                            type: "STRING",
-                            description: "The shell command to execute."
-                        }
+                        command: { type: "STRING", description: "The shell command to execute." }
                     },
                     required: ["command"]
                 }
             },
             {
                 name: "search_web",
-                description: "Search the web using Tavily API or download a file directly. Use 'query' for search, or 'download' with a URL to download a file.",
+                description: "Search the web using Tavily API or download a file directly.",
                 parameters: {
                     type: "OBJECT",
                     properties: {
-                        action: {
-                            type: "STRING",
-                            enum: ["search", "download"],
-                            description: "Search the web for information or download a file from URL."
-                        },
-                        query: {
-                            type: "STRING",
-                            description: "Search query (required for action=search)"
-                        },
-                        url: {
-                            type: "STRING",
-                            description: "URL to download (required for action=download)"
-                        }
+                        action: { type: "STRING", enum: ["search", "download"] },
+                        query: { type: "STRING", description: "Search query" },
+                        url: { type: "STRING", description: "URL to download" }
                     },
                     required: ["action"]
                 }
             },
             {
                 name: "send_message_to_telegram",
-                description: "Send a text message to a specific Telegram chat. If chat_id is not provided, the default TG_CHAT_ID from environment will be used.",
+                description: "Send a text message to a Telegram chat. chat_id is optional; defaults to TG_CHAT_ID.",
                 parameters: {
                     type: "OBJECT",
                     properties: {
-                        chat_id: {
-                            type: "STRING",
-                            description: "Target chat ID (optional, defaults to TG_CHAT_ID)"
-                        },
-                        text: {
-                            type: "STRING",
-                            description: "Message text (HTML allowed)"
-                        }
+                        chat_id: { type: "STRING", description: "Target chat ID (optional)" },
+                        text: { type: "STRING", description: "Message text (HTML allowed)" }
                     },
                     required: ["text"]
                 }
             },
             {
                 name: "send_file_to_telegram",
-                description: "Send a file from the server to a specific Telegram chat. Provide the full path to the file on the server. If chat_id is not provided, the default TG_CHAT_ID will be used.",
+                description: "Send a file from server to a Telegram chat. chat_id is optional; defaults to TG_CHAT_ID.",
                 parameters: {
                     type: "OBJECT",
                     properties: {
-                        chat_id: {
-                            type: "STRING",
-                            description: "Target chat ID (optional, defaults to TG_CHAT_ID)"
-                        },
-                        file_path: {
-                            type: "STRING",
-                            description: "Absolute path to the file on the server (e.g., '/tmp/report.pdf')"
-                        }
+                        chat_id: { type: "STRING", description: "Target chat ID (optional)" },
+                        file_path: { type: "STRING", description: "Absolute path to the file" }
                     },
                     required: ["file_path"]
+                }
+            },
+            {
+                name: "toggle_proxy",
+                description: "Enable or disable the Ghost Proxy (SOCKS5) for web scraping.",
+                parameters: {
+                    type: "OBJECT",
+                    properties: {
+                        state: { type: "STRING", enum: ["on", "off"], description: "Desired proxy state" }
+                    },
+                    required: ["state"]
+                }
+            },
+            {
+                name: "manage_cron_tasks",
+                description: "Manage background cron tasks. Use 'create' to add a task, 'list' to view all, 'delete' to remove a task by job_id.",
+                parameters: {
+                    type: "OBJECT",
+                    properties: {
+                        action: { type: "STRING", enum: ["create", "list", "delete"], description: "Action to perform" },
+                        pattern: { type: "STRING", description: "Cron pattern (for create)" },
+                        task_text: { type: "STRING", description: "Task description for the AI (for create)" },
+                        job_id: { type: "STRING", description: "Job ID to delete (for delete)" }
+                    },
+                    required: ["action"]
                 }
             }
         ]
@@ -829,10 +826,7 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                     }
                     executedCommands.push({ command: cmd, result: execResult });
                     console.log(`[ADMIN] Результат: ${execResult.substring(0, 200)}`);
-                    const funcResponse = {
-                        name: call.name,
-                        response: { result: execResult }
-                    };
+                    const funcResponse = { name: call.name, response: { result: execResult } };
                     result = await chat.sendMessage([{ functionResponse: funcResponse }]);
                 } else if (call.name === "search_web") {
                     const action = call.args.action;
@@ -875,10 +869,7 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                         searchResult = `Ошибка поиска/загрузки: ${err.message}`;
                     }
                     console.log(`[ADMIN] Результат операции: ${searchResult.substring(0, 200)}`);
-                    const funcResponse = {
-                        name: call.name,
-                        response: { result: searchResult }
-                    };
+                    const funcResponse = { name: call.name, response: { result: searchResult } };
                     result = await chat.sendMessage([{ functionResponse: funcResponse }]);
                 } else if (call.name === "send_message_to_telegram") {
                     let execResult;
@@ -937,12 +928,79 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                     console.log(`[ADMIN] send_file_to_telegram: ${execResult}`);
                     const funcResponse = { name: call.name, response: { result: execResult } };
                     result = await chat.sendMessage([{ functionResponse: funcResponse }]);
+                } else if (call.name === "toggle_proxy") {
+                    const state = call.args.state;
+                    if (state === "on") {
+                        if (!SOCKS5_PROXY) {
+                            execResult = "Ошибка: SOCKS5_PROXY не настроен";
+                        } else {
+                            useProxy = true;
+                            execResult = "Прокси включён";
+                        }
+                    } else {
+                        useProxy = false;
+                        execResult = "Прокси выключен";
+                    }
+                    console.log(`[ADMIN] toggle_proxy: ${execResult}`);
+                    const funcResponse = { name: call.name, response: { result: execResult } };
+                    result = await chat.sendMessage([{ functionResponse: funcResponse }]);
+                } else if (call.name === "manage_cron_tasks") {
+                    let execResult;
+                    const action = call.args.action;
+                    try {
+                        if (action === "create") {
+                            const pattern = call.args.pattern;
+                            const taskText = call.args.task_text;
+                            if (!pattern || !taskText) throw new Error("pattern and task_text are required");
+                            if (!cron.validate(pattern)) throw new Error("Invalid cron pattern");
+                            
+                            const jobId = 'job_' + Date.now();
+                            const newJob = {
+                                id: jobId,
+                                pattern: pattern,
+                                taskText: taskText,
+                                model: preferredModel,
+                                createdAt: getKyivTime()
+                            };
+                            scheduledJobs.push(newJob);
+                            saveJobs();
+                            startCronTask(newJob);
+                            execResult = `Задача создана с ID: ${jobId}`;
+                        } else if (action === "list") {
+                            if (scheduledJobs.length === 0) {
+                                execResult = "Нет активных задач.";
+                            } else {
+                                execResult = scheduledJobs.map(j => `ID: ${j.id} | ${j.pattern} | ${j.taskText}`).join('\n');
+                            }
+                        } else if (action === "delete") {
+                            const jobId = call.args.job_id;
+                            if (!jobId) throw new Error("job_id is required for delete");
+                            const idx = scheduledJobs.findIndex(j => j.id === jobId);
+                            if (idx === -1) {
+                                execResult = `Задача с ID ${jobId} не найдена`;
+                            } else {
+                                if (activeCronTasks[jobId]) {
+                                    activeCronTasks[jobId].stop();
+                                    delete activeCronTasks[jobId];
+                                }
+                                scheduledJobs.splice(idx, 1);
+                                saveJobs();
+                                execResult = `Задача ${jobId} удалена`;
+                            }
+                        } else {
+                            execResult = "Неизвестное действие";
+                        }
+                    } catch (err) {
+                        execResult = `Ошибка: ${err.message}`;
+                    }
+                    console.log(`[ADMIN] manage_cron_tasks: ${execResult}`);
+                    const funcResponse = { name: call.name, response: { result: execResult } };
+                    result = await chat.sendMessage([{ functionResponse: funcResponse }]);
                 } else {
                     console.log("[ADMIN] Неизвестная функция:", call.name);
                     break;
                 }
             } else {
-                // Финальный ответ
                 let finalText = parts.map(p => p.text).join('');
                 if (executedCommands.length > 0) {
                     finalText += `\n\n<details><summary>📋 <b>Терминал</b> (нажмите, чтобы развернуть)</summary>\n`;
@@ -951,10 +1009,7 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                     });
                     finalText += `\n</details>`;
                 }
-                // Сохраняем обновлённую историю
                 adminHistory = await chat.getHistory();
-                console.log(`[ADMIN] Финальный ответ. Контекст админа теперь: ${adminHistory.length} сообщений`);
-                // Подмешиваем уведомления в режиме админа
                 let finalResponseText = finalText;
                 if (cronNotificationsHtml) {
                     finalResponseText = cronNotificationsHtml + '<br>' + finalResponseText;
@@ -963,7 +1018,6 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
             }
             iterations++;
             if (iterations >= maxIterations) {
-                console.log("[ADMIN] Достигнут лимит итераций.");
                 let limitText = "⚠️ Достигнут лимит операций. Завершаю работу.";
                 if (executedCommands.length > 0) {
                     limitText += `\n\n<details><summary>📋 <b>Терминал</b> (нажмите, чтобы развернуть)</summary>\n`;
@@ -1095,7 +1149,6 @@ app.get('/', async (req, res) => {
             }
         }
 
-        // --- УМНАЯ ЗАГЛУШКА АНТИ-БОТОВ ---
         if ([401, 403, 406, 429, 503].includes(responseStatus)) {
             console.warn(`[PROXY WARNING] Сайт заблокировал запрос. HTTP Код: ${responseStatus}`);
             return res.status(200).send(`<!DOCTYPE html><html><body style="font-family:sans-serif; text-align:center; padding:40px; background:#f8d7da; color:#721c24; border-radius:10px; margin:20px;"><h2 style="margin-top:0;">🚫 Доступ заблокирован (${responseStatus})</h2><p>Целевой сервер отклонил запрос. Попробуйте использовать команду <b>/proxy on</b> в чате.</p></body></html>`);
@@ -1106,7 +1159,6 @@ app.get('/', async (req, res) => {
              return res.status(200).send(`<!DOCTYPE html><html><body style="font-family:sans-serif; text-align:center; padding:40px; background:#fff3cd; color:#856404; border-radius:10px; margin:20px;"><h2 style="margin-top:0;">🤖 JS-Капча (Cloudflare)</h2><p>Сайт требует вычисления сложной JavaScript-капчи, которую невозможно выполнить через серверный прокси. Откройте эту ссылку в обычном браузере.</p></body></html>`);
         }
 
-        // --- Обработка HTML ---
         if (isHtml) {
             console.log(`[PROXY] HTML загружен успешно. Парсинг ресурсов...`);
             const $ = cheerio.load(htmlContent);
@@ -1154,7 +1206,6 @@ app.get('/', async (req, res) => {
             return res.send($.html());
         }
         
-        // --- Обработка Загрузки файлов ---
         else {
             console.log(`[PROXY] Обнаружен файл (${contentType}). Подготовка к загрузке...`);
             const fileId = crypto.randomUUID();
