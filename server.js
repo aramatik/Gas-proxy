@@ -111,7 +111,8 @@ function startCronTask(job) {
             }
             const modelName = job.model || "gemini-2.5-flash";
             const modelConfig = { model: modelName };
-            modelConfig.systemInstruction = "Ты — автономный агент, выполняющий задачу по расписанию (cron). Твоя цель — выполнить запрошенное действие ЕДИНОРАЗОВО прямо сейчас и вернуть ТОЛЬКО краткий конечный результат. КАТЕГОРИЧЕСКИ ЗАПРЕЩАЕТСЯ создавать bash-скрипты с бесконечными циклами (while true, sleep) или свои планировщики. НЕ ОПИСЫВАЙ шаги, которые ты делал, и не перечисляй выполненные команды — система сама добавит их в лог для пользователя. Дай только ответ на суть задачи (например, только текущий курс или статус).";
+            // *** ИЗМЕНЕНИЕ: требование проверки даты перед поиском ***
+            modelConfig.systemInstruction = "Ты — автономный агент, выполняющий задачу по расписанию (cron). Твоя цель — выполнить запрошенное действие ЕДИНОРАЗОВО прямо сейчас и вернуть ТОЛЬКО краткий конечный результат. КАТЕГОРИЧЕСКИ ЗАПРЕЩАЕТСЯ создавать bash-скрипты с бесконечными циклами (while true, sleep) или свои планировщики. НЕ ОПИСЫВАЙ шаги, которые ты делал, и не перечисляй выполненные команды — система сама добавит их в лог для пользователя. Дай только ответ на суть задачи (например, только текущий курс или статус). Перед любым поиском или анализом ОБЯЗАТЕЛЬНО выполни команду date, чтобы знать актуальную дату и не использовать устаревшие данные из памяти.";
             
             const model = genAI.getGenerativeModel(modelConfig);
             const tools = [{
@@ -930,6 +931,7 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                     result = await chat.sendMessage([{ functionResponse: funcResponse }]);
                 } else if (call.name === "toggle_proxy") {
                     const state = call.args.state;
+                    let execResult;
                     if (state === "on") {
                         if (!SOCKS5_PROXY) {
                             execResult = "Ошибка: SOCKS5_PROXY не настроен";
@@ -1048,7 +1050,7 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
 }
 
 // ==========================================
-// ОСНОВНОЙ ПРОКСИ (без изменений)
+// ОСНОВНОЙ ПРОКСИ
 // ==========================================
 app.get('/', async (req, res) => {
     const reqToken = req.query.token;
