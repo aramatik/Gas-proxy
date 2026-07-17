@@ -1,8 +1,8 @@
 # Используем легковесный образ Node.js 20
 FROM node:20-alpine
 
-# Устанавливаем системную утилиту zip, python3 pip curl и bash
-RUN apk add --no-cache zip python3 py3-pip curl bash
+# Устанавливаем системную утилиту zip, python3 pip curl bash и mc
+RUN apk add --no-cache zip python3 py3-pip curl bash mc
 
 # Устанавливаем временные инструменты сборки, необходимые для компиляции крипто-библиотек Python
 RUN apk add --no-cache --virtual .build-deps gcc musl-dev libffi-dev python3-dev
