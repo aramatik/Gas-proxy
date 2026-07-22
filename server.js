@@ -32,12 +32,15 @@ let geminiHistory = [];          // история обычного чата
 let adminMode = false;
 let adminHistory = [];           // отдельная история для режима администратора
 // ==========================================
-// ANTIGRAVITY: состояние multi-turn
+// ANTIGRAVITY: состояние multi-turn + режим выполнения
 // ==========================================
 let geminiAntigravityPrevId = null;
 let geminiAntigravityEnvId = null;
 let adminAntigravityPrevId = null;
 let adminAntigravityEnvId = null;
+// true  = неблокирующий (async): задача уходит в фон, GAS не висит, результат во входящие
+// false = блокирующий (sync): сервер ждёт завершения и возвращает ответ в пузыре
+let antigravityNonBlocking = true;
 // Системный промпт администратора из файла
 let adminSystemPrompt = "";
 try {
@@ -75,10 +78,51 @@ function extractAntigravityText(interaction) {
     }
     return parts.join('\n') || '[Antigravity не вернул текстового ответа]';
 }
+// --- Хелперы прогресса Antigravity ---
+function escHtmlAg(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+// Устойчивый парсер шагов: схема может отличаться, пробуем несколько вариантов, никогда не падаем.
+function describeAntigravityStep(step, idx) {
+    if (!step || typeof step !== 'object') return `⚙️ Шаг ${idx + 1}`;
+    const type = String(step.type || step.role || '').toLowerCase();
+    const toolName =
+        (step.tool_call && step.tool_call.name) ||
+        (step.tool_use && step.tool_use.name) ||
+        (step.function_call && step.function_call.name) ||
+        step.name || null;
+    if (type === 'tool_call' || type === 'tool_use' || type === 'function_call' || toolName) {
+        return `🔧 <b>Antigravity → инструмент:</b> <code>${escHtmlAg(toolName || 'tool')}</code>`;
+    }
+    if (type === 'tool_result' || type === 'tool_output' || type === 'function_response') {
+        return `📥 <b>Antigravity:</b> получен результат инструмента`;
+    }
+    let preview = '';
+    if (Array.isArray(step.content)) {
+        for (const c of step.content) {
+            if (c && typeof c.text === 'string') { preview = c.text; break; }
+        }
+    } else if (typeof step.text === 'string') preview = step.text;
+    else if (typeof step.content === 'string') preview = step.content;
+    if (preview) {
+        preview = preview.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+        if (preview.length > 160) preview = preview.slice(0, 160) + '…';
+        const tag = (type === 'thought' || type === 'reasoning') ? '💭' : '💬';
+        return `${tag} <b>Antigravity:</b> ${escHtmlAg(preview)}`;
+    }
+    return `⚙️ <b>Antigravity:</b> шаг ${idx + 1}${type ? ' (' + escHtmlAg(type) + ')' : ''}`;
+}
+// Лёгкий push прогресса в inbox БЕЗ записи на диск (прогресс эфемерен,
+// фронт заберёт его через poll_inbox прямо из памяти).
+function pushProgressToInbox(html) {
+    messageInbox.push({ time: getKyivTime(), text: html });
+}
+// --- Вызов агента: устойчивые таймауты + прогресс ---
 async function callAntigravityAgent(opts) {
     const url = 'https://generativelanguage.googleapis.com/v1beta/interactions';
     const headers = { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY };
     const background = opts.background !== false;
+    const onProgress = typeof opts.onProgress === 'function' ? opts.onProgress : null;
     const body = {
         agent: 'antigravity-preview-05-2026',
         input: opts.input,
@@ -87,31 +131,113 @@ async function callAntigravityAgent(opts) {
     if (opts.previousInteractionId) body.previous_interaction_id = opts.previousInteractionId;
     if (opts.systemInstruction) body.system_instruction = opts.systemInstruction;
     if (background) body.background = true;
+
     console.log(`[ANTIGRAVITY] Отправка задачи агенту (background=${background})...`);
-    let resp = await axios.post(url, body, { headers, timeout: 90000 });
+    let resp = await axios.post(url, body, { headers, timeout: 120000 });
     let interaction = resp.data;
-    // Долгие агентные задачи выполняются асинхронно — опрашиваем статус
+
+    if (onProgress) {
+        try { onProgress('🚀 <b>Antigravity:</b> задача принята, агент запущен…'); } catch (_) {}
+    }
+
     if (background) {
-        const maxWaitMs = 5 * 60 * 1000;
+        const maxWaitMs = 10 * 60 * 1000;   // ждём до 10 минут (компиляция .bin может быть долгой)
         const intervalMs = 3000;
         const start = Date.now();
+        let consecutiveErrors = 0;
+        const maxConsecutiveErrors = 5;     // сдаёмся только после 5 ошибок подряд
+        let processedSteps = 0;             // сколько шагов уже отдали в прогресс
         while (interaction && (interaction.status === 'in_progress' || interaction.status === 'queued')) {
-            if (Date.now() - start > maxWaitMs) throw new Error('Antigravity: превышено время ожидания (5 минут)');
+            if (Date.now() - start > maxWaitMs) throw new Error('Antigravity: превышено время ожидания (10 минут)');
             await new Promise(r => setTimeout(r, intervalMs));
-            const poll = await axios.get(`${url}/${interaction.id}`, { headers, timeout: 30000 });
-            interaction = poll.data;
+            try {
+                const poll = await axios.get(`${url}/${interaction.id}`, { headers, timeout: 60000 });
+                interaction = poll.data;
+                consecutiveErrors = 0;
+                // --- ПРОГРЕСС: отдаём все новые шаги агента ---
+                const steps = Array.isArray(interaction.steps) ? interaction.steps : [];
+                if (steps.length > processedSteps) {
+                    for (let i = processedSteps; i < steps.length; i++) {
+                        let desc;
+                        try { desc = describeAntigravityStep(steps[i], i); } catch (_) { desc = `⚙️ Шаг ${i + 1}`; }
+                        console.log(`[ANTIGRAVITY PROGRESS] ${desc.replace(/<[^>]*>/g, '')}`);
+                        if (onProgress) { try { onProgress(desc); } catch (_) {} }
+                    }
+                    processedSteps = steps.length;
+                }
+            } catch (pollErr) {
+                consecutiveErrors++;
+                console.warn(`[ANTIGRAVITY] Polling ошибка (${consecutiveErrors}/${maxConsecutiveErrors}): ${pollErr.message}`);
+                if (consecutiveErrors >= maxConsecutiveErrors) {
+                    throw new Error(`Antigravity: polling не удался ${maxConsecutiveErrors} раз подряд: ${pollErr.message}`);
+                }
+                // иначе просто продолжаем ждать — задача на стороне Google жива
+            }
+        }
+        // добиваем шаги, если финальный interaction принёс новые
+        if (interaction) {
+            const steps = Array.isArray(interaction.steps) ? interaction.steps : [];
+            if (steps.length > processedSteps) {
+                for (let i = processedSteps; i < steps.length; i++) {
+                    let desc;
+                    try { desc = describeAntigravityStep(steps[i], i); } catch (_) { desc = `⚙️ Шаг ${i + 1}`; }
+                    console.log(`[ANTIGRAVITY PROGRESS] ${desc.replace(/<[^>]*>/g, '')}`);
+                    if (onProgress) { try { onProgress(desc); } catch (_) {} }
+                }
+                processedSteps = steps.length;
+            }
         }
     }
+
     if (interaction && interaction.status === 'failed') {
         const msg = (interaction.error && interaction.error.message) || 'Antigravity: задача завершилась с ошибкой';
         throw new Error(msg);
     }
+
     return {
         id: interaction ? interaction.id : null,
         environmentId: (interaction && (interaction.environment_id || (interaction.environment && interaction.environment.id))) || opts.environmentId || null,
         status: interaction ? interaction.status : 'unknown',
         text: extractAntigravityText(interaction)
     };
+}
+// ==========================================
+// ANTIGRAVITY: НЕБЛОКИРУЮЩИЙ ФОНОВЫЙ ЗАПУСК
+// Сервер не ждёт завершения — GAS не висит. Прогресс и финал идут во входящие.
+// ==========================================
+function runAntigravityInBackground(opts) {
+    // opts: { mode: 'admin' | 'chat', input, systemInstruction }
+    const mode = opts.mode;
+    (async () => {
+        try {
+            const prevId = (mode === 'admin') ? adminAntigravityPrevId : geminiAntigravityPrevId;
+            const envId  = (mode === 'admin') ? adminAntigravityEnvId  : geminiAntigravityEnvId;
+            const ag = await callAntigravityAgent({
+                input: opts.input,
+                previousInteractionId: prevId,
+                environmentId: envId,
+                systemInstruction: opts.systemInstruction,
+                background: true,
+                onProgress: (h) => pushProgressToInbox(h)
+            });
+            // обновляем multi-turn состояние для следующего запроса
+            if (mode === 'admin') { adminAntigravityPrevId = ag.id; adminAntigravityEnvId = ag.environmentId; }
+            else { geminiAntigravityPrevId = ag.id; geminiAntigravityEnvId = ag.environmentId; }
+
+            let finalText = ag.text;
+            if (mode === 'admin') {
+                finalText += `\n\n<i>ℹ️ Antigravity выполняет код и поиск в собственном защищённом sandbox Google (не на этом сервере). Серверные команды <code>!</code> здесь не используются.</i>`;
+            }
+            const head = (mode === 'admin')
+                ? '🛰 <b>Antigravity (admin) — готово:</b><br>'
+                : '🛰 <b>Antigravity — готово:</b><br>';
+            addMessageToInbox(head + finalText);
+            console.log(`[ANTIGRAVITY BG] Задача завершена (mode=${mode}).`);
+        } catch (err) {
+            console.error("[ANTIGRAVITY BG ERROR]", err.message);
+            addMessageToInbox(`❌ <b>Ошибка Antigravity:</b> ${escHtmlAg(err.message)}`);
+        }
+    })().catch(e => console.error("[ANTIGRAVITY BG UNHANDLED]", e && e.message));
 }
 async function getCronPattern(humanText) {
     const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
@@ -580,6 +706,7 @@ app.post('/gemini', async (req, res) => {
 <code>/limit</code> — Состояние моделей<br>
 <code>/logs</code> — Логи Northflank<br>
 <code>/proxy on</code> | <code>/proxy off</code> — Ghost Proxy (curl-impersonate локальный)<br>
+<code>/ag_async on</code> | <code>/ag_async off</code> — Antigravity: фон (async) / ожидание (sync)<br>
 <code>/download [путь]</code> — Скачать файл (до 15 МБ)<br>
 <code>/upload</code> — Загрузить файл на сервер<br>
 <code>/search [запрос]</code> — Поиск в сети с помощью Tavily API<br>
@@ -609,6 +736,17 @@ app.post('/gemini', async (req, res) => {
         adminAntigravityPrevId = null; adminAntigravityEnvId = null;
         console.log("[ADMIN] Режим администратора ОТКЛЮЧЕН.");
         return res.json({ ok: true, text: "🛑 <b>Режим администратора отключен.</b>" });
+    }
+    // Режим выполнения Antigravity: async (фон) / sync (ожидание)
+    if (userText === '/ag_async on' || userText === '/ag_async off') {
+        antigravityNonBlocking = (userText === '/ag_async on');
+        console.log("[ANTIGRAVITY] Неблокирующий режим: " + (antigravityNonBlocking ? "ON" : "OFF"));
+        return res.json({ ok: true, text: antigravityNonBlocking
+            ? "⚡ <b>Antigravity: неблокирующий режим ВКЛ (async).</b><br>Задачи уходят в фон мгновенно — GAS не висит и не упрётся в лимит 6 минут. Прогресс и итоговый результат придут во входящие (📬 Планировщик)."
+            : "🔒 <b>Antigravity: блокирующий режим ВКЛ (sync).</b><br>Сервер ждёт завершения задачи и возвращает ответ прямо в пузыре. <b>Внимание:</b> на задачах дольше ~6 минут GAS‑прослойка может оборвать соединение — для долгих задач (компиляция, исследования) используйте <code>/ag_async on</code>." });
+    }
+    if (userText === '/ag_async') {
+        return res.json({ ok: true, text: `⚡ Режим Antigravity сейчас: <b>${antigravityNonBlocking ? 'НЕБЛОКИРУЮЩИЙ (async, фон)' : 'БЛОКИРУЮЩИЙ (sync, ожидание)'}</b><br>Переключение: <code>/ag_async on</code> | <code>/ag_async off</code>` });
     }
     if (userText === '/proxy on') {
         if (!SOCKS5_PROXY) return res.json({ok: true, text: "❌ Переменная SOCKS5_PROXY не настроена."});
@@ -659,8 +797,11 @@ app.post('/gemini', async (req, res) => {
             ? '<span style="color:green; font-weight:bold;">✅ ВКЛЮЧЕН</span>'
             : '<span style="color:red;">❌ ВЫКЛЮЧЕН</span>';
         const adminCtx = adminMode ? `<br>🧠 Контекст админа: <b>${adminHistory.length} сообщений</b>` : '';
+        const agMode = antigravityNonBlocking
+            ? '<span style="color:#1a73e8; font-weight:bold;">async (фон)</span>'
+            : '<span style="color:#6f42c1; font-weight:bold;">sync (ожидание)</span>';
         const tasksCount = scheduledJobs.length;
-        let statusText = `🖥 <b>Статус:</b><br>⏱ Uptime: <b>${Math.floor(uptime/3600)}ч ${Math.floor((uptime%3600)/60)}м</b><br>💾 Память: <b>${(mem.rss / 1024 / 1024).toFixed(1)} MB</b><br>🔒 Ghost Proxy: <b>${useProxy ? '<span style="color:green">ВКЛЮЧЕН</span>' : '<span style="color:red">ВЫКЛЮЧЕН</span>'}</b><br>🔧 Режим администратора: ${adminStatus}${adminCtx}<br>🧠 Контекст обычного чата: <b>${geminiHistory.length} сообщений</b><br>⚙️ Фоновых задач: <b>${tasksCount}</b>`;
+        let statusText = `🖥 <b>Статус:</b><br>⏱ Uptime: <b>${Math.floor(uptime/3600)}ч ${Math.floor((uptime%3600)/60)}м</b><br>💾 Память: <b>${(mem.rss / 1024 / 1024).toFixed(1)} MB</b><br>🔒 Ghost Proxy: <b>${useProxy ? '<span style="color:green">ВКЛЮЧЕН</span>' : '<span style="color:red">ВЫКЛЮЧЕН</span>'}</b><br>🔧 Режим администратора: ${adminStatus}${adminCtx}<br>⚡ Antigravity: <b>${agMode}</b><br>🧠 Контекст обычного чата: <b>${geminiHistory.length} сообщений</b><br>⚙️ Фоновых задач: <b>${tasksCount}</b>`;
         if (cronNotificationsHtml) {
             statusText = cronNotificationsHtml + '<br>' + statusText;
         }
@@ -754,20 +895,29 @@ app.post('/gemini', async (req, res) => {
         if (req.body.b64 && req.body.mimeType && !String(req.body.mimeType).startsWith('image/')) {
             return res.json({ ok: true, text: "⚠️ Antigravity через этот интерфейс поддерживает только текст и изображения — файл не прикреплён." });
         }
+        let agInput = userText || " ";
+        if (req.body.b64 && req.body.mimeType && String(req.body.mimeType).startsWith('image/')) {
+            agInput = [
+                { type: "text", text: userText || "Проанализируй это изображение" },
+                { type: "image", data: req.body.b64, mime_type: req.body.mimeType }
+            ];
+        }
+        // НЕБЛОКИРУЮЩИЙ режим: мгновенная заглушка, задача в фоне
+        if (antigravityNonBlocking) {
+            runAntigravityInBackground({ mode: 'chat', input: agInput, systemInstruction: "Ты — полезный ИИ-ассистент." });
+            let stub = "✅ <b>Задача Antigravity принята в фоновый режим.</b><br>Прогресс и ответ появятся во входящих (📬 Планировщик). Следите за блоками прогресса — они приходят каждые ~10 секунд.";
+            if (cronNotificationsHtml) stub = cronNotificationsHtml + '<br>' + stub;
+            return res.json({ ok: true, text: stub });
+        }
+        // БЛОКИРУЮЩИЙ режим: ждём завершения и возвращаем в пузыре
         try {
-            let agInput = userText || " ";
-            if (req.body.b64 && req.body.mimeType && String(req.body.mimeType).startsWith('image/')) {
-                agInput = [
-                    { type: "text", text: userText || "Проанализируй это изображение" },
-                    { type: "image", data: req.body.b64, mime_type: req.body.mimeType }
-                ];
-            }
             const ag = await callAntigravityAgent({
                 input: agInput,
                 previousInteractionId: geminiAntigravityPrevId,
                 environmentId: geminiAntigravityEnvId,
                 systemInstruction: "Ты — полезный ИИ-ассистент.",
-                background: true
+                background: true,
+                onProgress: (h) => pushProgressToInbox(h)
             });
             geminiAntigravityPrevId = ag.id;
             geminiAntigravityEnvId = ag.environmentId;
@@ -805,13 +955,26 @@ app.post('/gemini', async (req, res) => {
 // ANTIGRAVITY В РЕЖИМЕ АДМИНИСТРАТОРА
 // ==========================================
 async function handleAntigravityAdmin(userText, req, res, cronNotificationsHtml = "") {
+    // НЕБЛОКИРУЮЩИЙ режим: мгновенная заглушка, задача в фоне
+    if (antigravityNonBlocking) {
+        runAntigravityInBackground({
+            mode: 'admin',
+            input: userText,
+            systemInstruction: adminSystemPrompt || "Ты — автономный агент-администратор. Выполняй задачу и возвращай краткий результат."
+        });
+        let stub = "✅ <b>Задача Antigravity принята в фоновый режим.</b><br>Прогресс и итоговый результат появятся во входящих (📬 Планировщик). Следите за блоками прогресса — они приходят каждые ~10 секунд.";
+        if (cronNotificationsHtml) stub = cronNotificationsHtml + '<br>' + stub;
+        return res.json({ ok: true, text: stub });
+    }
+    // БЛОКИРУЮЩИЙ режим: ждём завершения и возвращаем в пузыре
     try {
         const ag = await callAntigravityAgent({
             input: userText,
             previousInteractionId: adminAntigravityPrevId,
             environmentId: adminAntigravityEnvId,
             systemInstruction: adminSystemPrompt || "Ты — автономный агент-администратор. Выполняй задачу и возвращай краткий результат.",
-            background: true
+            background: true,
+            onProgress: (h) => pushProgressToInbox(h)
         });
         adminAntigravityPrevId = ag.id;
         adminAntigravityEnvId = ag.environmentId;
