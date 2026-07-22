@@ -31,6 +31,13 @@ let genAI = null;
 let geminiHistory = [];          // история обычного чата
 let adminMode = false;
 let adminHistory = [];           // отдельная история для режима администратора
+// ==========================================
+// ANTIGRAVITY: состояние multi-turn
+// ==========================================
+let geminiAntigravityPrevId = null;
+let geminiAntigravityEnvId = null;
+let adminAntigravityPrevId = null;
+let adminAntigravityEnvId = null;
 // Системный промпт администратора из файла
 let adminSystemPrompt = "";
 try {
@@ -41,6 +48,70 @@ try {
 }
 if (GEMINI_API_KEY) {
     genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+}
+// ==========================================
+// ПОДДЕРЖКА ANTIGRAVITY (Interactions API)
+// ==========================================
+function isAntigravityModel(modelName) {
+    return !!(modelName && String(modelName).toLowerCase().includes('antigravity'));
+}
+function extractAntigravityText(interaction) {
+    const parts = [];
+    if (interaction && Array.isArray(interaction.steps)) {
+        for (const step of interaction.steps) {
+            if (step && step.type === 'model_output' && Array.isArray(step.content)) {
+                for (const c of step.content) {
+                    if (c && c.type === 'text' && c.text) parts.push(c.text);
+                }
+            }
+        }
+    }
+    if (parts.length === 0 && interaction && interaction.output_text) return interaction.output_text;
+    if (parts.length === 0 && interaction && Array.isArray(interaction.outputs)) {
+        for (const o of interaction.outputs) {
+            if (o && o.text) parts.push(o.text);
+            if (o && Array.isArray(o.content)) for (const c of o.content) if (c && c.text) parts.push(c.text);
+        }
+    }
+    return parts.join('\n') || '[Antigravity не вернул текстового ответа]';
+}
+async function callAntigravityAgent(opts) {
+    const url = 'https://generativelanguage.googleapis.com/v1beta/interactions';
+    const headers = { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY };
+    const background = opts.background !== false;
+    const body = {
+        agent: 'antigravity-preview-05-2026',
+        input: opts.input,
+        environment: opts.environmentId || 'remote'
+    };
+    if (opts.previousInteractionId) body.previous_interaction_id = opts.previousInteractionId;
+    if (opts.systemInstruction) body.system_instruction = opts.systemInstruction;
+    if (background) body.background = true;
+    console.log(`[ANTIGRAVITY] Отправка задачи агенту (background=${background})...`);
+    let resp = await axios.post(url, body, { headers, timeout: 90000 });
+    let interaction = resp.data;
+    // Долгие агентные задачи выполняются асинхронно — опрашиваем статус
+    if (background) {
+        const maxWaitMs = 5 * 60 * 1000;
+        const intervalMs = 3000;
+        const start = Date.now();
+        while (interaction && (interaction.status === 'in_progress' || interaction.status === 'queued')) {
+            if (Date.now() - start > maxWaitMs) throw new Error('Antigravity: превышено время ожидания (5 минут)');
+            await new Promise(r => setTimeout(r, intervalMs));
+            const poll = await axios.get(`${url}/${interaction.id}`, { headers, timeout: 30000 });
+            interaction = poll.data;
+        }
+    }
+    if (interaction && interaction.status === 'failed') {
+        const msg = (interaction.error && interaction.error.message) || 'Antigravity: задача завершилась с ошибкой';
+        throw new Error(msg);
+    }
+    return {
+        id: interaction ? interaction.id : null,
+        environmentId: (interaction && (interaction.environment_id || (interaction.environment && interaction.environment.id))) || opts.environmentId || null,
+        status: interaction ? interaction.status : 'unknown',
+        text: extractAntigravityText(interaction)
+    };
 }
 async function getCronPattern(humanText) {
     const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
@@ -95,8 +166,21 @@ function startCronTask(job) {
                 return;
             }
             const modelName = job.model || "gemini-2.5-flash";
+            // --- Antigravity: фоновая задача через Interactions API ---
+            if (isAntigravityModel(modelName)) {
+                try {
+                    const ag = await callAntigravityAgent({
+                        input: job.taskText,
+                        systemInstruction: "Ты — автономный агент, выполняющий задачу по расписанию. Верни только краткий конечный результат.",
+                        background: true
+                    });
+                    addMessageToInbox(`<b>Задача ${job.id} выполнена (Antigravity)!</b><br>Запрос: <i>${job.taskText}</i><br><br>${ag.text}`);
+                } catch (e) {
+                    addMessageToInbox(`❌ <b>Ошибка Antigravity в задаче ${job.id}:</b> ${e.message}`);
+                }
+                return;
+            }
             const modelConfig = { model: modelName };
-            // *** ИЗМЕНЕНИЕ: требование проверки даты перед поиском ***
             modelConfig.systemInstruction = "Ты — автономный агент, выполняющий задачу по расписанию (cron). Твоя цель — выполнить запрошенное действие ЕДИНОРАЗОВО прямо сейчас и вернуть ТОЛЬКО краткий конечный результат. КАТЕГОРИЧЕСКИ ЗАПРЕЩАЕТСЯ создавать bash-скрипты с бесконечными циклами (while true, sleep) или свои планировщики. НЕ ОПИСЫВАЙ шаги, которые ты делал, и не перечисляй выполненные команды — система сама добавит их в лог для пользователя. Дай только ответ на суть задачи (например, только текущий курс или статус). Перед любым поиском или анализом ОБЯЗАТЕЛЬНО выполни команду date, чтобы знать актуальную дату и не использовать устаревшие данные из памяти.";
             const model = genAI.getGenerativeModel(modelConfig);
             const tools = [{
@@ -154,7 +238,6 @@ function startCronTask(job) {
                         result = await chat.sendMessage([{ functionResponse: funcResponse }]);
                     } else if (call.name === "search_web") {
                         // *** ИСПРАВЛЕНО: search и download объединены в одну рабочую ветку ***
-                        // (раньше download лежал в недостижимой внешней ветке и падал с ReferenceError)
                         const action = call.args.action;
                         let searchResult = "";
                         try {
@@ -516,12 +599,14 @@ app.post('/gemini', async (req, res) => {
             { role: "user", parts: [{ text: "Инструкции администратора" }] },
             { role: "model", parts: [{ text: adminSystemPrompt || "Инструкции не загружены." }] }
         ];
+        adminAntigravityPrevId = null; adminAntigravityEnvId = null;
         console.log("[ADMIN] Режим администратора ВКЛЮЧЕН. История инициализирована системным промптом.");
         return res.json({ ok: true, text: "🔧 <b>Режим администратора активирован.</b> Все последующие сообщения будут выполняться как автономные задачи с доступом к терминалу и поиску в интернете." });
     }
     if (userText === '/admin off') {
         adminMode = false;
         adminHistory = [];
+        adminAntigravityPrevId = null; adminAntigravityEnvId = null;
         console.log("[ADMIN] Режим администратора ОТКЛЮЧЕН.");
         return res.json({ ok: true, text: "🛑 <b>Режим администратора отключен.</b>" });
     }
@@ -646,6 +731,8 @@ app.post('/gemini', async (req, res) => {
     if (!GEMINI_API_KEY) return res.status(500).json({ok: false, error: "Отсутствует GEMINI_API_KEY"});
     if (req.body.clear === 'true') {
         geminiHistory = [];
+        geminiAntigravityPrevId = null; geminiAntigravityEnvId = null;
+        adminAntigravityPrevId = null; adminAntigravityEnvId = null;
         if (adminMode) {
             adminHistory = [
                 { role: "user", parts: [{ text: "Инструкции администратора" }] },
@@ -662,6 +749,35 @@ app.post('/gemini', async (req, res) => {
         return handleAdminMessage(userText, req, res, cronNotificationsHtml);
     }
     const modelName = req.body.model || "gemini-2.5-flash";
+    // --- Antigravity: отдельный путь через Interactions API ---
+    if (isAntigravityModel(modelName)) {
+        if (req.body.b64 && req.body.mimeType && !String(req.body.mimeType).startsWith('image/')) {
+            return res.json({ ok: true, text: "⚠️ Antigravity через этот интерфейс поддерживает только текст и изображения — файл не прикреплён." });
+        }
+        try {
+            let agInput = userText || " ";
+            if (req.body.b64 && req.body.mimeType && String(req.body.mimeType).startsWith('image/')) {
+                agInput = [
+                    { type: "text", text: userText || "Проанализируй это изображение" },
+                    { type: "image", data: req.body.b64, mime_type: req.body.mimeType }
+                ];
+            }
+            const ag = await callAntigravityAgent({
+                input: agInput,
+                previousInteractionId: geminiAntigravityPrevId,
+                environmentId: geminiAntigravityEnvId,
+                systemInstruction: "Ты — полезный ИИ-ассистент.",
+                background: true
+            });
+            geminiAntigravityPrevId = ag.id;
+            geminiAntigravityEnvId = ag.environmentId;
+            const aiText = ag.text;
+            return res.json({ ok: true, text: cronNotificationsHtml ? cronNotificationsHtml + '<br>' + aiText : aiText });
+        } catch (err) {
+            console.error("[ANTIGRAVITY ERROR]", err.message);
+            return res.status(500).json({ ok: false, error: err.message });
+        }
+    }
     const msgParts = [];
     if (userText) msgParts.push(userText);
     if (req.body.b64 && req.body.mimeType) {
@@ -686,11 +802,38 @@ app.post('/gemini', async (req, res) => {
     }
 });
 // ==========================================
+// ANTIGRAVITY В РЕЖИМЕ АДМИНИСТРАТОРА
+// ==========================================
+async function handleAntigravityAdmin(userText, req, res, cronNotificationsHtml = "") {
+    try {
+        const ag = await callAntigravityAgent({
+            input: userText,
+            previousInteractionId: adminAntigravityPrevId,
+            environmentId: adminAntigravityEnvId,
+            systemInstruction: adminSystemPrompt || "Ты — автономный агент-администратор. Выполняй задачу и возвращай краткий результат.",
+            background: true
+        });
+        adminAntigravityPrevId = ag.id;
+        adminAntigravityEnvId = ag.environmentId;
+        let finalText = ag.text;
+        finalText += `\n\n<i>ℹ️ Antigravity выполняет код и поиск в собственном защищённом sandbox Google (не на этом сервере). Серверные команды <code>!</code> здесь не используются.</i>`;
+        if (cronNotificationsHtml) finalText = cronNotificationsHtml + '<br>' + finalText;
+        return res.json({ ok: true, text: finalText });
+    } catch (err) {
+        console.error("[ANTIGRAVITY ADMIN ERROR]", err.message);
+        return res.status(500).json({ ok: false, error: err.message });
+    }
+}
+// ==========================================
 // АВТОНОМНЫЙ АДМИНИСТРАТОР С ИНСТРУМЕНТАМИ
 // ==========================================
 async function handleAdminMessage(userText, req, res, cronNotificationsHtml = "") {
     if (!GEMINI_API_KEY) return res.status(500).json({ok: false, error: "Отсутствует GEMINI_API_KEY"});
     const preferredModel = req.body.model || "gemini-2.5-flash";
+    // --- Antigravity: агент работает через Interactions API со своими инструментами ---
+    if (isAntigravityModel(preferredModel)) {
+        return handleAntigravityAdmin(userText, req, res, cronNotificationsHtml);
+    }
     const isGemma = preferredModel.toLowerCase().includes('gemma');
     const modelConfig = { model: preferredModel };
     if (!isGemma) {
