@@ -153,33 +153,45 @@ function startCronTask(job) {
                         const funcResponse = { name: call.name, response: { result: execResult } };
                         result = await chat.sendMessage([{ functionResponse: funcResponse }]);
                     } else if (call.name === "search_web") {
+                        // *** ИСПРАВЛЕНО: search и download объединены в одну рабочую ветку ***
+                        // (раньше download лежал в недостижимой внешней ветке и падал с ReferenceError)
                         const action = call.args.action;
                         let searchResult = "";
                         try {
                             if (action === "search") {
                                 const query = call.args.query;
+                                if (!query) throw new Error("No query provided");
+                                if (!TAVILY_API_KEY) throw new Error("TAVILY_API_KEY not set");
                                 const requestBody = { api_key: TAVILY_API_KEY, query: query, max_results: 5, search_depth: "basic" };
                                 const tavRes = await axios.post('https://api.tavily.com/search', requestBody);
                                 if (tavRes.data && tavRes.data.results) {
                                     searchResult = tavRes.data.results.map((r, i) => `[${i+1}] ${r.title}\n${r.content}\n${r.url}`).join('\n\n');
                                 } else { searchResult = "Ничего не найдено."; }
+                            } else if (action === "download") {
+                                const url = call.args.url;
+                                if (!url) throw new Error("No URL provided");
+                                const parsed = new URL.URL(url);
+                                const filename = (path.basename(parsed.pathname) || `dl_${Date.now()}`).replace(/[^a-zA-Z0-9.\-_]/g, '_');
+                                const savePath = path.join(TMP_DIR, filename);
+                                if (useProxy && SOCKS5_PROXY) {
+                                    const curlBin = path.join(__dirname, 'curl-impersonate', 'curl_chrome116');
+                                    const proxyStr = SOCKS5_PROXY.replace('socks5://', 'socks5h://');
+                                    const shell = fs.existsSync('/bin/bash') ? 'bash' : 'sh';
+                                    await execPromise(`${shell} "${curlBin}" --compressed -m 60 -s -L -x "${proxyStr}" -o "${savePath}" "${url}"`);
+                                } else {
+                                    const response = await axios.get(url, { responseType: 'stream', headers: getBrowserHeaders(false), timeout: 60000 });
+                                    const writer = fs.createWriteStream(savePath);
+                                    response.data.pipe(writer);
+                                    await new Promise((resolve, reject) => { writer.on('finish', resolve); writer.on('error', reject); });
+                                }
+                                const stat = fs.statSync(savePath);
+                                searchResult = `Файл загружен: ${savePath} (${(stat.size/1024).toFixed(1)} KB)`;
+                            } else {
+                                searchResult = `Неизвестное действие search_web: ${action}`;
                             }
                         } catch (err) {
-                            searchResult = `Ошибка поиска: ${err.message}`;
+                            searchResult = `Ошибка поиска/загрузки: ${err.message}`;
                         }
-                        const funcResponse = { name: call.name, response: { result: searchResult } };
-                        result = await chat.sendMessage([{ functionResponse: funcResponse }]);
-                    } else if (call.name === "search_web" && action === "download") {
-                        const url = call.args.url;
-                        const filename = (path.basename(url) || `dl_${Date.now()}`).replace(/[^a-zA-Z0-9.\-_]/g, '_');
-                        const savePath = path.join(TMP_DIR, filename);
-                        try {
-                            const response = await axios.get(url, { responseType: 'stream', timeout: 30000 });
-                            const writer = fs.createWriteStream(savePath);
-                            response.data.pipe(writer);
-                            await new Promise((resolve, reject) => { writer.on('finish', resolve); writer.on('error', reject); });
-                            searchResult = `Файл успешно скачан: ${savePath}`;
-                        } catch (e) { searchResult = `Ошибка скачивания: ${e.message}`; }
                         const funcResponse = { name: call.name, response: { result: searchResult } };
                         result = await chat.sendMessage([{ functionResponse: funcResponse }]);
                     } else { break; }
