@@ -28,9 +28,10 @@ const SOCKS5_PROXY = process.env.SOCKS5_PROXY || "";
 const TG_TOKEN = process.env.TG_TOKEN || "";
 const TG_CHAT_ID = process.env.TG_CHAT_ID || "";
 let genAI = null;
-let geminiHistory = [];
+let geminiHistory = [];          // история обычного чата
 let adminMode = false;
-let adminHistory = [];
+let adminHistory = [];           // отдельная история для режима администратора
+// Системный промпт администратора из файла
 let adminSystemPrompt = "";
 try {
     adminSystemPrompt = fs.readFileSync(path.join(__dirname, 'admin.md'), 'utf8').trim();
@@ -41,58 +42,11 @@ try {
 if (GEMINI_API_KEY) {
     genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 }
-
-// ==========================================
-// ПАТЧ: ФИЛЬТР ИСТОРИИ ДЛЯ НОВЫХ МОДЕЛЕЙ GEMINI
-// Удаляет записи с ролью 'function' и части functionCall/functionResponse,
-// которые не поддерживаются моделями Gemini 3.5 Flash Lite, 3.6 Flash и новее.
-// ==========================================
-function sanitizeHistoryForModel(history) {
-    if (!history || !Array.isArray(history)) return [];
-
-    // Шаг 1: удаляем записи с ролью 'function' и записи, состоящие только из function-частей
-    let cleaned = history
-        .filter(entry => {
-            if (entry.role === 'function') return false;
-            if (entry.parts && entry.parts.length > 0) {
-                const onlyFuncParts = entry.parts.every(
-                    p => p.functionCall || p.functionResponse
-                );
-                if (onlyFuncParts) return false;
-            }
-            return true;
-        })
-        .map(entry => {
-            if (entry.parts) {
-                const cleanParts = entry.parts.filter(
-                    p => !p.functionCall && !p.functionResponse
-                );
-                if (cleanParts.length === 0) return null;
-                return { ...entry, parts: cleanParts };
-            }
-            return entry;
-        })
-        .filter(Boolean);
-
-    // Шаг 2: сжимаем подряд идущие одинаковые роли (user+user → user, model+model → model)
-    const merged = [];
-    for (const entry of cleaned) {
-        const last = merged[merged.length - 1];
-        if (last && last.role === entry.role) {
-            last.parts = [...last.parts, ...entry.parts];
-        } else {
-            merged.push({ ...entry, parts: [...entry.parts] });
-        }
-    }
-
-    return merged;
-}
-
 async function getCronPattern(humanText) {
     const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
     const result = await model.generateContent("Переведи фразу строго в стандартный cron-pattern из 5 параметров (минуты, часы, день, месяц, день недели). Верни ТОЛЬКО строку, например '*/2 * * * *'. Никаких других символов. Фраза: " + humanText);
     let pattern = result.response.text().trim();
-    if (!cron.validate(pattern)) return "*/5 * * * *";
+    if (!cron.validate(pattern)) return "*/5 * * * *"; // fallback
     return pattern;
 }
 // ==========================================
@@ -101,7 +55,7 @@ async function getCronPattern(humanText) {
 const MESSAGES_FILE = path.join(TMP_DIR, 'inbox.json');
 const JOBS_FILE = path.join(TMP_DIR, 'scheduled_jobs.json');
 let messageInbox = [];
-let scheduledJobs = [];
+let scheduledJobs = []; // список активных задач { id, pattern, taskText, model }
 if (fs.existsSync(MESSAGES_FILE)) {
     try { messageInbox = JSON.parse(fs.readFileSync(MESSAGES_FILE, 'utf8')); } catch(e){}
 }
@@ -127,6 +81,7 @@ function addMessageToInbox(msgText) {
     });
     saveInbox();
 }
+// Карта для хранения активных объектов cron-задач
 const activeCronTasks = {};
 function startCronTask(job) {
     if (activeCronTasks[job.id]) {
@@ -141,6 +96,7 @@ function startCronTask(job) {
             }
             const modelName = job.model || "gemini-2.5-flash";
             const modelConfig = { model: modelName };
+            // *** ИЗМЕНЕНИЕ: требование проверки даты перед поиском ***
             modelConfig.systemInstruction = "Ты — автономный агент, выполняющий задачу по расписанию (cron). Твоя цель — выполнить запрошенное действие ЕДИНОРАЗОВО прямо сейчас и вернуть ТОЛЬКО краткий конечный результат. КАТЕГОРИЧЕСКИ ЗАПРЕЩАЕТСЯ создавать bash-скрипты с бесконечными циклами (while true, sleep) или свои планировщики. НЕ ОПИСЫВАЙ шаги, которые ты делал, и не перечисляй выполненные команды — система сама добавит их в лог для пользователя. Дай только ответ на суть задачи (например, только текущий курс или статус). Перед любым поиском или анализом ОБЯЗАТЕЛЬНО выполни команду date, чтобы знать актуальную дату и не использовать устаревшие данные из памяти.";
             const model = genAI.getGenerativeModel(modelConfig);
             const tools = [{
@@ -207,19 +163,23 @@ function startCronTask(job) {
                                 if (tavRes.data && tavRes.data.results) {
                                     searchResult = tavRes.data.results.map((r, i) => `[${i+1}] ${r.title}\n${r.content}\n${r.url}`).join('\n\n');
                                 } else { searchResult = "Ничего не найдено."; }
-                            } else if (action === "download") {
-                                const url = call.args.url;
-                                const filename = (path.basename(url) || `dl_${Date.now()}`).replace(/[^a-zA-Z0-9.\-_]/g, '_');
-                                const savePath = path.join(TMP_DIR, filename);
-                                const response = await axios.get(url, { responseType: 'stream', timeout: 30000 });
-                                const writer = fs.createWriteStream(savePath);
-                                response.data.pipe(writer);
-                                await new Promise((resolve, reject) => { writer.on('finish', resolve); writer.on('error', reject); });
-                                searchResult = `Файл успешно скачан: ${savePath}`;
                             }
                         } catch (err) {
                             searchResult = `Ошибка поиска: ${err.message}`;
                         }
+                        const funcResponse = { name: call.name, response: { result: searchResult } };
+                        result = await chat.sendMessage([{ functionResponse: funcResponse }]);
+                    } else if (call.name === "search_web" && action === "download") {
+                        const url = call.args.url;
+                        const filename = (path.basename(url) || `dl_${Date.now()}`).replace(/[^a-zA-Z0-9.\-_]/g, '_');
+                        const savePath = path.join(TMP_DIR, filename);
+                        try {
+                            const response = await axios.get(url, { responseType: 'stream', timeout: 30000 });
+                            const writer = fs.createWriteStream(savePath);
+                            response.data.pipe(writer);
+                            await new Promise((resolve, reject) => { writer.on('finish', resolve); writer.on('error', reject); });
+                            searchResult = `Файл успешно скачан: ${savePath}`;
+                        } catch (e) { searchResult = `Ошибка скачивания: ${e.message}`; }
                         const funcResponse = { name: call.name, response: { result: searchResult } };
                         result = await chat.sendMessage([{ functionResponse: funcResponse }]);
                     } else { break; }
@@ -305,7 +265,7 @@ function decodeBuffer(buffer, contentType) {
     }
 }
 // ==========================================
-// ТЕЛЕМЕТРИЯ ЛИМИТОВ
+// ТЕЛЕМЕТРИЯ ЛИМИТОВ + ПАТЧ СОВМЕСТИМОСТИ МОДЕЛЕЙ
 // ==========================================
 const LIMITS_FILE = path.join(TMP_DIR, 'gemini_limits.json');
 let geminiLimits = {};
@@ -314,7 +274,46 @@ if (fs.existsSync(LIMITS_FILE)) {
 }
 const originalFetch = global.fetch;
 global.fetch = async (input, init) => {
-    const response = await originalFetch(input, init);
+    // ============================================================
+    // ПАТЧ СОВМЕСТИМОСТИ: Gemini 3.5 Flash Lite / 3.6 Flash и новее
+    // Эти модели не принимают роль 'function'. SDK всё ещё пакует
+    // functionResponse в role:'function' — на лету переписываем в 'user'.
+    // Чинит админку, cron и обычный чат независимо от версии SDK.
+    // ============================================================
+    let patchedInit = init;
+    try {
+        const urlStr = typeof input === 'string' ? input : (input && input.url ? input.url : '');
+        if (urlStr && urlStr.includes('generativelanguage.googleapis.com') &&
+            init && init.body && typeof init.body === 'string') {
+            const parsed = JSON.parse(init.body);
+            let changed = false;
+            if (Array.isArray(parsed.contents)) {
+                for (const c of parsed.contents) {
+                    if (c && c.role === 'function') { c.role = 'user'; changed = true; }
+                }
+            }
+            if (changed) {
+                const newBody = JSON.stringify(parsed);
+                let newHeaders = init.headers;
+                try {
+                    const h = new Headers(init.headers || {});
+                    h.delete('content-length');
+                    newHeaders = h;
+                } catch (_) {
+                    if (init.headers && typeof init.headers === 'object') {
+                        newHeaders = { ...init.headers };
+                        delete newHeaders['content-length'];
+                        delete newHeaders['Content-Length'];
+                    }
+                }
+                patchedInit = { ...init, body: newBody, headers: newHeaders };
+            }
+        }
+    } catch (e) { /* если тело не JSON — шлём как есть */ }
+
+    const response = await originalFetch(input, patchedInit);
+
+    // --- телеметрия лимитов ---
     let url = typeof input === 'string' ? input : (input && input.url ? input.url : '');
     if (url && url.includes('generativelanguage.googleapis.com/v1beta/models/')) {
         const match = url.match(/models\/([^:]+)(?::generateContent|:streamGenerateContent)/);
@@ -348,6 +347,7 @@ global.fetch = async (input, init) => {
 // ==========================================
 app.post('/gemini', async (req, res) => {
     if (req.query.token !== PROXY_SECRET) return res.status(403).json({ok: false, error: "Auth failed"});
+    // Обработчик опроса уведомлений планировщика
     if (req.body.action === 'poll_inbox') {
         const notifications = messageInbox.map(msg => ({
             time: msg.time,
@@ -361,6 +361,7 @@ app.post('/gemini', async (req, res) => {
             admin_mode: adminMode
         });
     }
+    // Проверяем входящие накопленные ответы от отработавших cron-задач
     let cronNotificationsHtml = "";
     if (messageInbox.length > 0) {
         cronNotificationsHtml = '<div style="background:#fff3cd; border-left:5px solid #ffc107; padding:12px; margin-bottom:15px; border-radius:6px; font-size:12px; color:#856404; max-height: 400px; overflow-y: auto;"><b>🔔 Результаты фоновых задач планировщика:</b><br>' + messageInbox.map(m => `⏰ [${m.time} Kyiv]: ${m.text}`).join('<hr style="border:0; border-top:1px solid #ffeeba; margin:10px 0;">') + '</div>';
@@ -496,6 +497,7 @@ app.post('/gemini', async (req, res) => {
 <i>Пример: <code>!ls -la /tmp</code></i>`;
         return res.json({ ok: true, text: respHtml });
     }
+    // Режим администратора
     if (userText === '/admin on') {
         adminMode = true;
         adminHistory = [
@@ -643,6 +645,7 @@ app.post('/gemini', async (req, res) => {
         console.log("[GEMINI] Память контекста нейросети очищена.");
         if (userText === 'clear') return res.json({ok: true, text: "История очищена"});
     }
+    // Передаем cronNotificationsHtml в функцию администратора
     if (adminMode && userText && !userText.startsWith('/') && !userText.startsWith('!')) {
         return handleAdminMessage(userText, req, res, cronNotificationsHtml);
     }
@@ -660,7 +663,7 @@ app.post('/gemini', async (req, res) => {
         const modelConfig = { model: modelName };
         if (!isGemma) modelConfig.systemInstruction = "Ты — полезный ИИ-ассистент.";
         const model = genAI.getGenerativeModel(modelConfig);
-        const chat = model.startChat({ history: sanitizeHistoryForModel(geminiHistory) });
+        const chat = model.startChat({ history: geminiHistory });
         const result = await chat.sendMessage(msgParts);
         geminiHistory = await chat.getHistory();
         const aiText = result.response.text();
@@ -759,8 +762,7 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
             }
         ]
     }];
-    // *** ПАТЧ: фильтруем историю перед передачей в startChat ***
-    const chat = model.startChat({ history: sanitizeHistoryForModel(adminHistory), tools: tools });
+    const chat = model.startChat({ history: adminHistory, tools: tools });
     const executedCommands = [];
     let iterations = 0;
     const maxIterations = 10;
