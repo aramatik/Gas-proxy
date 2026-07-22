@@ -27,6 +27,24 @@ const TAVILY_API_KEY = process.env.TAVILY_API_KEY || "";
 const SOCKS5_PROXY = process.env.SOCKS5_PROXY || "";
 const TG_TOKEN = process.env.TG_TOKEN || "";
 const TG_CHAT_ID = process.env.TG_CHAT_ID || "";
+// ==========================================
+// ГИБРИД ДОСТАВКИ АРТЕФАКТОВ (Antigravity -> сервер -> /download + GitHub)
+// ==========================================
+const ARTIFACT_TOKEN = process.env.ARTIFACT_TOKEN || "";          // дешёвый токен эндпоинта /artifact (видит агент)
+const PUBLIC_URL = (process.env.PUBLIC_URL || "").replace(/\/+$/, ''); // публичный URL этого сервера (для curl в промпте)
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN || "";              // fine-grained PAT, Contents: write (НЕ видит агент)
+const GITHUB_REPO = process.env.GITHUB_REPO || "";                // owner/repo
+const GITHUB_BRANCH = process.env.GITHUB_BRANCH || "main";
+const GITHUB_PATH_PREFIX = process.env.GITHUB_PATH_PREFIX || "artifacts/";
+const ARTIFACT_DIR = path.join(TMP_DIR, 'artifacts');
+const ARTIFACT_MAX = 50 * 1024 * 1024; // 50 МБ на приём
+const GITHUB_CONTENTS_MAX = 1 * 1024 * 1024; // лимит GitHub Contents API ~1 МБ
+if (!fs.existsSync(ARTIFACT_DIR)) {
+    try { fs.mkdirSync(ARTIFACT_DIR, { recursive: true }); } catch (e) { console.warn("[ARTIFACT] Не удалось создать папку:", e.message); }
+}
+// Доставка активна, только если заданы и URL, и токен эндпоинта
+const ARTIFACT_DELIVERY_ENABLED = !!(PUBLIC_URL && ARTIFACT_TOKEN);
+const GITHUB_ENABLED = !!(GITHUB_TOKEN && GITHUB_REPO);
 let genAI = null;
 let geminiHistory = [];          // история обычного чата
 let adminMode = false;
@@ -51,6 +69,79 @@ try {
 }
 if (GEMINI_API_KEY) {
     genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+}
+// ==========================================
+// МАСКИРОВКА СЕКРЕТОВ В ЛОГАХ
+// ==========================================
+function maskSecrets(s) {
+    let r = String(s);
+    if (ARTIFACT_TOKEN) r = r.split(ARTIFACT_TOKEN).join('***ARTIFACT***');
+    if (GITHUB_TOKEN) r = r.split(GITHUB_TOKEN).join('***GITHUB***');
+    return r;
+}
+// ==========================================
+// ГИБРИД: системная инструкция и футер для Antigravity
+// ==========================================
+// Добавляет в промпт агенту инструкцию по загрузке артефакта на сервер (только если гибрид настроен).
+function getAntigravitySystemInstruction(basePrompt) {
+    let extra = "";
+    if (ARTIFACT_DELIVERY_ENABLED) {
+        extra = `\n\n=== ДОСТАВКА ФАЙЛОВ-АРТЕФАКТОВ НА СЕРВЕР ===\n` +
+            `Когда задача создаёт файл-артефакт (.bin, .zip, .hex, .elf, документ и т.п.), ПОСЛЕ его создания ОБЯЗАТЕЛЬНО загрузи его на сервер ОДНОЙ командой (подставь реальные ИМЯ и ЛОКАЛЬНЫЙ_ПУТЬ):\n` +
+            `curl -s -X POST "${PUBLIC_URL}/artifact?token=${ARTIFACT_TOKEN}" -H "Content-Type: application/octet-stream" -H "X-Filename: ИМЯ" --data-binary @ЛОКАЛЬНЫЙ_ПУТЬ\n` +
+            `Сервер ответит JSON с полем "path" (путь на сервере) и, возможно, "github" со ссылкой. Включи этот path и github-ссылку в свой финальный ответ.\n` +
+            `ПРАВИЛА БЕЗОПАСНОСТИ: НИКОГДА не выводи сам токен и URL с токеном в ответе; НЕ выполняй echo/printenv/env/set; НЕ делай git remote -v; используй curl с флагом -s и не печатай саму команду. В ответе пиши только path из JSON-ответа сервера и github-ссылку.`;
+    }
+    return (basePrompt || "") + extra;
+}
+// Честная приписка про то, где физически лежит файл.
+function buildAntigravityFooter() {
+    if (ARTIFACT_DELIVERY_ENABLED) {
+        return `\n\n<i>ℹ️ Antigravity выполняет код в собственном sandbox Google.</i><br>` +
+            `📤 <b>Доставка артефактов настроена:</b> если агент создал файл и загрузил его командой <code>curl</code> на сервер — файл лежит в <code>/tmp/artifacts/</code> (путь указан в ответе) и доступен через <code>/download</code>; также он мог быть запушен в GitHub (ссылка в ответе).<br>` +
+            `⚠️ Если в ответе нет пути сервера — значит агент не выполнил загрузку, и файл остался только в sandbox Google (недоступен на сервере). Для гарантированного получения файлов компилируйте в обычном админ-режиме: выберите <b>Gemini 3.5 Flash Lite / 3.6 Flash</b> вместо Antigravity.`;
+    }
+    return `\n\n<i>ℹ️ Antigravity выполняет код в собственном sandbox Google, а НЕ на этом сервере.</i><br>` +
+        `⚠️ <b>Все созданные файлы (.bin, .zip и т.д.) остаются в sandbox Google и НЕДОСТУПНЫ на этом сервере</b> — скачать их через <code>/download</code> нельзя. Если нужен файл-артефакт, используйте обычный админ-режим: выберите модель <b>Gemini 3.5 Flash Lite / 3.6 Flash</b> вместо Antigravity — там команды выполняются на этом сервере и файл появится в <code>/tmp</code>.`;
+}
+// ==========================================
+// ГИБРИД: push артефакта в GitHub (Contents API, без git)
+// ==========================================
+async function pushArtifactToGitHub(filePath, safeName) {
+    if (!GITHUB_ENABLED) return { ok: false, skipped: true, reason: "GITHUB_TOKEN/GITHUB_REPO не настроены" };
+    try {
+        const stat = fs.statSync(filePath);
+        if (stat.size > GITHUB_CONTENTS_MAX) {
+            return { ok: false, reason: `Файл ${stat.size} байт превышает лимит GitHub Contents API (~1 МБ)` };
+        }
+        const b64 = fs.readFileSync(filePath).toString('base64');
+        // Уникальный путь с таймштампом Kyiv — избегаем конфликтов sha и перезаписи
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').slice(0, 19);
+        const prefix = GITHUB_PATH_PREFIX.replace(/\/+$/, '');
+        const repoPath = `${prefix}/${stamp}_${safeName}`;
+        const url = `https://api.github.com/repos/${GITHUB_REPO}/contents/${repoPath}`;
+        const resp = await axios.put(url, {
+            message: `artifact: ${safeName} (${stamp})`,
+            content: b64,
+            branch: GITHUB_BRANCH
+        }, {
+            headers: {
+                'Authorization': `Bearer ${GITHUB_TOKEN}`,
+                'Accept': 'application/vnd.github+json',
+                'X-GitHub-Api-Version': '2022-11-28',
+                'User-Agent': 'northflank-artifact',
+                'Content-Type': 'application/json'
+            },
+            timeout: 60000
+        });
+        const htmlUrl = (resp.data && resp.data.content && resp.data.content.html_url) || null;
+        console.log(`[ARTIFACT][GITHUB] Запушен: ${repoPath}`);
+        return { ok: true, path: repoPath, url: htmlUrl };
+    } catch (err) {
+        const detail = (err.response && err.response.data && (err.response.data.message || JSON.stringify(err.response.data))) || err.message;
+        console.error("[ARTIFACT][GITHUB ERROR]", detail);
+        return { ok: false, reason: detail };
+    }
 }
 // ==========================================
 // ПОДДЕРЖКА ANTIGRAVITY (Interactions API)
@@ -82,10 +173,19 @@ function extractAntigravityText(interaction) {
 function escHtmlAg(s) {
     return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
-// Устойчивый парсер шагов: схема может отличаться, пробуем несколько вариантов, никогда не падаем.
+// Устойчивый парсер шагов: распознаёт реальные типы Antigravity (code_execution_*, thought).
 function describeAntigravityStep(step, idx) {
     if (!step || typeof step !== 'object') return `⚙️ Шаг ${idx + 1}`;
     const type = String(step.type || step.role || '').toLowerCase();
+    if (type === 'code_execution_call' || type === 'code_execution') {
+        return `🔧 <b>Antigravity → выполняет код</b> (sandbox)`;
+    }
+    if (type === 'code_execution_result') {
+        return `📥 <b>Antigravity:</b> код выполнен`;
+    }
+    if (type === 'thought' || type === 'reasoning') {
+        return `💭 <b>Antigravity:</b> размышляет…`;
+    }
     const toolName =
         (step.tool_call && step.tool_call.name) ||
         (step.tool_use && step.tool_use.name) ||
@@ -107,17 +207,15 @@ function describeAntigravityStep(step, idx) {
     if (preview) {
         preview = preview.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
         if (preview.length > 160) preview = preview.slice(0, 160) + '…';
-        const tag = (type === 'thought' || type === 'reasoning') ? '💭' : '💬';
-        return `${tag} <b>Antigravity:</b> ${escHtmlAg(preview)}`;
+        return `💬 <b>Antigravity:</b> ${escHtmlAg(preview)}`;
     }
     return `⚙️ <b>Antigravity:</b> шаг ${idx + 1}${type ? ' (' + escHtmlAg(type) + ')' : ''}`;
 }
-// Лёгкий push прогресса в inbox БЕЗ записи на диск (прогресс эфемерен,
-// фронт заберёт его через poll_inbox прямо из памяти).
+// Лёгкий push прогресса в inbox БЕЗ записи на диск.
 function pushProgressToInbox(html) {
     messageInbox.push({ time: getKyivTime(), text: html });
 }
-// --- Вызов агента: устойчивые таймауты + прогресс ---
+// --- Вызов агента: устойчивые таймауты + прогресс + heartbeat ---
 async function callAntigravityAgent(opts) {
     const url = 'https://generativelanguage.googleapis.com/v1beta/interactions';
     const headers = { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY };
@@ -141,12 +239,14 @@ async function callAntigravityAgent(opts) {
     }
 
     if (background) {
-        const maxWaitMs = 10 * 60 * 1000;   // ждём до 10 минут (компиляция .bin может быть долгой)
+        const maxWaitMs = 10 * 60 * 1000;
         const intervalMs = 3000;
+        const heartbeatIntervalMs = 30000;   // API не отдаёт шаги во время in_progress — шлём индикацию
         const start = Date.now();
+        let lastActivityTime = Date.now();
         let consecutiveErrors = 0;
-        const maxConsecutiveErrors = 5;     // сдаёмся только после 5 ошибок подряд
-        let processedSteps = 0;             // сколько шагов уже отдали в прогресс
+        const maxConsecutiveErrors = 5;
+        let processedSteps = 0;
         while (interaction && (interaction.status === 'in_progress' || interaction.status === 'queued')) {
             if (Date.now() - start > maxWaitMs) throw new Error('Antigravity: превышено время ожидания (10 минут)');
             await new Promise(r => setTimeout(r, intervalMs));
@@ -154,7 +254,6 @@ async function callAntigravityAgent(opts) {
                 const poll = await axios.get(`${url}/${interaction.id}`, { headers, timeout: 60000 });
                 interaction = poll.data;
                 consecutiveErrors = 0;
-                // --- ПРОГРЕСС: отдаём все новые шаги агента ---
                 const steps = Array.isArray(interaction.steps) ? interaction.steps : [];
                 if (steps.length > processedSteps) {
                     for (let i = processedSteps; i < steps.length; i++) {
@@ -164,6 +263,11 @@ async function callAntigravityAgent(opts) {
                         if (onProgress) { try { onProgress(desc); } catch (_) {} }
                     }
                     processedSteps = steps.length;
+                    lastActivityTime = Date.now();
+                } else if (onProgress && (Date.now() - lastActivityTime) >= heartbeatIntervalMs) {
+                    const elapsedSec = Math.round((Date.now() - start) / 1000);
+                    try { onProgress(`⏳ <b>Antigravity:</b> задача выполняется… (прошло ${elapsedSec} сек)`); } catch (_) {}
+                    lastActivityTime = Date.now();
                 }
             } catch (pollErr) {
                 consecutiveErrors++;
@@ -171,10 +275,9 @@ async function callAntigravityAgent(opts) {
                 if (consecutiveErrors >= maxConsecutiveErrors) {
                     throw new Error(`Antigravity: polling не удался ${maxConsecutiveErrors} раз подряд: ${pollErr.message}`);
                 }
-                // иначе просто продолжаем ждать — задача на стороне Google жива
             }
         }
-        // добиваем шаги, если финальный interaction принёс новые
+        // добиваем шаги из финального interaction (API отдаёт их только при завершении)
         if (interaction) {
             const steps = Array.isArray(interaction.steps) ? interaction.steps : [];
             if (steps.length > processedSteps) {
@@ -203,10 +306,8 @@ async function callAntigravityAgent(opts) {
 }
 // ==========================================
 // ANTIGRAVITY: НЕБЛОКИРУЮЩИЙ ФОНОВЫЙ ЗАПУСК
-// Сервер не ждёт завершения — GAS не висит. Прогресс и финал идут во входящие.
 // ==========================================
 function runAntigravityInBackground(opts) {
-    // opts: { mode: 'admin' | 'chat', input, systemInstruction }
     const mode = opts.mode;
     (async () => {
         try {
@@ -220,14 +321,10 @@ function runAntigravityInBackground(opts) {
                 background: true,
                 onProgress: (h) => pushProgressToInbox(h)
             });
-            // обновляем multi-turn состояние для следующего запроса
             if (mode === 'admin') { adminAntigravityPrevId = ag.id; adminAntigravityEnvId = ag.environmentId; }
             else { geminiAntigravityPrevId = ag.id; geminiAntigravityEnvId = ag.environmentId; }
 
-            let finalText = ag.text;
-            if (mode === 'admin') {
-                finalText += `\n\n<i>ℹ️ Antigravity выполняет код и поиск в собственном защищённом sandbox Google (не на этом сервере). Серверные команды <code>!</code> здесь не используются.</i>`;
-            }
+            let finalText = ag.text + buildAntigravityFooter();
             const head = (mode === 'admin')
                 ? '🛰 <b>Antigravity (admin) — готово:</b><br>'
                 : '🛰 <b>Antigravity — готово:</b><br>';
@@ -297,7 +394,7 @@ function startCronTask(job) {
                 try {
                     const ag = await callAntigravityAgent({
                         input: job.taskText,
-                        systemInstruction: "Ты — автономный агент, выполняющий задачу по расписанию. Верни только краткий конечный результат.",
+                        systemInstruction: getAntigravitySystemInstruction("Ты — автономный агент, выполняющий задачу по расписанию. Верни только краткий конечный результат."),
                         background: true
                     });
                     addMessageToInbox(`<b>Задача ${job.id} выполнена (Antigravity)!</b><br>Запрос: <i>${job.taskText}</i><br><br>${ag.text}`);
@@ -436,7 +533,7 @@ function initAllCronJobs() {
     });
 }
 // ==========================================
-// СИСТЕМА ЛОГИРОВАНИЯ
+// СИСТЕМА ЛОГИРОВАНИЯ (с маскировкой секретов)
 // ==========================================
 const MAX_LOG_LINES = 100;
 let serverLogs = [];
@@ -449,13 +546,15 @@ function captureLog(msg) {
 }
 const origLog = console.log;
 console.log = function(...args) {
-    origLog.apply(console, args);
-    captureLog(util.format(...args));
+    const formatted = maskSecrets(util.format(...args));
+    origLog(formatted);
+    captureLog(formatted);
 };
 const origErr = console.error;
 console.error = function(...args) {
-    origErr.apply(console, args);
-    captureLog("ERROR: " + util.format(...args));
+    const formatted = maskSecrets(util.format(...args));
+    origErr(formatted);
+    captureLog("ERROR: " + formatted);
 };
 console.log("[SYSTEM] Сервер запущен. Часовой пояс: Europe/Kyiv");
 let useProxy = false;
@@ -499,7 +598,6 @@ global.fetch = async (input, init) => {
     // ПАТЧ СОВМЕСТИМОСТИ: Gemini 3.5 Flash Lite / 3.6 Flash и новее
     // Эти модели не принимают роль 'function'. SDK всё ещё пакует
     // functionResponse в role:'function' — на лету переписываем в 'user'.
-    // Чинит админку, cron и обычный чат независимо от версии SDK.
     // ============================================================
     let patchedInit = init;
     try {
@@ -563,6 +661,45 @@ global.fetch = async (input, init) => {
     }
     return response;
 };
+// ==========================================
+// ЭНДПОИНТ ПРИЁМА АРТЕФАКТОВ ОТ ANTIGRAVITY
+// Узкоскоупный: умеет ТОЛЬКО класть файл в /tmp/artifacts/ (+ опц. push в GitHub).
+// Не даёт exec/прокси/чат. Токен ARTIFACT_TOKEN != PROXY_SECRET.
+// ==========================================
+app.post('/artifact', (req, res) => {
+    if (!ARTIFACT_TOKEN) return res.status(500).json({ ok: false, error: "ARTIFACT_TOKEN not set on server" });
+    if (req.query.token !== ARTIFACT_TOKEN) return res.status(403).json({ ok: false, error: "Auth failed" });
+
+    // Имя только из basename, без путей и точек-точек
+    let rawName = String(req.get('x-filename') || req.query.name || 'artifact.bin');
+    let safeName = path.basename(rawName).replace(/[^a-zA-Z0-9.\-_]/g, '_') || 'artifact.bin';
+    const savePath = path.join(ARTIFACT_DIR, safeName); // всегда внутри ARTIFACT_DIR
+
+    let bytes = 0; let aborted = false;
+    const writer = fs.createWriteStream(savePath);
+    req.on('data', (chunk) => {
+        bytes += chunk.length;
+        if (bytes > ARTIFACT_MAX && !aborted) {
+            aborted = true; req.destroy(); writer.close();
+            try { fs.unlinkSync(savePath); } catch (_) {}
+        }
+    });
+    req.pipe(writer);
+    writer.on('finish', async () => {
+        if (aborted) return res.status(413).json({ ok: false, error: "File too large" });
+        console.log(`[ARTIFACT] Принят файл: ${savePath} (${(bytes/1024).toFixed(1)} KB)`);
+        // Опциональный push в GitHub (агент GITHUB_TOKEN не видит)
+        let github = { ok: false, skipped: true, reason: "GitHub не настроен" };
+        if (GITHUB_ENABLED) {
+            github = await pushArtifactToGitHub(savePath, safeName);
+        }
+        res.json({ ok: true, path: savePath, size: bytes, github: github });
+    });
+    writer.on('error', (e) => {
+        console.error("[ARTIFACT WRITE ERROR]", e.message);
+        if (!res.headersSent) res.status(500).json({ ok: false, error: e.message });
+    });
+});
 // ==========================================
 // МАРШРУТ УПРАВЛЕНИЯ И GEMINI
 // ==========================================
@@ -695,6 +832,9 @@ app.post('/gemini', async (req, res) => {
         }
     }
     if (userText === '/help') {
+        const deliveryHint = ARTIFACT_DELIVERY_ENABLED
+            ? `<code>/artifact</code> — приём артефактов от Antigravity <b>настроен</b> (файлы → /tmp/artifacts/ + GitHub${GITHUB_ENABLED ? '' : ' [не настроен]'})<br>`
+            : `<code>/artifact</code> — приём артефактов <b>НЕ настроен</b> (нужны env PUBLIC_URL + ARTIFACT_TOKEN)<br>`;
         const respHtml = `🤖 <b>СИСТЕМА CHATOPS (с поддержкой фонового планировщика):</b><br><br>
 <code>/task [cron-pattern или текст] [запрос]</code> — Запланировать автономную задачу для ИИ<br>
 <i>Пример 1: <code>/task */5 * * * * Какая цена BTC сейчас?</code></i><br>
@@ -707,6 +847,7 @@ app.post('/gemini', async (req, res) => {
 <code>/logs</code> — Логи Northflank<br>
 <code>/proxy on</code> | <code>/proxy off</code> — Ghost Proxy (curl-impersonate локальный)<br>
 <code>/ag_async on</code> | <code>/ag_async off</code> — Antigravity: фон (async) / ожидание (sync)<br>
+${deliveryHint}
 <code>/download [путь]</code> — Скачать файл (до 15 МБ)<br>
 <code>/upload</code> — Загрузить файл на сервер<br>
 <code>/search [запрос]</code> — Поиск в сети с помощью Tavily API<br>
@@ -800,8 +941,11 @@ app.post('/gemini', async (req, res) => {
         const agMode = antigravityNonBlocking
             ? '<span style="color:#1a73e8; font-weight:bold;">async (фон)</span>'
             : '<span style="color:#6f42c1; font-weight:bold;">sync (ожидание)</span>';
+        const deliveryStatus = ARTIFACT_DELIVERY_ENABLED
+            ? `<span style="color:green; font-weight:bold;">✅ настроена</span> → /tmp/artifacts/` + (GITHUB_ENABLED ? ` + GitHub (<code>${escHtmlAg(GITHUB_REPO)}</code>)` : ` <span style="color:#856404;">(GitHub не настроен)</span>`)
+            : `<span style="color:red;">❌ НЕ настроена</span> (нужны env PUBLIC_URL + ARTIFACT_TOKEN)`;
         const tasksCount = scheduledJobs.length;
-        let statusText = `🖥 <b>Статус:</b><br>⏱ Uptime: <b>${Math.floor(uptime/3600)}ч ${Math.floor((uptime%3600)/60)}м</b><br>💾 Память: <b>${(mem.rss / 1024 / 1024).toFixed(1)} MB</b><br>🔒 Ghost Proxy: <b>${useProxy ? '<span style="color:green">ВКЛЮЧЕН</span>' : '<span style="color:red">ВЫКЛЮЧЕН</span>'}</b><br>🔧 Режим администратора: ${adminStatus}${adminCtx}<br>⚡ Antigravity: <b>${agMode}</b><br>🧠 Контекст обычного чата: <b>${geminiHistory.length} сообщений</b><br>⚙️ Фоновых задач: <b>${tasksCount}</b>`;
+        let statusText = `🖥 <b>Статус:</b><br>⏱ Uptime: <b>${Math.floor(uptime/3600)}ч ${Math.floor((uptime%3600)/60)}м</b><br>💾 Память: <b>${(mem.rss / 1024 / 1024).toFixed(1)} MB</b><br>🔒 Ghost Proxy: <b>${useProxy ? '<span style="color:green">ВКЛЮЧЕН</span>' : '<span style="color:red">ВЫКЛЮЧЕН</span>'}</b><br>🔧 Режим администратора: ${adminStatus}${adminCtx}<br>⚡ Antigravity: <b>${agMode}</b><br>📤 Доставка артефактов: ${deliveryStatus}<br>🧠 Контекст обычного чата: <b>${geminiHistory.length} сообщений</b><br>⚙️ Фоновых задач: <b>${tasksCount}</b>`;
         if (cronNotificationsHtml) {
             statusText = cronNotificationsHtml + '<br>' + statusText;
         }
@@ -904,7 +1048,7 @@ app.post('/gemini', async (req, res) => {
         }
         // НЕБЛОКИРУЮЩИЙ режим: мгновенная заглушка, задача в фоне
         if (antigravityNonBlocking) {
-            runAntigravityInBackground({ mode: 'chat', input: agInput, systemInstruction: "Ты — полезный ИИ-ассистент." });
+            runAntigravityInBackground({ mode: 'chat', input: agInput, systemInstruction: getAntigravitySystemInstruction("Ты — полезный ИИ-ассистент.") });
             let stub = "✅ <b>Задача Antigravity принята в фоновый режим.</b><br>Прогресс и ответ появятся во входящих (📬 Планировщик). Следите за блоками прогресса — они приходят каждые ~10 секунд.";
             if (cronNotificationsHtml) stub = cronNotificationsHtml + '<br>' + stub;
             return res.json({ ok: true, text: stub });
@@ -915,13 +1059,13 @@ app.post('/gemini', async (req, res) => {
                 input: agInput,
                 previousInteractionId: geminiAntigravityPrevId,
                 environmentId: geminiAntigravityEnvId,
-                systemInstruction: "Ты — полезный ИИ-ассистент.",
+                systemInstruction: getAntigravitySystemInstruction("Ты — полезный ИИ-ассистент."),
                 background: true,
                 onProgress: (h) => pushProgressToInbox(h)
             });
             geminiAntigravityPrevId = ag.id;
             geminiAntigravityEnvId = ag.environmentId;
-            const aiText = ag.text;
+            const aiText = ag.text + buildAntigravityFooter();
             return res.json({ ok: true, text: cronNotificationsHtml ? cronNotificationsHtml + '<br>' + aiText : aiText });
         } catch (err) {
             console.error("[ANTIGRAVITY ERROR]", err.message);
@@ -960,7 +1104,7 @@ async function handleAntigravityAdmin(userText, req, res, cronNotificationsHtml 
         runAntigravityInBackground({
             mode: 'admin',
             input: userText,
-            systemInstruction: adminSystemPrompt || "Ты — автономный агент-администратор. Выполняй задачу и возвращай краткий результат."
+            systemInstruction: getAntigravitySystemInstruction(adminSystemPrompt || "Ты — автономный агент-администратор. Выполняй задачу и возвращай краткий результат.")
         });
         let stub = "✅ <b>Задача Antigravity принята в фоновый режим.</b><br>Прогресс и итоговый результат появятся во входящих (📬 Планировщик). Следите за блоками прогресса — они приходят каждые ~10 секунд.";
         if (cronNotificationsHtml) stub = cronNotificationsHtml + '<br>' + stub;
@@ -972,14 +1116,13 @@ async function handleAntigravityAdmin(userText, req, res, cronNotificationsHtml 
             input: userText,
             previousInteractionId: adminAntigravityPrevId,
             environmentId: adminAntigravityEnvId,
-            systemInstruction: adminSystemPrompt || "Ты — автономный агент-администратор. Выполняй задачу и возвращай краткий результат.",
+            systemInstruction: getAntigravitySystemInstruction(adminSystemPrompt || "Ты — автономный агент-администратор. Выполняй задачу и возвращай краткий результат."),
             background: true,
             onProgress: (h) => pushProgressToInbox(h)
         });
         adminAntigravityPrevId = ag.id;
         adminAntigravityEnvId = ag.environmentId;
-        let finalText = ag.text;
-        finalText += `\n\n<i>ℹ️ Antigravity выполняет код и поиск в собственном защищённом sandbox Google (не на этом сервере). Серверные команды <code>!</code> здесь не используются.</i>`;
+        let finalText = ag.text + buildAntigravityFooter();
         if (cronNotificationsHtml) finalText = cronNotificationsHtml + '<br>' + finalText;
         return res.json({ ok: true, text: finalText });
     } catch (err) {
@@ -1559,6 +1702,7 @@ async function startServer() {
     const PORT = process.env.PORT || 8080;
     app.listen(PORT, () => {
         console.log(`[SYSTEM] Сервер успешно запущен на порту ${PORT}`);
+        console.log(`[SYSTEM] Доставка артефактов: ${ARTIFACT_DELIVERY_ENABLED ? 'ВКЛ' : 'ВЫКЛ'} | GitHub: ${GITHUB_ENABLED ? 'ВКЛ (' + GITHUB_REPO + ')' : 'ВЫКЛ'}`);
         initAllCronJobs();
     });
 }
