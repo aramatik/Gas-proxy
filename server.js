@@ -30,7 +30,7 @@ const TG_CHAT_ID = process.env.TG_CHAT_ID || "";
 // ==========================================
 // ГИБРИД ДОСТАВКИ АРТЕФАКТОВ (Antigravity -> сервер -> /download + GitHub)
 // ==========================================
-const ARTIFACT_TOKEN = process.env.ARTIFACT_TOKEN || "";          // дешёвый токен эндпоинта /artifact (видит агент)
+const ARTIFACT_TOKEN = process.env.ARTIFACT_TOKEN || "";          // дешёвый токен эндпоинтов /artifact и /fetch (видит агент)
 const PUBLIC_URL = (process.env.PUBLIC_URL || "").replace(/\/+$/, ''); // публичный URL этого сервера (для curl в промпте)
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN || "";              // fine-grained PAT, Contents: write (НЕ видит агент)
 const GITHUB_REPO = process.env.GITHUB_REPO || "";                // owner/repo
@@ -41,6 +41,34 @@ const ARTIFACT_MAX = 50 * 1024 * 1024; // 50 МБ на приём
 const GITHUB_CONTENTS_MAX = 1 * 1024 * 1024; // лимит GitHub Contents API ~1 МБ
 if (!fs.existsSync(ARTIFACT_DIR)) {
     try { fs.mkdirSync(ARTIFACT_DIR, { recursive: true }); } catch (e) { console.warn("[ARTIFACT] Не удалось создать папку:", e.message); }
+}
+// ==========================================
+// ПАПКА ОБМЕНА (сервер -> агент): /fetch читает ТОЛЬКО отсюда (песочница)
+// НЕ ставьте SHARE_DIR=/tmp — иначе /fetch сможет читать весь /tmp (дыра).
+// ==========================================
+const SHARE_DIR = process.env.SHARE_DIR || path.join(TMP_DIR, 'share');
+const SHARE_FILE_MAX = 50 * 1024 * 1024;   // 50 МБ на один файл
+const SHARE_ZIP_MAX = 100 * 1024 * 1024;   // 100 МБ исходной папки под zip
+if (!fs.existsSync(SHARE_DIR)) {
+    try { fs.mkdirSync(SHARE_DIR, { recursive: true }); } catch (e) { console.warn("[SHARE] Не удалось создать папку:", e.message); }
+}
+// Разрешает путь только внутри SHARE_DIR (защита от ../ и абсолютных путей)
+function safeResolveShare(rel) {
+    const r = String(rel || '').replace(/^\/+/, '');
+    const abs = path.normalize(path.join(SHARE_DIR, r));
+    if (abs !== SHARE_DIR && !abs.startsWith(SHARE_DIR + path.sep)) return null;
+    return abs;
+}
+// Рекурсивный список файлов папки (без зависимостей)
+function walkDir(dir, base) {
+    base = base || dir; let out = [];
+    let entries; try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { return out; }
+    for (const ent of entries) {
+        const full = path.join(dir, ent.name);
+        if (ent.isDirectory()) out = out.concat(walkDir(full, base));
+        else if (ent.isFile()) out.push({ rel: path.relative(base, full).split(path.sep).join('/'), size: fs.statSync(full).size });
+    }
+    return out;
 }
 // Доставка активна, только если заданы и URL, и токен эндпоинта
 const ARTIFACT_DELIVERY_ENABLED = !!(PUBLIC_URL && ARTIFACT_TOKEN);
@@ -82,15 +110,22 @@ function maskSecrets(s) {
 // ==========================================
 // ГИБРИД: системная инструкция и футер для Antigravity
 // ==========================================
-// Добавляет в промпт агенту инструкцию по загрузке артефакта на сервер (только если гибрид настроен).
+// Добавляет в промпт агенту инструкции по загрузке артефакта (/artifact) и по скачиванию файлов (/fetch).
 function getAntigravitySystemInstruction(basePrompt) {
     let extra = "";
     if (ARTIFACT_DELIVERY_ENABLED) {
         extra = `\n\n=== ДОСТАВКА ФАЙЛОВ-АРТЕФАКТОВ НА СЕРВЕР ===\n` +
-            `Когда задача создаёт файл-артефакт (.bin, .zip, .hex, .elf, документ и т.п.), ПОСЛЕ его создания ОБЯЗАТЕЛЬНО загрузи его на сервер ОДНОЙ командой (подставь реальные ИМЯ и ЛОКАЛЬНЫЙ_ПУТЬ):\n` +
+            `Когда задача создаёт файл-артефакт (.bin, .zip, .hex, .elf, .apk, документ и т.п.), ПОСЛЕ его создания ОБЯЗАТЕЛЬНО загрузи его на сервер ОДНОЙ командой (подставь реальные ИМЯ и ЛОКАЛЬНЫЙ_ПУТЬ):\n` +
             `curl -s -X POST "${PUBLIC_URL}/artifact?token=${ARTIFACT_TOKEN}" -H "Content-Type: application/octet-stream" -H "X-Filename: ИМЯ" --data-binary @ЛОКАЛЬНЫЙ_ПУТЬ\n` +
             `Сервер ответит JSON с полем "path" (путь на сервере) и, возможно, "github" со ссылкой. Включи этот path и github-ссылку в свой финальный ответ.\n` +
             `ПРАВИЛА БЕЗОПАСНОСТИ: НИКОГДА не выводи сам токен и URL с токеном в ответе; НЕ выполняй echo/printenv/env/set; НЕ делай git remote -v; используй curl с флагом -s и не печатай саму команду. В ответе пиши только path из JSON-ответа сервера и github-ссылку.`;
+        extra += `\n\n=== ПОЛУЧЕНИЕ ФАЙЛОВ/ПРОЕКТОВ С СЕРВЕРА ===\n` +
+            `На сервере есть папка-песочница с файлами/проектами. Ты можешь скачать их ИСХОДЯЩИМ curl по этим URL (REL — путь относительно корня папки БЕЗ ведущего слэша, напр. "myproj" или "myproj/src/main.cpp"):\n` +
+            `- Список файлов папки:        curl -s "${PUBLIC_URL}/fetch?token=${ARTIFACT_TOKEN}&list=REL"\n` +
+            `- Вся папка одним архивом:     curl -s -o project.zip "${PUBLIC_URL}/fetch?token=${ARTIFACT_TOKEN}&zip=REL"   затем распакуй: unzip project.zip  (или, если unzip нет: python3 -m zipfile -e project.zip .)\n` +
+            `- Один файл:                   curl -s -o file.bin "${PUBLIC_URL}/fetch?token=${ARTIFACT_TOKEN}&path=REL"\n` +
+            `ТИПОВОЙ ПОРЯДОК РАБОТЫ С ПРОЕКТОМ НА СЕРВЕРЕ: если пользователь назвал папку/файл на сервере — сначала сделай list, чтобы увидеть структуру; затем скачай всю папку через zip и распакуй в свой sandbox; внеси изменения/собери; готовые артефакты залей обратно на сервер по инструкции выше (эндпоинт /artifact).\n` +
+            `ПРАВИЛА: НЕ выводи токен и URL с токеном в ответе; НЕ делай echo/printenv/env.`;
     }
     return (basePrompt || "") + extra;
 }
@@ -115,7 +150,7 @@ async function pushArtifactToGitHub(filePath, safeName) {
             return { ok: false, reason: `Файл ${stat.size} байт превышает лимит GitHub Contents API (~1 МБ)` };
         }
         const b64 = fs.readFileSync(filePath).toString('base64');
-        // Уникальный путь с таймштампом Kyiv — избегаем конфликтов sha и перезаписи
+        // Уникальный путь с таймштампом — избегаем конфликтов sha и перезаписи
         const stamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').slice(0, 19);
         const prefix = GITHUB_PATH_PREFIX.replace(/\/+$/, '');
         const repoPath = `${prefix}/${stamp}_${safeName}`;
@@ -701,6 +736,66 @@ app.post('/artifact', (req, res) => {
     });
 });
 // ==========================================
+// ЭНДПОИНТ ОТДАЧИ ФАЙЛОВ/ПАПОК АГЕНТУ (сервер -> Antigravity)
+// Читает ТОЛЬКО из SHARE_DIR под ARTIFACT_TOKEN. Три режима: list / zip / path.
+// ==========================================
+app.get('/fetch', async (req, res) => {
+    if (!ARTIFACT_TOKEN) return res.status(500).json({ ok: false, error: "ARTIFACT_TOKEN not set on server" });
+    if (req.query.token !== ARTIFACT_TOKEN) return res.status(403).json({ ok: false, error: "Auth failed" });
+    const listRel = req.query.list;
+    const zipRel = req.query.zip;
+    const fileRel = req.query.path;
+    try {
+        // --- список файлов папки ---
+        if (listRel !== undefined) {
+            const abs = safeResolveShare(listRel);
+            if (!abs) return res.status(403).json({ ok: false, error: "Path outside share dir" });
+            if (!fs.existsSync(abs)) return res.status(404).json({ ok: false, error: "Not found" });
+            if (!fs.statSync(abs).isDirectory()) return res.status(400).json({ ok: false, error: "Not a directory" });
+            const files = walkDir(abs);
+            return res.json({ ok: true, root: listRel || '.', count: files.length, files: files });
+        }
+        // --- вся папка одним zip (пакуются на лету) ---
+        if (zipRel !== undefined) {
+            const abs = safeResolveShare(zipRel);
+            if (!abs) return res.status(403).json({ ok: false, error: "Path outside share dir" });
+            if (!fs.existsSync(abs)) return res.status(404).json({ ok: false, error: "Not found" });
+            if (!fs.statSync(abs).isDirectory()) return res.status(400).json({ ok: false, error: "zip expects a directory" });
+            let total = 0; for (const f of walkDir(abs)) total += f.size;
+            if (total > SHARE_ZIP_MAX) return res.status(413).json({ ok: false, error: `Folder too large (${total} bytes > ${SHARE_ZIP_MAX})` });
+            const tmpZip = path.join(TMP_DIR, `fetch_${crypto.randomUUID()}.zip`); // имя безопасное (uuid)
+            // путь папки идёт в cwd, НЕ в строку команды → нет command injection
+            await execPromise(`zip -r "${tmpZip}" .`, { cwd: abs, timeout: 120000 });
+            const zstat = fs.statSync(tmpZip);
+            res.set('Content-Type', 'application/zip');
+            res.set('Content-Disposition', `attachment; filename="${(path.basename(abs) || 'share').replace(/[^a-zA-Z0-9.\-_]/g, '_')}.zip"`);
+            res.set('Content-Length', zstat.size);
+            const stream = fs.createReadStream(tmpZip);
+            const cleanup = () => { try { fs.unlinkSync(tmpZip); } catch (_) {} };
+            stream.on('close', cleanup); stream.on('error', cleanup);
+            console.log(`[FETCH] Отдан zip папки: ${zipRel} (${(zstat.size/1024).toFixed(1)} KB)`);
+            return stream.pipe(res);
+        }
+        // --- один файл ---
+        if (fileRel !== undefined) {
+            const abs = safeResolveShare(fileRel);
+            if (!abs) return res.status(403).json({ ok: false, error: "Path outside share dir" });
+            if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) return res.status(404).json({ ok: false, error: "File not found" });
+            const st = fs.statSync(abs);
+            if (st.size > SHARE_FILE_MAX) return res.status(413).json({ ok: false, error: "File too large" });
+            res.set('Content-Type', 'application/octet-stream');
+            res.set('Content-Disposition', `attachment; filename="${path.basename(abs)}"`);
+            res.set('Content-Length', st.size);
+            console.log(`[FETCH] Отдан файл: ${fileRel} (${(st.size/1024).toFixed(1)} KB)`);
+            return fs.createReadStream(abs).pipe(res);
+        }
+        return res.status(400).json({ ok: false, error: "Provide one of: path, zip, list" });
+    } catch (e) {
+        console.error("[FETCH ERROR]", e.message);
+        if (!res.headersSent) res.status(500).json({ ok: false, error: e.message });
+    }
+});
+// ==========================================
 // МАРШРУТ УПРАВЛЕНИЯ И GEMINI
 // ==========================================
 app.post('/gemini', async (req, res) => {
@@ -833,8 +928,9 @@ app.post('/gemini', async (req, res) => {
     }
     if (userText === '/help') {
         const deliveryHint = ARTIFACT_DELIVERY_ENABLED
-            ? `<code>/artifact</code> — приём артефактов от Antigravity <b>настроен</b> (файлы → /tmp/artifacts/ + GitHub${GITHUB_ENABLED ? '' : ' [не настроен]'})<br>`
-            : `<code>/artifact</code> — приём артефактов <b>НЕ настроен</b> (нужны env PUBLIC_URL + ARTIFACT_TOKEN)<br>`;
+            ? `<code>/artifact</code> — приём артефактов от Antigravity <b>настроен</b> (файлы → /tmp/artifacts/ + GitHub${GITHUB_ENABLED ? '' : ' [не настроен]'})<br>` +
+              `📂 <code>/fetch</code> — отдача файлов/папок агенту из <code>${escHtmlAg(SHARE_DIR)}</code> (list/zip/path)<br>`
+            : `<code>/artifact</code> / <code>/fetch</code> — обмен файлами с агентом <b>НЕ настроен</b> (нужны env PUBLIC_URL + ARTIFACT_TOKEN)<br>`;
         const respHtml = `🤖 <b>СИСТЕМА CHATOPS (с поддержкой фонового планировщика):</b><br><br>
 <code>/task [cron-pattern или текст] [запрос]</code> — Запланировать автономную задачу для ИИ<br>
 <i>Пример 1: <code>/task */5 * * * * Какая цена BTC сейчас?</code></i><br>
@@ -945,7 +1041,7 @@ ${deliveryHint}
             ? `<span style="color:green; font-weight:bold;">✅ настроена</span> → /tmp/artifacts/` + (GITHUB_ENABLED ? ` + GitHub (<code>${escHtmlAg(GITHUB_REPO)}</code>)` : ` <span style="color:#856404;">(GitHub не настроен)</span>`)
             : `<span style="color:red;">❌ НЕ настроена</span> (нужны env PUBLIC_URL + ARTIFACT_TOKEN)`;
         const tasksCount = scheduledJobs.length;
-        let statusText = `🖥 <b>Статус:</b><br>⏱ Uptime: <b>${Math.floor(uptime/3600)}ч ${Math.floor((uptime%3600)/60)}м</b><br>💾 Память: <b>${(mem.rss / 1024 / 1024).toFixed(1)} MB</b><br>🔒 Ghost Proxy: <b>${useProxy ? '<span style="color:green">ВКЛЮЧЕН</span>' : '<span style="color:red">ВЫКЛЮЧЕН</span>'}</b><br>🔧 Режим администратора: ${adminStatus}${adminCtx}<br>⚡ Antigravity: <b>${agMode}</b><br>📤 Доставка артефактов: ${deliveryStatus}<br>🧠 Контекст обычного чата: <b>${geminiHistory.length} сообщений</b><br>⚙️ Фоновых задач: <b>${tasksCount}</b>`;
+        let statusText = `🖥 <b>Статус:</b><br>⏱ Uptime: <b>${Math.floor(uptime/3600)}ч ${Math.floor((uptime%3600)/60)}м</b><br>💾 Память: <b>${(mem.rss / 1024 / 1024).toFixed(1)} MB</b><br>🔒 Ghost Proxy: <b>${useProxy ? '<span style="color:green">ВКЛЮЧЕН</span>' : '<span style="color:red">ВЫКЛЮЧЕН</span>'}</b><br>🔧 Режим администратора: ${adminStatus}${adminCtx}<br>⚡ Antigravity: <b>${agMode}</b><br>📤 Доставка артефактов: ${deliveryStatus}<br>📂 Папка обмена (share, /fetch): <code>${escHtmlAg(SHARE_DIR)}</code><br>🧠 Контекст обычного чата: <b>${geminiHistory.length} сообщений</b><br>⚙️ Фоновых задач: <b>${tasksCount}</b>`;
         if (cronNotificationsHtml) {
             statusText = cronNotificationsHtml + '<br>' + statusText;
         }
@@ -1703,6 +1799,7 @@ async function startServer() {
     app.listen(PORT, () => {
         console.log(`[SYSTEM] Сервер успешно запущен на порту ${PORT}`);
         console.log(`[SYSTEM] Доставка артефактов: ${ARTIFACT_DELIVERY_ENABLED ? 'ВКЛ' : 'ВЫКЛ'} | GitHub: ${GITHUB_ENABLED ? 'ВКЛ (' + GITHUB_REPO + ')' : 'ВЫКЛ'}`);
+        console.log(`[SYSTEM] Папка обмена /fetch (SHARE_DIR): ${SHARE_DIR}`);
         initAllCronJobs();
     });
 }
