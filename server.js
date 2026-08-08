@@ -49,6 +49,8 @@ let genAI = null;
 let geminiHistory = [];          // история обычного чата
 let adminMode = false;
 let adminHistory = [];           // отдельная история для режима администратора
+let githubHistory = [];          // история сессии /github (для продолжения после лимита итераций)
+let githubSessionActive = false; // true, если предыдущий /github не завершил задачу (лимит/ошибка)
 // ==========================================
 // ANTIGRAVITY: состояние multi-turn + режим выполнения
 // ==========================================
@@ -396,9 +398,205 @@ async function githubOps(args) {
             }, null, 2);
         }
 
+        // ---------- GitHub Actions ----------
+        const actionsBase = `https://api.github.com/repos/${GITHUB_REPO}/actions`;
+
+        if (action === 'list_workflows') {
+            const resp = await axios.get(`${actionsBase}/workflows?per_page=50`, {
+                headers: githubApiHeaders(), timeout: 30000
+            });
+            const workflows = (resp.data.workflows || []).map(w => ({
+                id: w.id,
+                name: w.name,
+                path: w.path,
+                state: w.state,
+                html_url: w.html_url
+            }));
+            return JSON.stringify({ ok: true, count: workflows.length, workflows }, null, 2);
+        }
+
+        if (action === 'trigger_workflow') {
+            // workflow_id — числовой id или имя файла (build-esp32s3.yml / build-esp32s3.yaml)
+            let workflowId = args.workflow_id || args.workflow || args.path;
+            if (!workflowId) {
+                return JSON.stringify({ ok: false, error: 'Нужен workflow_id (id или имя файла .yml)' });
+            }
+            workflowId = String(workflowId);
+            const ref = branch;
+            const inputs = (args.inputs && typeof args.inputs === 'object') ? args.inputs : undefined;
+            const body = { ref };
+            if (inputs) body.inputs = inputs;
+            const url = `${actionsBase}/workflows/${encodeURIComponent(workflowId)}/dispatches`;
+            await axios.post(url, body, { headers: githubApiHeaders(), timeout: 30000 });
+            return JSON.stringify({
+                ok: true,
+                triggered: true,
+                workflow: workflowId,
+                ref,
+                note: 'Dispatch принят (HTTP 204). Через 5–15 сек появится run — используй list_runs.'
+            }, null, 2);
+        }
+
+        if (action === 'list_runs') {
+            const params = new URLSearchParams();
+            params.set('per_page', String(Math.min(parseInt(args.per_page, 10) || 10, 30)));
+            if (args.workflow_id || args.workflow) params.set('path', ''); // filtered below if needed
+            if (branch) params.set('branch', branch);
+            if (args.status) params.set('status', String(args.status)); // queued|in_progress|completed
+            let url = `${actionsBase}/runs?${params.toString()}`;
+            if (args.workflow_id || args.workflow) {
+                const wf = encodeURIComponent(String(args.workflow_id || args.workflow));
+                url = `${actionsBase}/workflows/${wf}/runs?per_page=${params.get('per_page')}`;
+                if (branch) url += `&branch=${encodeURIComponent(branch)}`;
+                if (args.status) url += `&status=${encodeURIComponent(String(args.status))}`;
+            }
+            const resp = await axios.get(url, { headers: githubApiHeaders(), timeout: 30000 });
+            const runs = (resp.data.workflow_runs || []).map(r => ({
+                id: r.id,
+                name: r.name,
+                status: r.status,
+                conclusion: r.conclusion,
+                event: r.event,
+                head_branch: r.head_branch,
+                html_url: r.html_url,
+                created_at: r.created_at,
+                updated_at: r.updated_at,
+                artifacts_url: r.artifacts_url
+            }));
+            return JSON.stringify({ ok: true, total_count: resp.data.total_count, runs }, null, 2);
+        }
+
+        if (action === 'list_artifacts') {
+            let url;
+            if (args.run_id) {
+                url = `${actionsBase}/runs/${encodeURIComponent(String(args.run_id))}/artifacts?per_page=30`;
+            } else {
+                url = `${actionsBase}/artifacts?per_page=20`;
+            }
+            const resp = await axios.get(url, { headers: githubApiHeaders(), timeout: 30000 });
+            const artifacts = (resp.data.artifacts || []).map(a => ({
+                id: a.id,
+                name: a.name,
+                size_in_bytes: a.size_in_bytes,
+                expired: a.expired,
+                created_at: a.created_at,
+                workflow_run: a.workflow_run ? { id: a.workflow_run.id, head_branch: a.workflow_run.head_branch } : null,
+                archive_download_url: a.archive_download_url
+            }));
+            return JSON.stringify({ ok: true, total_count: resp.data.total_count, artifacts }, null, 2);
+        }
+
+        if (action === 'download_artifact') {
+            const artifactId = args.artifact_id || args.id;
+            if (!artifactId) {
+                return JSON.stringify({ ok: false, error: 'Нужен artifact_id (из list_artifacts)' });
+            }
+            // GitHub отдаёт 302 на временный URL архива (zip)
+            const metaUrl = `${actionsBase}/artifacts/${encodeURIComponent(String(artifactId))}/zip`;
+            const resp = await axios.get(metaUrl, {
+                headers: githubApiHeaders(),
+                responseType: 'arraybuffer',
+                timeout: 180000,
+                maxContentLength: 100 * 1024 * 1024,
+                maxRedirects: 5
+            });
+            const zipName = `artifact_${artifactId}.zip`;
+            const savePath = args.local_path
+                ? String(args.local_path)
+                : path.join(TMP_DIR, zipName);
+            fs.mkdirSync(path.dirname(savePath), { recursive: true });
+            fs.writeFileSync(savePath, Buffer.from(resp.data));
+            const st = fs.statSync(savePath);
+
+            // Попытка распаковать, если есть unzip
+            let extracted = [];
+            let extractDir = null;
+            try {
+                extractDir = path.join(TMP_DIR, `artifact_${artifactId}_unpacked`);
+                fs.mkdirSync(extractDir, { recursive: true });
+                await execPromise(`unzip -o -q "${savePath}" -d "${extractDir}"`, { timeout: 60000 });
+                const walk = (dir, base = '') => {
+                    for (const name of fs.readdirSync(dir)) {
+                        const full = path.join(dir, name);
+                        const rel = base ? `${base}/${name}` : name;
+                        if (fs.statSync(full).isDirectory()) walk(full, rel);
+                        else extracted.push({ path: full, rel, size: fs.statSync(full).size });
+                    }
+                };
+                walk(extractDir);
+            } catch (unzipErr) {
+                extracted = [];
+                extractDir = null;
+            }
+
+            // Если просили конкретный файл (например firmware.bin) — найти и скопировать
+            let binPath = null;
+            if (args.file_name && extracted.length) {
+                const want = String(args.file_name).toLowerCase();
+                const hit = extracted.find(e => e.rel.toLowerCase().endsWith(want) || path.basename(e.rel).toLowerCase() === want);
+                if (hit) {
+                    binPath = path.join(TMP_DIR, path.basename(hit.rel).replace(/[^a-zA-Z0-9.\-_]/g, '_'));
+                    fs.copyFileSync(hit.path, binPath);
+                }
+            } else if (extracted.length === 1) {
+                binPath = path.join(TMP_DIR, path.basename(extracted[0].rel).replace(/[^a-zA-Z0-9.\-_]/g, '_'));
+                fs.copyFileSync(extracted[0].path, binPath);
+            } else if (extracted.length) {
+                const binHit = extracted.find(e => /\.(bin|elf|hex|uf2)$/i.test(e.rel));
+                if (binHit) {
+                    binPath = path.join(TMP_DIR, path.basename(binHit.rel).replace(/[^a-zA-Z0-9.\-_]/g, '_'));
+                    fs.copyFileSync(binHit.path, binPath);
+                }
+            }
+
+            return JSON.stringify({
+                ok: true,
+                zip_path: savePath,
+                zip_size: st.size,
+                extract_dir: extractDir,
+                files: extracted.map(e => ({ rel: e.rel, path: e.path, size: e.size })),
+                bin_path: binPath,
+                note: binPath
+                    ? `Готовый файл: ${binPath} — можно отправить через send_file_to_telegram`
+                    : 'Архив скачан. Укажите file_name для извлечения конкретного файла или используйте zip_path.'
+            }, null, 2);
+        }
+
+        if (action === 'wait_run') {
+            // Опрос статуса run до completed или таймаута (сек)
+            const runId = args.run_id;
+            if (!runId) return JSON.stringify({ ok: false, error: 'Нужен run_id' });
+            const timeoutSec = Math.min(parseInt(args.timeout_sec, 10) || 180, 300);
+            const intervalSec = Math.min(parseInt(args.interval_sec, 10) || 8, 30);
+            const deadline = Date.now() + timeoutSec * 1000;
+            let last = null;
+            while (Date.now() < deadline) {
+                const resp = await axios.get(`${actionsBase}/runs/${encodeURIComponent(String(runId))}`, {
+                    headers: githubApiHeaders(), timeout: 20000
+                });
+                last = {
+                    id: resp.data.id,
+                    status: resp.data.status,
+                    conclusion: resp.data.conclusion,
+                    html_url: resp.data.html_url,
+                    updated_at: resp.data.updated_at
+                };
+                if (resp.data.status === 'completed') {
+                    return JSON.stringify({ ok: true, finished: true, run: last }, null, 2);
+                }
+                await new Promise(r => setTimeout(r, intervalSec * 1000));
+            }
+            return JSON.stringify({
+                ok: true,
+                finished: false,
+                run: last,
+                note: `Таймаут ${timeoutSec}с — run ещё не completed. Вызови wait_run или list_runs снова.`
+            }, null, 2);
+        }
+
         return JSON.stringify({
             ok: false,
-            error: `Неизвестное action: ${action}. Допустимо: status, list, get, put, delete, download_to_server, create_artifact`
+            error: `Неизвестное action: ${action}. Допустимо: status, list, get, put, delete, download_to_server, create_artifact, list_workflows, trigger_workflow, list_runs, list_artifacts, download_artifact, wait_run`
         });
     } catch (err) {
         const status = err.response && err.response.status;
@@ -1141,9 +1339,11 @@ ${deliveryHint}
     if (userText === '/admin off') {
         adminMode = false;
         adminHistory = [];
+        githubHistory = [];
+        githubSessionActive = false;
         adminAntigravityPrevId = null; adminAntigravityEnvId = null;
         console.log("[ADMIN] Режим администратора ОТКЛЮЧЕН.");
-        return res.json({ ok: true, text: "🛑 <b>Режим администратора отключен.</b>" });
+        return res.json({ ok: true, text: "🛑 <b>Режим администратора отключен.</b> Сессия /github также сброшена." });
     }
     // Режим выполнения Antigravity: async (фон) / sync (ожидание)
     if (userText === '/ag_async on' || userText === '/ag_async off') {
@@ -1302,20 +1502,35 @@ ${deliveryHint}
             return res.json({ ok: true, text: "⚠️ Сначала включите режим администратора: <code>/admin on</code>, затем повторите <code>/github …</code>." });
         }
         const ghTask = userText.replace(/^\/github\s*/i, '').trim();
+        // Сброс сессии GitHub
+        if (/^(clear|reset|новый|сброс)$/i.test(ghTask)) {
+            githubHistory = [];
+            githubSessionActive = false;
+            return res.json({ ok: true, text: "🧹 <b>Сессия /github очищена.</b> Следующий <code>/github …</code> начнётся с нуля." });
+        }
         if (!ghTask) {
+            const sess = githubHistory.length
+                ? `💾 Активная сессия: <b>${githubHistory.length}</b> сообщ.${githubSessionActive ? ' (ожидает продолжения после лимита)' : ''}<br>` +
+                  `Продолжить: <code>/github продолжай</code> · Сброс: <code>/github clear</code><br><br>`
+                : `Сессия пуста — новый диалог начнётся с первого запроса.<br><br>`;
             return res.json({
                 ok: true,
-                text: `📦 <b>GitHub-инструмент</b> (${GITHUB_ENABLED ? 'настроен: <code>' + GITHUB_REPO + '</code>' : '<span style="color:red">НЕ настроен</span>'})<br><br>` +
+                text: `📦 <b>GitHub-инструмент</b> (${GITHUB_ENABLED ? 'настроен: <code>' + GITHUB_REPO + '</code>' : '<span style="color:red">НЕ настроен</span>'})<br>` +
+                    sess +
                     `Использование: <code>/github [что сделать]</code><br>` +
                     `Примеры:<br>` +
-                    `• <code>/github покажи содержимое корня репозитория</code><br>` +
-                    `• <code>/github создай файл docs/hello.md с текстом Hello World</code><br>` +
-                    `• <code>/github скачай artifacts/app.bin на сервер в /tmp</code><br>` +
-                    `• <code>/github загрузи /tmp/build.zip как артефакт в репозиторий</code><br><br>` +
-                    `Подробные инструкции подключаются только на время этой команды и не засоряют обычный контекст.`
+                    `• <code>/github покажи корень репозитория</code><br>` +
+                    `• <code>/github создай скетч ESP32-S3, workflow PlatformIO, собери, скачай .bin и пришли в Telegram</code><br>` +
+                    `• <code>/github продолжай</code> — после лимита итераций<br>` +
+                    `• <code>/github clear</code> — сбросить сессию<br><br>` +
+                    `Лимит: 50 вызовов инструментов за ход; прогресс сохраняется.`
             });
         }
-        return handleAdminMessage(ghTask, req, res, cronNotificationsHtml, { withGithub: true });
+        // «продолжай» без доп. текста — модель сама подхватит историю
+        const taskForModel = /^(продолжай|continue|далее|продолжить)$/i.test(ghTask)
+            ? 'Продолжи выполнение предыдущей задачи с того места, где остановился. Не начинай заново — используй уже сделанный прогресс из истории. Если всё уже сделано — кратко сообщи итог.'
+            : ghTask;
+        return handleAdminMessage(taskForModel, req, res, cronNotificationsHtml, { withGithub: true });
     }
     // Передаем cronNotificationsHtml в функцию администратора
     if (adminMode && userText && !userText.startsWith('/') && !userText.startsWith('!')) {
@@ -1527,13 +1742,19 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
             },
             {
                 name: "github_ops",
-                description: "Full GitHub repository operations via Contents API: list/get/put/delete files, download to server, create artifacts. Uses server env GITHUB_TOKEN/GITHUB_REPO (token is never exposed). Prefer this over raw curl/git.",
+                description: "GitHub Contents + Actions: files (list/get/put/delete), artifacts, workflows (list/trigger), runs, download Actions artifacts to /tmp. Token never exposed. Prefer this over raw curl/git.",
                 parameters: {
                     type: "OBJECT",
                     properties: {
                         action: {
                             type: "STRING",
-                            enum: ["status", "list", "get", "put", "delete", "download_to_server", "create_artifact"],
+                            enum: [
+                                "status", "list", "get", "put", "delete",
+                                "download_to_server", "create_artifact",
+                                "list_workflows", "trigger_workflow",
+                                "list_runs", "wait_run",
+                                "list_artifacts", "download_artifact"
+                            ],
                             description: "Operation to perform"
                         },
                         path: { type: "STRING", description: "Path inside the repository (no leading slash)" },
@@ -1543,24 +1764,41 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                         local_path: { type: "STRING", description: "Absolute path on this server (/tmp/...)" },
                         sha: { type: "STRING", description: "Blob SHA required for update/delete" },
                         is_binary: { type: "BOOLEAN", description: "If true, content is treated as base64" },
-                        url: { type: "STRING", description: "Optional direct download URL for download_to_server" }
+                        url: { type: "STRING", description: "Optional direct download URL for download_to_server" },
+                        workflow_id: { type: "STRING", description: "Workflow id or filename (e.g. build-esp32s3.yml) for trigger/list_runs" },
+                        workflow: { type: "STRING", description: "Alias for workflow_id" },
+                        run_id: { type: "STRING", description: "Workflow run id for list_artifacts / wait_run" },
+                        artifact_id: { type: "STRING", description: "Artifact id for download_artifact" },
+                        file_name: { type: "STRING", description: "Inside artifact zip: extract this file (e.g. firmware.bin)" },
+                        status: { type: "STRING", description: "Filter runs: queued|in_progress|completed" },
+                        timeout_sec: { type: "STRING", description: "wait_run timeout seconds (max 300)" },
+                        interval_sec: { type: "STRING", description: "wait_run poll interval seconds" },
+                        per_page: { type: "STRING", description: "Pagination for list_runs" }
                     },
                     required: ["action"]
                 }
             }
         ]
     }];
-    // При /github не тащим всю adminHistory с лишним шумом — даём свежий контекст + github.md
-    const historyForChat = withGithub
-        ? [
-            { role: "user", parts: [{ text: "Инструкции администратора + GitHub" }] },
-            { role: "model", parts: [{ text: (adminSystemPrompt || "") + (githubSystemPrompt ? "\n\n" + githubSystemPrompt : "") }] }
-          ]
-        : adminHistory;
+    // /github: продолжаем сохранённую сессию, если она есть; иначе стартуем с github.md
+    let historyForChat;
+    if (withGithub) {
+        if (githubHistory && githubHistory.length > 0) {
+            historyForChat = githubHistory;
+            console.log(`[GITHUB] Продолжение сессии: ${githubHistory.length} сообщений в истории`);
+        } else {
+            historyForChat = [
+                { role: "user", parts: [{ text: "Инструкции администратора + GitHub" }] },
+                { role: "model", parts: [{ text: (adminSystemPrompt || "") + (githubSystemPrompt ? "\n\n" + githubSystemPrompt : "") }] }
+            ];
+        }
+    } else {
+        historyForChat = adminHistory;
+    }
     const chat = model.startChat({ history: historyForChat, tools: tools });
     const executedCommands = [];
     let iterations = 0;
-    const maxIterations = 10;
+    const maxIterations = withGithub ? 50 : 50; // admin / github: до 50 вызовов инструментов за один ход
     try {
         let result = await chat.sendMessage(userText);
         while (result.response && result.response.candidates && result.response.candidates[0]) {
@@ -1778,10 +2016,16 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                     });
                     finalText += `\n</details>`;
                 }
-                // /github использует изолированную историю — не засоряем основной adminHistory
-                if (!withGithub) {
-                    adminHistory = await chat.getHistory();
-                }
+                // Сохраняем историю: admin → adminHistory; github → githubHistory (для /github continue)
+                try {
+                    const hist = await chat.getHistory();
+                    if (withGithub) {
+                        githubHistory = hist;
+                        githubSessionActive = false; // задача штатно завершена
+                    } else {
+                        adminHistory = hist;
+                    }
+                } catch (_) {}
                 let finalResponseText = finalText;
                 if (cronNotificationsHtml) {
                     finalResponseText = cronNotificationsHtml + '<br>' + finalResponseText;
@@ -1790,7 +2034,21 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
             }
             iterations++;
             if (iterations >= maxIterations) {
-                let limitText = "⚠️ Достигнут лимит операций. Завершаю работу.";
+                // Сохраняем точку остановки — следующий /github продолжит с этой истории
+                try {
+                    const hist = await chat.getHistory();
+                    if (withGithub) {
+                        githubHistory = hist;
+                        githubSessionActive = true;
+                    } else {
+                        adminHistory = hist;
+                    }
+                } catch (_) {}
+                let limitText = `⚠️ <b>Достигнут лимит операций (${maxIterations}).</b> Прогресс сохранён.<br>` +
+                    (withGithub
+                        ? `Продолжите той же сессией: <code>/github продолжай</code> или <code>/github</code> + следующая инструкция.<br>` +
+                          `Сброс сессии GitHub: <code>/github clear</code>`
+                        : `Отправьте следующее сообщение в admin-режиме — контекст сохранён.`);
                 if (executedCommands.length > 0) {
                     limitText += `\n\n<details><summary>📋 <b>Терминал</b> (нажмите, чтобы развернуть)</summary>\n`;
                     executedCommands.forEach((cmd, index) => {
@@ -1798,15 +2056,13 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                     });
                     limitText += `\n</details>`;
                 }
-                if (!withGithub) {
-                    adminHistory = await chat.getHistory();
-                }
                 return res.json({ ok: true, text: limitText });
             }
         }
-        if (!withGithub) {
-            adminHistory = await chat.getHistory();
-        }
+        try {
+            const hist = await chat.getHistory();
+            if (withGithub) { githubHistory = hist; } else { adminHistory = hist; }
+        } catch (_) {}
         return res.json({ ok: true, text: "Не удалось получить ответ от ИИ." });
     } catch (err) {
         console.error("[ADMIN ERROR]", err.message);
@@ -1818,9 +2074,16 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
             });
             errorText += `\n</details>`;
         }
-        if (!withGithub) {
-            try { adminHistory = await chat.getHistory(); } catch (e) {}
-        }
+        try {
+            const hist = await chat.getHistory();
+            if (withGithub) {
+                githubHistory = hist;
+                githubSessionActive = true;
+                errorText += `<br><br>💾 Сессия GitHub сохранена — продолжите: <code>/github продолжай</code>`;
+            } else {
+                adminHistory = hist;
+            }
+        } catch (e) {}
         return res.status(500).json({ ok: false, error: errorText });
     }
 }
