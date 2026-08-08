@@ -67,6 +67,14 @@ try {
 } catch (e) {
     console.warn("[SYSTEM] admin.md не найден, используется пустой промпт");
 }
+// Инструкции GitHub (подключаются только по команде /github, чтобы не раздувать контекст)
+let githubSystemPrompt = "";
+try {
+    githubSystemPrompt = fs.readFileSync(path.join(__dirname, 'github.md'), 'utf8').trim();
+    console.log("[SYSTEM] Инструкции GitHub загружены из github.md");
+} catch (e) {
+    console.warn("[SYSTEM] github.md не найден — инструмент github_ops будет без подробных инструкций");
+}
 if (GEMINI_API_KEY) {
     genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 }
@@ -141,6 +149,262 @@ async function pushArtifactToGitHub(filePath, safeName) {
         const detail = (err.response && err.response.data && (err.response.data.message || JSON.stringify(err.response.data))) || err.message;
         console.error("[ARTIFACT][GITHUB ERROR]", detail);
         return { ok: false, reason: detail };
+    }
+}
+// ==========================================
+// GITHUB OPS — полноценная работа с репозиторием (Contents API)
+// ==========================================
+function githubApiHeaders() {
+    return {
+        'Authorization': `Bearer ${GITHUB_TOKEN}`,
+        'Accept': 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'User-Agent': 'northflank-github-ops',
+        'Content-Type': 'application/json'
+    };
+}
+function normalizeRepoPath(p) {
+    if (!p) return '';
+    return String(p).replace(/^\/+/, '').replace(/\/+/g, '/');
+}
+async function githubOps(args) {
+    const action = String(args.action || '').toLowerCase();
+    const branch = (args.branch && String(args.branch).trim()) || GITHUB_BRANCH || 'main';
+    const pathInRepo = normalizeRepoPath(args.path || '');
+
+    if (action === 'status') {
+        return JSON.stringify({
+            ok: true,
+            enabled: GITHUB_ENABLED,
+            repo: GITHUB_ENABLED ? GITHUB_REPO : null,
+            branch: GITHUB_BRANCH,
+            path_prefix: GITHUB_PATH_PREFIX,
+            contents_max_bytes: GITHUB_CONTENTS_MAX,
+            reason: GITHUB_ENABLED ? 'GitHub настроен' : 'GITHUB_TOKEN и/или GITHUB_REPO не заданы'
+        }, null, 2);
+    }
+
+    if (!GITHUB_ENABLED) {
+        return JSON.stringify({ ok: false, error: 'GitHub не настроен: нужны env GITHUB_TOKEN и GITHUB_REPO' });
+    }
+
+    const base = `https://api.github.com/repos/${GITHUB_REPO}/contents`;
+
+    try {
+        if (action === 'list') {
+            const url = pathInRepo ? `${base}/${pathInRepo}?ref=${encodeURIComponent(branch)}` : `${base}?ref=${encodeURIComponent(branch)}`;
+            const resp = await axios.get(url, { headers: githubApiHeaders(), timeout: 30000 });
+            const data = resp.data;
+            if (Array.isArray(data)) {
+                const items = data.map(f => ({
+                    name: f.name,
+                    path: f.path,
+                    type: f.type,
+                    size: f.size,
+                    sha: f.sha,
+                    html_url: f.html_url
+                }));
+                return JSON.stringify({ ok: true, branch, path: pathInRepo || '/', count: items.length, items }, null, 2);
+            }
+            // одиночный файл, если path указывает на файл
+            return JSON.stringify({
+                ok: true,
+                branch,
+                item: {
+                    name: data.name,
+                    path: data.path,
+                    type: data.type,
+                    size: data.size,
+                    sha: data.sha,
+                    html_url: data.html_url,
+                    encoding: data.encoding
+                }
+            }, null, 2);
+        }
+
+        if (action === 'get') {
+            if (!pathInRepo) return JSON.stringify({ ok: false, error: 'path обязателен для get' });
+            const url = `${base}/${pathInRepo}?ref=${encodeURIComponent(branch)}`;
+            const resp = await axios.get(url, { headers: githubApiHeaders(), timeout: 30000 });
+            const data = resp.data;
+            if (data.type === 'dir' || Array.isArray(data)) {
+                return JSON.stringify({ ok: false, error: 'path указывает на директорию — используй action=list' });
+            }
+            let textContent = null;
+            if (data.encoding === 'base64' && data.content) {
+                const buf = Buffer.from(data.content.replace(/\n/g, ''), 'base64');
+                // текстовый, если выглядит как UTF-8 без нулей
+                const sample = buf.subarray(0, Math.min(buf.length, 4096));
+                const hasNull = sample.includes(0);
+                if (!hasNull && data.size <= 512 * 1024) {
+                    try { textContent = buf.toString('utf8'); } catch (_) { textContent = null; }
+                }
+            }
+            return JSON.stringify({
+                ok: true,
+                path: data.path,
+                sha: data.sha,
+                size: data.size,
+                html_url: data.html_url,
+                download_url: data.download_url,
+                encoding: data.encoding,
+                content: textContent,
+                note: textContent === null ? 'Бинарный или слишком большой файл — content не декодирован. Используй download_to_server.' : undefined
+            }, null, 2);
+        }
+
+        if (action === 'put') {
+            if (!pathInRepo) return JSON.stringify({ ok: false, error: 'path обязателен для put' });
+            let contentB64;
+            if (args.local_path) {
+                const lp = String(args.local_path);
+                if (!fs.existsSync(lp)) return JSON.stringify({ ok: false, error: `Локальный файл не найден: ${lp}` });
+                const st = fs.statSync(lp);
+                if (st.size > GITHUB_CONTENTS_MAX) {
+                    return JSON.stringify({ ok: false, error: `Файл ${st.size} байт превышает лимит Contents API (~1 МБ)` });
+                }
+                contentB64 = fs.readFileSync(lp).toString('base64');
+            } else if (args.content !== undefined && args.content !== null) {
+                if (args.is_binary) {
+                    contentB64 = String(args.content).replace(/\s/g, '');
+                } else {
+                    contentB64 = Buffer.from(String(args.content), 'utf8').toString('base64');
+                }
+                if (Buffer.from(contentB64, 'base64').length > GITHUB_CONTENTS_MAX) {
+                    return JSON.stringify({ ok: false, error: 'Содержимое превышает лимит Contents API (~1 МБ)' });
+                }
+            } else {
+                return JSON.stringify({ ok: false, error: 'Нужен content или local_path' });
+            }
+            const body = {
+                message: (args.message && String(args.message).trim()) || `update: ${pathInRepo}`,
+                content: contentB64,
+                branch
+            };
+            if (args.sha) body.sha = String(args.sha);
+            const url = `${base}/${pathInRepo}`;
+            const resp = await axios.put(url, body, { headers: githubApiHeaders(), timeout: 60000 });
+            const c = resp.data && resp.data.content;
+            return JSON.stringify({
+                ok: true,
+                action: args.sha ? 'updated' : 'created',
+                path: c && c.path,
+                sha: c && c.sha,
+                html_url: c && c.html_url,
+                commit: resp.data && resp.data.commit && (resp.data.commit.html_url || resp.data.commit.sha)
+            }, null, 2);
+        }
+
+        if (action === 'delete') {
+            if (!pathInRepo) return JSON.stringify({ ok: false, error: 'path обязателен для delete' });
+            if (!args.sha) return JSON.stringify({ ok: false, error: 'sha обязателен для delete (получи через get/list)' });
+            const body = {
+                message: (args.message && String(args.message).trim()) || `delete: ${pathInRepo}`,
+                sha: String(args.sha),
+                branch
+            };
+            const url = `${base}/${pathInRepo}`;
+            const resp = await axios.delete(url, { headers: githubApiHeaders(), data: body, timeout: 30000 });
+            return JSON.stringify({
+                ok: true,
+                deleted: pathInRepo,
+                commit: resp.data && resp.data.commit && (resp.data.commit.html_url || resp.data.commit.sha)
+            }, null, 2);
+        }
+
+        if (action === 'download_to_server') {
+            if (!pathInRepo && !args.url) {
+                return JSON.stringify({ ok: false, error: 'Нужен path (в репо) или url' });
+            }
+            let downloadUrl = args.url ? String(args.url) : null;
+            let suggestedName = path.basename(pathInRepo) || `gh_${Date.now()}`;
+            if (!downloadUrl) {
+                const metaUrl = `${base}/${pathInRepo}?ref=${encodeURIComponent(branch)}`;
+                const meta = await axios.get(metaUrl, { headers: githubApiHeaders(), timeout: 30000 });
+                if (!meta.data || !meta.data.download_url) {
+                    return JSON.stringify({ ok: false, error: 'Не удалось получить download_url (возможно, это директория)' });
+                }
+                downloadUrl = meta.data.download_url;
+                suggestedName = meta.data.name || suggestedName;
+            }
+            const safeName = suggestedName.replace(/[^a-zA-Z0-9.\-_]/g, '_') || `gh_${Date.now()}`;
+            const savePath = args.local_path
+                ? String(args.local_path)
+                : path.join(TMP_DIR, safeName);
+            // гарантируем родительскую папку
+            fs.mkdirSync(path.dirname(savePath), { recursive: true });
+            const fileResp = await axios.get(downloadUrl, {
+                responseType: 'arraybuffer',
+                headers: { 'User-Agent': 'northflank-github-ops', 'Accept': 'application/octet-stream' },
+                timeout: 120000,
+                maxContentLength: 80 * 1024 * 1024
+            });
+            fs.writeFileSync(savePath, Buffer.from(fileResp.data));
+            const st = fs.statSync(savePath);
+            return JSON.stringify({
+                ok: true,
+                path: savePath,
+                size: st.size,
+                size_kb: +(st.size / 1024).toFixed(1),
+                source: downloadUrl.replace(/https:\/\/raw\.githubusercontent\.com\/[^/]+\/[^/]+\//, 'raw://')
+            }, null, 2);
+        }
+
+        if (action === 'create_artifact') {
+            const lp = args.local_path ? String(args.local_path) : '';
+            if (!lp || !fs.existsSync(lp)) {
+                return JSON.stringify({ ok: false, error: `local_path обязателен и должен существовать: ${lp || '(пусто)'}` });
+            }
+            const st = fs.statSync(lp);
+            if (st.size > GITHUB_CONTENTS_MAX) {
+                return JSON.stringify({ ok: false, error: `Файл ${st.size} байт превышает лимит Contents API (~1 МБ). Разбейте или используйте другой способ доставки.` });
+            }
+            const safeName = path.basename(lp).replace(/[^a-zA-Z0-9.\-_]/g, '_') || 'artifact.bin';
+            let repoPath;
+            if (pathInRepo) {
+                repoPath = pathInRepo;
+            } else {
+                const stamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').slice(0, 19);
+                const prefix = (GITHUB_PATH_PREFIX || 'artifacts/').replace(/\/+$/, '');
+                repoPath = `${prefix}/${stamp}_${safeName}`;
+            }
+            const b64 = fs.readFileSync(lp).toString('base64');
+            const body = {
+                message: (args.message && String(args.message).trim()) || `artifact: ${safeName}`,
+                content: b64,
+                branch
+            };
+            // если файл уже есть — подтянуть sha для обновления
+            try {
+                const exist = await axios.get(`${base}/${repoPath}?ref=${encodeURIComponent(branch)}`, {
+                    headers: githubApiHeaders(), timeout: 15000
+                });
+                if (exist.data && exist.data.sha) body.sha = exist.data.sha;
+            } catch (_) { /* 404 — создаём новый */ }
+            const resp = await axios.put(`${base}/${repoPath}`, body, {
+                headers: githubApiHeaders(), timeout: 60000
+            });
+            const c = resp.data && resp.data.content;
+            return JSON.stringify({
+                ok: true,
+                path: c && c.path,
+                sha: c && c.sha,
+                html_url: c && c.html_url,
+                size: st.size,
+                local_path: lp,
+                commit: resp.data && resp.data.commit && (resp.data.commit.html_url || resp.data.commit.sha)
+            }, null, 2);
+        }
+
+        return JSON.stringify({
+            ok: false,
+            error: `Неизвестное action: ${action}. Допустимо: status, list, get, put, delete, download_to_server, create_artifact`
+        });
+    } catch (err) {
+        const status = err.response && err.response.status;
+        const detail = (err.response && err.response.data && (err.response.data.message || JSON.stringify(err.response.data))) || err.message;
+        console.error('[GITHUB_OPS ERROR]', action, detail);
+        return JSON.stringify({ ok: false, status: status || null, error: detail });
     }
 }
 // ==========================================
@@ -853,7 +1117,10 @@ ${deliveryHint}
 <code>/search [запрос]</code> — Поиск в сети с помощью Tavily API<br>
 <code>/search download:[url]</code> — Прямая загрузка файла<br>
 <code>/admin on</code> — Включить режим администратора (автовыполнение команд)<br>
-<code>/admin off</code> — Выключить режим администратора<br><br>
+<code>/admin off</code> — Выключить режим администратора<br>
+<code>/github [задача]</code> — Работа с GitHub (только в режиме admin): создать/править/удалить файлы, артефакты, скачать на сервер<br>
+<i>Пример: <code>/github создай файл docs/hello.md с текстом Hello</code></i><br>
+<i>GitHub: ${GITHUB_ENABLED ? '<span style="color:green">настроен (' + GITHUB_REPO + ')</span>' : '<span style="color:red">НЕ настроен</span>'}</i><br><br>
 💻 <b>Терминал:</b><br>
 <i>Путь контейнера: <code>/usr/src/app</code></i><br>
 <code>! [команда]</code> — Консоль Linux<br>
@@ -1029,6 +1296,27 @@ ${deliveryHint}
         console.log("[GEMINI] Память контекста нейросети очищена.");
         if (userText === 'clear') return res.json({ok: true, text: "История очищена"});
     }
+    // /github — задача с подключением инструкций github.md (только в admin-режиме)
+    if (userText.startsWith('/github')) {
+        if (!adminMode) {
+            return res.json({ ok: true, text: "⚠️ Сначала включите режим администратора: <code>/admin on</code>, затем повторите <code>/github …</code>." });
+        }
+        const ghTask = userText.replace(/^\/github\s*/i, '').trim();
+        if (!ghTask) {
+            return res.json({
+                ok: true,
+                text: `📦 <b>GitHub-инструмент</b> (${GITHUB_ENABLED ? 'настроен: <code>' + GITHUB_REPO + '</code>' : '<span style="color:red">НЕ настроен</span>'})<br><br>` +
+                    `Использование: <code>/github [что сделать]</code><br>` +
+                    `Примеры:<br>` +
+                    `• <code>/github покажи содержимое корня репозитория</code><br>` +
+                    `• <code>/github создай файл docs/hello.md с текстом Hello World</code><br>` +
+                    `• <code>/github скачай artifacts/app.bin на сервер в /tmp</code><br>` +
+                    `• <code>/github загрузи /tmp/build.zip как артефакт в репозиторий</code><br><br>` +
+                    `Подробные инструкции подключаются только на время этой команды и не засоряют обычный контекст.`
+            });
+        }
+        return handleAdminMessage(ghTask, req, res, cronNotificationsHtml, { withGithub: true });
+    }
     // Передаем cronNotificationsHtml в функцию администратора
     if (adminMode && userText && !userText.startsWith('/') && !userText.startsWith('!')) {
         return handleAdminMessage(userText, req, res, cronNotificationsHtml);
@@ -1098,15 +1386,26 @@ ${deliveryHint}
 // ==========================================
 // ANTIGRAVITY В РЕЖИМЕ АДМИНИСТРАТОРА
 // ==========================================
-async function handleAntigravityAdmin(userText, req, res, cronNotificationsHtml = "") {
+async function handleAntigravityAdmin(userText, req, res, cronNotificationsHtml = "", withGithub = false) {
+    // Antigravity не имеет инструмента github_ops (он доступен только обычным Gemini-моделям в admin).
+    // При /github просто добавляем текстовые инструкции; для полноценного GitHub лучше выбрать Gemini Flash.
+    let basePrompt = adminSystemPrompt || "Ты — автономный агент-администратор. Выполняй задачу и возвращай краткий результат.";
+    if (withGithub && githubSystemPrompt) {
+        basePrompt += "\n\n=== РЕЖИМ GITHUB ===\n" + githubSystemPrompt +
+            "\n\nВАЖНО: инструмент github_ops доступен только в обычном admin-режиме (модели Gemini Flash / Lite, НЕ Antigravity). " +
+            "В Antigravity токен GitHub тебе недоступен — не пытайся его искать. Если нужна запись в репозиторий, попроси пользователя выбрать модель без Antigravity.";
+    }
     // НЕБЛОКИРУЮЩИЙ режим: мгновенная заглушка, задача в фоне
     if (antigravityNonBlocking) {
         runAntigravityInBackground({
             mode: 'admin',
             input: userText,
-            systemInstruction: getAntigravitySystemInstruction(adminSystemPrompt || "Ты — автономный агент-администратор. Выполняй задачу и возвращай краткий результат.")
+            systemInstruction: getAntigravitySystemInstruction(basePrompt)
         });
         let stub = "✅ <b>Задача Antigravity принята в фоновый режим.</b><br>Прогресс и итоговый результат появятся во входящих (📬 Планировщик). Следите за блоками прогресса — они приходят каждые ~10 секунд.";
+        if (withGithub) {
+            stub += "<br><br>ℹ️ <b>Подсказка:</b> полноценный <code>github_ops</code> работает на моделях <b>Gemini Flash / Lite</b> (не Antigravity).";
+        }
         if (cronNotificationsHtml) stub = cronNotificationsHtml + '<br>' + stub;
         return res.json({ ok: true, text: stub });
     }
@@ -1116,7 +1415,7 @@ async function handleAntigravityAdmin(userText, req, res, cronNotificationsHtml 
             input: userText,
             previousInteractionId: adminAntigravityPrevId,
             environmentId: adminAntigravityEnvId,
-            systemInstruction: getAntigravitySystemInstruction(adminSystemPrompt || "Ты — автономный агент-администратор. Выполняй задачу и возвращай краткий результат."),
+            systemInstruction: getAntigravitySystemInstruction(basePrompt),
             background: true,
             onProgress: (h) => pushProgressToInbox(h)
         });
@@ -1133,17 +1432,22 @@ async function handleAntigravityAdmin(userText, req, res, cronNotificationsHtml 
 // ==========================================
 // АВТОНОМНЫЙ АДМИНИСТРАТОР С ИНСТРУМЕНТАМИ
 // ==========================================
-async function handleAdminMessage(userText, req, res, cronNotificationsHtml = "") {
+async function handleAdminMessage(userText, req, res, cronNotificationsHtml = "", options = {}) {
     if (!GEMINI_API_KEY) return res.status(500).json({ok: false, error: "Отсутствует GEMINI_API_KEY"});
     const preferredModel = req.body.model || "gemini-2.5-flash";
+    const withGithub = !!(options && options.withGithub);
     // --- Antigravity: агент работает через Interactions API со своими инструментами ---
     if (isAntigravityModel(preferredModel)) {
-        return handleAntigravityAdmin(userText, req, res, cronNotificationsHtml);
+        return handleAntigravityAdmin(userText, req, res, cronNotificationsHtml, withGithub);
     }
     const isGemma = preferredModel.toLowerCase().includes('gemma');
     const modelConfig = { model: preferredModel };
     if (!isGemma) {
-        modelConfig.systemInstruction = adminSystemPrompt || "Ты полезный администратор сервера...";
+        let sys = adminSystemPrompt || "Ты полезный администратор сервера...";
+        if (withGithub && githubSystemPrompt) {
+            sys = sys + "\n\n=== РЕЖИМ GITHUB (активен для этой задачи) ===\n" + githubSystemPrompt;
+        }
+        modelConfig.systemInstruction = sys;
     }
     const model = genAI.getGenerativeModel(modelConfig);
     const tools = [{
@@ -1220,10 +1524,40 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                     },
                     required: ["action"]
                 }
+            },
+            {
+                name: "github_ops",
+                description: "Full GitHub repository operations via Contents API: list/get/put/delete files, download to server, create artifacts. Uses server env GITHUB_TOKEN/GITHUB_REPO (token is never exposed). Prefer this over raw curl/git.",
+                parameters: {
+                    type: "OBJECT",
+                    properties: {
+                        action: {
+                            type: "STRING",
+                            enum: ["status", "list", "get", "put", "delete", "download_to_server", "create_artifact"],
+                            description: "Operation to perform"
+                        },
+                        path: { type: "STRING", description: "Path inside the repository (no leading slash)" },
+                        content: { type: "STRING", description: "Full text content for put (UTF-8). For binary prefer local_path" },
+                        message: { type: "STRING", description: "Commit message" },
+                        branch: { type: "STRING", description: "Branch name (default from env)" },
+                        local_path: { type: "STRING", description: "Absolute path on this server (/tmp/...)" },
+                        sha: { type: "STRING", description: "Blob SHA required for update/delete" },
+                        is_binary: { type: "BOOLEAN", description: "If true, content is treated as base64" },
+                        url: { type: "STRING", description: "Optional direct download URL for download_to_server" }
+                    },
+                    required: ["action"]
+                }
             }
         ]
     }];
-    const chat = model.startChat({ history: adminHistory, tools: tools });
+    // При /github не тащим всю adminHistory с лишним шумом — даём свежий контекст + github.md
+    const historyForChat = withGithub
+        ? [
+            { role: "user", parts: [{ text: "Инструкции администратора + GitHub" }] },
+            { role: "model", parts: [{ text: (adminSystemPrompt || "") + (githubSystemPrompt ? "\n\n" + githubSystemPrompt : "") }] }
+          ]
+        : adminHistory;
+    const chat = model.startChat({ history: historyForChat, tools: tools });
     const executedCommands = [];
     let iterations = 0;
     const maxIterations = 10;
@@ -1418,6 +1752,19 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                     console.log(`[ADMIN] manage_cron_tasks: ${execResult}`);
                     const funcResponse = { name: call.name, response: { result: execResult } };
                     result = await chat.sendMessage([{ functionResponse: funcResponse }]);
+                } else if (call.name === "github_ops") {
+                    console.log(`[ADMIN] github_ops: action=${call.args && call.args.action}`);
+                    let ghResult;
+                    try {
+                        ghResult = await githubOps(call.args || {});
+                    } catch (err) {
+                        ghResult = JSON.stringify({ ok: false, error: err.message });
+                    }
+                    // не светим токен даже если модель вдруг попросила env
+                    ghResult = maskSecrets(ghResult);
+                    console.log(`[ADMIN] github_ops result: ${String(ghResult).substring(0, 300)}`);
+                    const funcResponse = { name: call.name, response: { result: ghResult } };
+                    result = await chat.sendMessage([{ functionResponse: funcResponse }]);
                 } else {
                     console.log("[ADMIN] Неизвестная функция:", call.name);
                     break;
@@ -1431,7 +1778,10 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                     });
                     finalText += `\n</details>`;
                 }
-                adminHistory = await chat.getHistory();
+                // /github использует изолированную историю — не засоряем основной adminHistory
+                if (!withGithub) {
+                    adminHistory = await chat.getHistory();
+                }
                 let finalResponseText = finalText;
                 if (cronNotificationsHtml) {
                     finalResponseText = cronNotificationsHtml + '<br>' + finalResponseText;
@@ -1448,11 +1798,15 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                     });
                     limitText += `\n</details>`;
                 }
-                adminHistory = await chat.getHistory();
+                if (!withGithub) {
+                    adminHistory = await chat.getHistory();
+                }
                 return res.json({ ok: true, text: limitText });
             }
         }
-        adminHistory = await chat.getHistory();
+        if (!withGithub) {
+            adminHistory = await chat.getHistory();
+        }
         return res.json({ ok: true, text: "Не удалось получить ответ от ИИ." });
     } catch (err) {
         console.error("[ADMIN ERROR]", err.message);
@@ -1464,7 +1818,9 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
             });
             errorText += `\n</details>`;
         }
-        try { adminHistory = await chat.getHistory(); } catch (e) {}
+        if (!withGithub) {
+            try { adminHistory = await chat.getHistory(); } catch (e) {}
+        }
         return res.status(500).json({ ok: false, error: errorText });
     }
 }
