@@ -1046,78 +1046,79 @@ function decodeBuffer(buffer, contentType) {
         return buffer.toString('utf-8');
     }
 }
-// ==========================================
-// ТЕЛЕМЕТРИЯ ЛИМИТОВ + ПАТЧ СОВМЕСТИМОСТИ МОДЕЛЕЙ
-// ==========================================
+// ============================================================
+// ТЕЛЕМЕТРИЯ ЛИМИТОВ + ПАТЧ СОВМЕСТИМОСТИ МОДЕЛЕЙ + ФИКС KEEP-ALIVE
+// ============================================================
 const LIMITS_FILE = path.join(TMP_DIR, 'gemini_limits.json');
 let geminiLimits = {};
 if (fs.existsSync(LIMITS_FILE)) {
     try { geminiLimits = JSON.parse(fs.readFileSync(LIMITS_FILE, 'utf8')); } catch(e){}
 }
+
 const originalFetch = global.fetch;
 global.fetch = async (input, init) => {
-    // ============================================================
-    // ПАТЧ СОВМЕСТИМОСТИ: Gemini 3.5 Flash Lite / 3.6 Flash и новее
-    // Эти модели не принимают роль 'function'. SDK всё ещё пакует
-    // functionResponse в role:'function' — на лету переписываем в 'user'.
-    // ============================================================
-    let patchedInit = init;
+    let patchedInit = { ...init };
+    let modelIdForLimits = null; 
+
     try {
         const urlStr = typeof input === 'string' ? input : (input && input.url ? input.url : '');
-        if (urlStr && urlStr.includes('generativelanguage.googleapis.com') &&
-            init && init.body && typeof init.body === 'string') {
-            const parsed = JSON.parse(init.body);
-            let changed = false;
-            if (Array.isArray(parsed.contents)) {
-                for (const c of parsed.contents) {
-                    if (c && c.role === 'function') { c.role = 'user'; changed = true; }
-                }
-            }
-            if (changed) {
-                const newBody = JSON.stringify(parsed);
-                let newHeaders = init.headers;
-                try {
-                    const h = new Headers(init.headers || {});
-                    h.set('content-length', Buffer.byteLength(newBody, 'utf8').toString());
-                    newHeaders = h;
-                } catch (_) {
-                    if (init.headers && typeof init.headers === 'object') {
-                        newHeaders = { ...init.headers };
-                        newHeaders['content-length'] = Buffer.byteLength(newBody, 'utf8').toString();
-                        delete newHeaders['Content-Length'];
+        if (urlStr && urlStr.includes('generativelanguage.googleapis.com')) {
+            
+            // --- Подготовка заголовков ---
+            const newHeaders = new Headers(init ? init.headers : {});
+            
+            // 1. ФИКС СЕТИ (Apply.build Keep-Alive Drop)
+            // Принудительно закрываем соединение, чтобы Node.js не пытался 
+            // использовать "мертвые" сокеты из пула при следующих запросах.
+            newHeaders.set('Connection', 'close');
+
+            // 2. ФИКС РОЛЕЙ И CONTENT-LENGTH (Gemini 3.5/3.6)
+            if (init && init.body && typeof init.body === 'string') {
+                const parsed = JSON.parse(init.body);
+                let changed = false;
+                if (Array.isArray(parsed.contents)) {
+                    for (const c of parsed.contents) {
+                        if (c && c.role === 'function') { c.role = 'user'; changed = true; }
                     }
                 }
-                patchedInit = { ...init, body: newBody, headers: newHeaders };
+                if (changed) {
+                    const newBody = JSON.stringify(parsed);
+                    patchedInit.body = newBody;
+                    // Актуализируем вес, чтобы строгий роутер не блокировал пакет
+                    newHeaders.set('content-length', Buffer.byteLength(newBody, 'utf8').toString());
+                }
             }
+            patchedInit.headers = newHeaders;
+
+            // Вытягиваем ID модели для нижнего блока телеметрии
+            const match = urlStr.match(/models\/([^:]+)(?::generateContent|:streamGenerateContent)/);
+            if (match && match[1]) modelIdForLimits = match[1];
         }
-    } catch (e) { /* если тело не JSON — шлём как есть */ }
+    } catch (e) {
+        console.error("[FETCH PATCH ERROR]", e.message);
+    }
 
     const response = await originalFetch(input, patchedInit);
 
     // --- телеметрия лимитов ---
-    let url = typeof input === 'string' ? input : (input && input.url ? input.url : '');
-    if (url && url.includes('generativelanguage.googleapis.com/v1beta/models/')) {
-        const match = url.match(/models\/([^:]+)(?::generateContent|:streamGenerateContent)/);
-        if (match && match[1]) {
-            const modelId = match[1];
-            if (response.status === 429) {
-                try {
-                    const data = await response.clone().json();
-                    let limit = '?'; let reset = '?';
-                    if (data.error && data.error.details) {
-                        const quotaFailure = data.error.details.find(d => d['@type'] === 'type.googleapis.com/google.rpc.QuotaFailure');
-                        const retryInfo = data.error.details.find(d => d['@type'] === 'type.googleapis.com/google.rpc.RetryInfo');
-                        if (quotaFailure && quotaFailure.violations && quotaFailure.violations.length > 0) limit = quotaFailure.violations[0].quotaValue || '?';
-                        if (retryInfo) reset = retryInfo.retryDelay || '?';
-                    }
-                    geminiLimits[modelId] = { status: 'БЛОКИРОВКА (429)', limit: limit, reset: reset, lastUpdated: getKyivTime() };
-                    fs.writeFileSync(LIMITS_FILE, JSON.stringify(geminiLimits, null, 2));
-                } catch(e) {}
-            } else if (response.status === 200) {
-                if (!geminiLimits[modelId] || geminiLimits[modelId].status !== 'OK') {
-                    geminiLimits[modelId] = { status: 'OK', limit: geminiLimits[modelId] ? geminiLimits[modelId].limit : 'Скрыто', reset: '-', lastUpdated: getKyivTime() };
-                    fs.writeFileSync(LIMITS_FILE, JSON.stringify(geminiLimits, null, 2));
+    if (modelIdForLimits) {
+        if (response.status === 429) {
+            try {
+                const data = await response.clone().json();
+                let limit = '?'; let reset = '?';
+                if (data.error && data.error.details) {
+                    const quotaFailure = data.error.details.find(d => d['@type'] === 'type.googleapis.com/google.rpc.QuotaFailure');
+                    const retryInfo = data.error.details.find(d => d['@type'] === 'type.googleapis.com/google.rpc.RetryInfo');
+                    if (quotaFailure && quotaFailure.violations && quotaFailure.violations.length > 0) limit = quotaFailure.violations[0].quotaValue || '?';
+                    if (retryInfo) reset = retryInfo.retryDelay || '?';
                 }
+                geminiLimits[modelIdForLimits] = { status: 'БЛОКИРОВКА (429)', limit: limit, reset: reset, lastUpdated: getKyivTime() };
+                fs.writeFileSync(LIMITS_FILE, JSON.stringify(geminiLimits, null, 2));
+            } catch(e) {}
+        } else if (response.status === 200) {
+            if (!geminiLimits[modelIdForLimits] || geminiLimits[modelIdForLimits].status !== 'OK') {
+                geminiLimits[modelIdForLimits] = { status: 'OK', limit: geminiLimits[modelIdForLimits] ? geminiLimits[modelIdForLimits].limit : 'Скрыто', reset: '-', lastUpdated: getKyivTime() };
+                fs.writeFileSync(LIMITS_FILE, JSON.stringify(geminiLimits, null, 2));
             }
         }
     }
