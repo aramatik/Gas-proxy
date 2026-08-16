@@ -92,7 +92,6 @@ function maskSecrets(s) {
 // ==========================================
 // ГИБРИД: системная инструкция и футер для Antigravity
 // ==========================================
-// Добавляет в промпт агенту инструкцию по загрузке артефакта на сервер (только если гибрид настроен).
 function getAntigravitySystemInstruction(basePrompt) {
     let extra = "";
     if (ARTIFACT_DELIVERY_ENABLED) {
@@ -104,7 +103,6 @@ function getAntigravitySystemInstruction(basePrompt) {
     }
     return (basePrompt || "") + extra;
 }
-// Честная приписка про то, где физически лежит файл.
 function buildAntigravityFooter() {
     if (ARTIFACT_DELIVERY_ENABLED) {
         return `\n\n<i>ℹ️ Antigravity выполняет код в собственном sandbox Google.</i><br>` +
@@ -125,7 +123,6 @@ async function pushArtifactToGitHub(filePath, safeName) {
             return { ok: false, reason: `Файл ${stat.size} байт превышает лимит GitHub Contents API (~1 МБ)` };
         }
         const b64 = fs.readFileSync(filePath).toString('base64');
-        // Уникальный путь с таймштампом Kyiv — избегаем конфликтов sha и перезаписи
         const stamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').slice(0, 19);
         const prefix = GITHUB_PATH_PREFIX.replace(/\/+$/, '');
         const repoPath = `${prefix}/${stamp}_${safeName}`;
@@ -208,7 +205,6 @@ async function githubOps(args) {
                 }));
                 return JSON.stringify({ ok: true, branch, path: pathInRepo || '/', count: items.length, items }, null, 2);
             }
-            // одиночный файл, если path указывает на файл
             return JSON.stringify({
                 ok: true,
                 branch,
@@ -235,7 +231,6 @@ async function githubOps(args) {
             let textContent = null;
             if (data.encoding === 'base64' && data.content) {
                 const buf = Buffer.from(data.content.replace(/\n/g, ''), 'base64');
-                // текстовый, если выглядит как UTF-8 без нулей
                 const sample = buf.subarray(0, Math.min(buf.length, 4096));
                 const hasNull = sample.includes(0);
                 if (!hasNull && data.size <= 512 * 1024) {
@@ -333,7 +328,6 @@ async function githubOps(args) {
             const savePath = args.local_path
                 ? String(args.local_path)
                 : path.join(TMP_DIR, safeName);
-            // гарантируем родительскую папку
             fs.mkdirSync(path.dirname(savePath), { recursive: true });
             const fileResp = await axios.get(downloadUrl, {
                 responseType: 'arraybuffer',
@@ -376,7 +370,6 @@ async function githubOps(args) {
                 content: b64,
                 branch
             };
-            // если файл уже есть — подтянуть sha для обновления
             try {
                 const exist = await axios.get(`${base}/${repoPath}?ref=${encodeURIComponent(branch)}`, {
                     headers: githubApiHeaders(), timeout: 15000
@@ -398,7 +391,6 @@ async function githubOps(args) {
             }, null, 2);
         }
 
-        // ---------- GitHub Actions ----------
         const actionsBase = `https://api.github.com/repos/${GITHUB_REPO}/actions`;
 
         if (action === 'list_workflows') {
@@ -416,7 +408,6 @@ async function githubOps(args) {
         }
 
         if (action === 'trigger_workflow') {
-            // workflow_id — числовой id или имя файла (build-esp32s3.yml / build-esp32s3.yaml)
             let workflowId = args.workflow_id || args.workflow || args.path;
             if (!workflowId) {
                 return JSON.stringify({ ok: false, error: 'Нужен workflow_id (id или имя файла .yml)' });
@@ -440,9 +431,9 @@ async function githubOps(args) {
         if (action === 'list_runs') {
             const params = new URLSearchParams();
             params.set('per_page', String(Math.min(parseInt(args.per_page, 10) || 10, 30)));
-            if (args.workflow_id || args.workflow) params.set('path', ''); // filtered below if needed
+            if (args.workflow_id || args.workflow) params.set('path', ''); 
             if (branch) params.set('branch', branch);
-            if (args.status) params.set('status', String(args.status)); // queued|in_progress|completed
+            if (args.status) params.set('status', String(args.status)); 
             let url = `${actionsBase}/runs?${params.toString()}`;
             if (args.workflow_id || args.workflow) {
                 const wf = encodeURIComponent(String(args.workflow_id || args.workflow));
@@ -491,7 +482,6 @@ async function githubOps(args) {
             if (!artifactId) {
                 return JSON.stringify({ ok: false, error: 'Нужен artifact_id (из list_artifacts)' });
             }
-            // GitHub отдаёт 302 на временный URL архива (zip)
             const metaUrl = `${actionsBase}/artifacts/${encodeURIComponent(String(artifactId))}/zip`;
             const resp = await axios.get(metaUrl, {
                 headers: githubApiHeaders(),
@@ -508,7 +498,6 @@ async function githubOps(args) {
             fs.writeFileSync(savePath, Buffer.from(resp.data));
             const st = fs.statSync(savePath);
 
-            // Попытка распаковать, если есть unzip
             let extracted = [];
             let extractDir = null;
             try {
@@ -529,7 +518,6 @@ async function githubOps(args) {
                 extractDir = null;
             }
 
-            // Если просили конкретный файл (например firmware.bin) — найти и скопировать
             let binPath = null;
             if (args.file_name && extracted.length) {
                 const want = String(args.file_name).toLowerCase();
@@ -563,7 +551,6 @@ async function githubOps(args) {
         }
 
         if (action === 'wait_run') {
-            // Опрос статуса run до completed или таймаута (сек)
             const runId = args.run_id;
             if (!runId) return JSON.stringify({ ok: false, error: 'Нужен run_id' });
             const timeoutSec = Math.min(parseInt(args.timeout_sec, 10) || 180, 300);
@@ -631,11 +618,9 @@ function extractAntigravityText(interaction) {
     }
     return parts.join('\n') || '[Antigravity не вернул текстового ответа]';
 }
-// --- Хелперы прогресса Antigravity ---
 function escHtmlAg(s) {
     return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
-// Устойчивый парсер шагов: распознаёт реальные типы Antigravity (code_execution_*, thought).
 function describeAntigravityStep(step, idx) {
     if (!step || typeof step !== 'object') return `⚙️ Шаг ${idx + 1}`;
     const type = String(step.type || step.role || '').toLowerCase();
@@ -673,11 +658,9 @@ function describeAntigravityStep(step, idx) {
     }
     return `⚙️ <b>Antigravity:</b> шаг ${idx + 1}${type ? ' (' + escHtmlAg(type) + ')' : ''}`;
 }
-// Лёгкий push прогресса в inbox БЕЗ записи на диск.
 function pushProgressToInbox(html) {
     messageInbox.push({ time: getKyivTime(), text: html });
 }
-// --- Вызов агента: устойчивые таймауты + прогресс + heartbeat ---
 async function callAntigravityAgent(opts) {
     const url = 'https://generativelanguage.googleapis.com/v1beta/interactions';
     const headers = { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY };
@@ -703,7 +686,7 @@ async function callAntigravityAgent(opts) {
     if (background) {
         const maxWaitMs = 10 * 60 * 1000;
         const intervalMs = 3000;
-        const heartbeatIntervalMs = 30000;   // API не отдаёт шаги во время in_progress — шлём индикацию
+        const heartbeatIntervalMs = 30000;  
         const start = Date.now();
         let lastActivityTime = Date.now();
         let consecutiveErrors = 0;
@@ -739,7 +722,6 @@ async function callAntigravityAgent(opts) {
                 }
             }
         }
-        // добиваем шаги из финального interaction (API отдаёт их только при завершении)
         if (interaction) {
             const steps = Array.isArray(interaction.steps) ? interaction.steps : [];
             if (steps.length > processedSteps) {
@@ -766,9 +748,6 @@ async function callAntigravityAgent(opts) {
         text: extractAntigravityText(interaction)
     };
 }
-// ==========================================
-// ANTIGRAVITY: НЕБЛОКИРУЮЩИЙ ФОНОВЫЙ ЗАПУСК
-// ==========================================
 function runAntigravityInBackground(opts) {
     const mode = opts.mode;
     (async () => {
@@ -802,7 +781,7 @@ async function getCronPattern(humanText) {
     const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
     const result = await model.generateContent("Переведи фразу строго в стандартный cron-pattern из 5 параметров (минуты, часы, день, месяц, день недели). Верни ТОЛЬКО строку, например '*/2 * * * *'. Никаких других символов. Фраза: " + humanText);
     let pattern = result.response.text().trim();
-    if (!cron.validate(pattern)) return "*/5 * * * *"; // fallback
+    if (!cron.validate(pattern)) return "*/5 * * * *"; 
     return pattern;
 }
 // ==========================================
@@ -811,7 +790,7 @@ async function getCronPattern(humanText) {
 const MESSAGES_FILE = path.join(TMP_DIR, 'inbox.json');
 const JOBS_FILE = path.join(TMP_DIR, 'scheduled_jobs.json');
 let messageInbox = [];
-let scheduledJobs = []; // список активных задач { id, pattern, taskText, model }
+let scheduledJobs = []; 
 if (fs.existsSync(MESSAGES_FILE)) {
     try { messageInbox = JSON.parse(fs.readFileSync(MESSAGES_FILE, 'utf8')); } catch(e){}
 }
@@ -837,7 +816,6 @@ function addMessageToInbox(msgText) {
     });
     saveInbox();
 }
-// Карта для хранения активных объектов cron-задач
 const activeCronTasks = {};
 function startCronTask(job) {
     if (activeCronTasks[job.id]) {
@@ -851,7 +829,6 @@ function startCronTask(job) {
                 return;
             }
             const modelName = job.model || "gemini-2.5-flash";
-            // --- Antigravity: фоновая задача через Interactions API ---
             if (isAntigravityModel(modelName)) {
                 try {
                     const ag = await callAntigravityAgent({
@@ -922,7 +899,6 @@ function startCronTask(job) {
                         const funcResponse = { name: call.name, response: { result: execResult } };
                         result = await chat.sendMessage([{ functionResponse: funcResponse }]);
                     } else if (call.name === "search_web") {
-                        // *** ИСПРАВЛЕНО: search и download объединены в одну рабочую ветку ***
                         const action = call.args.action;
                         let searchResult = "";
                         try {
@@ -1047,7 +1023,7 @@ function decodeBuffer(buffer, contentType) {
     }
 }
 // ============================================================
-// ТЕЛЕМЕТРИЯ ЛИМИТОВ + ПАТЧ СОВМЕСТИМОСТИ МОДЕЛЕЙ + ФИКС KEEP-ALIVE
+// ТЕЛЕМЕТРИЯ ЛИМИТОВ + ПАТЧ СОВМЕСТИМОСТИ МОДЕЛЕЙ + ФИКС СЕТИ
 // ============================================================
 const LIMITS_FILE = path.join(TMP_DIR, 'gemini_limits.json');
 let geminiLimits = {};
@@ -1064,15 +1040,29 @@ global.fetch = async (input, init) => {
         const urlStr = typeof input === 'string' ? input : (input && input.url ? input.url : '');
         if (urlStr && urlStr.includes('generativelanguage.googleapis.com')) {
             
-            // --- Подготовка заголовков ---
-            const newHeaders = new Headers(init ? init.headers : {});
-            
-            // 1. ФИКС СЕТИ (Apply.build Keep-Alive Drop)
-            // Принудительно закрываем соединение, чтобы Node.js не пытался 
-            // использовать "мертвые" сокеты из пула при следующих запросах.
-            newHeaders.set('Connection', 'close');
+            const match = urlStr.match(/models\/([^:]+)(?::generateContent|:streamGenerateContent)/);
+            if (match && match[1]) modelIdForLimits = match[1];
 
-            // 2. ФИКС РОЛЕЙ И CONTENT-LENGTH (Gemini 3.5/3.6)
+            // 1. Создаем чистый объект заголовков (избавляемся от проблем с классом Headers в Node.js)
+            let safeHeaders = {};
+            if (init && init.headers) {
+                if (typeof init.headers.forEach === 'function') {
+                    init.headers.forEach((v, k) => { safeHeaders[k.toLowerCase()] = v; });
+                } else {
+                    for (const [k, v] of Object.entries(init.headers)) {
+                        safeHeaders[k.toLowerCase()] = v;
+                    }
+                }
+            }
+
+            // 2. Отключаем Keep-Alive, чтобы избежать обрывов на стороне Apply.build
+            safeHeaders['connection'] = 'close';
+            patchedInit.keepalive = false;
+            if (patchedInit.dispatcher) {
+                delete patchedInit.dispatcher; // удаляем кастомный агент SDK
+            }
+
+            // 3. Патч ролей
             if (init && init.body && typeof init.body === 'string') {
                 const parsed = JSON.parse(init.body);
                 let changed = false;
@@ -1082,17 +1072,14 @@ global.fetch = async (input, init) => {
                     }
                 }
                 if (changed) {
-                    const newBody = JSON.stringify(parsed);
-                    patchedInit.body = newBody;
-                    // Актуализируем вес, чтобы строгий роутер не блокировал пакет
-                    newHeaders.set('content-length', Buffer.byteLength(newBody, 'utf8').toString());
+                    patchedInit.body = JSON.stringify(parsed);
+                    // СТРОГО удаляем длину, fetch сам ее идеально рассчитает. 
+                    // Ручная установка Content-Length часто крашит undici (fetch failed).
+                    delete safeHeaders['content-length'];
+                    delete safeHeaders['Content-Length'];
                 }
             }
-            patchedInit.headers = newHeaders;
-
-            // Вытягиваем ID модели для нижнего блока телеметрии
-            const match = urlStr.match(/models\/([^:]+)(?::generateContent|:streamGenerateContent)/);
-            if (match && match[1]) modelIdForLimits = match[1];
+            patchedInit.headers = safeHeaders;
         }
     } catch (e) {
         console.error("[FETCH PATCH ERROR]", e.message);
@@ -1100,7 +1087,6 @@ global.fetch = async (input, init) => {
 
     const response = await originalFetch(input, patchedInit);
 
-    // --- телеметрия лимитов ---
     if (modelIdForLimits) {
         if (response.status === 429) {
             try {
@@ -1133,10 +1119,9 @@ app.post('/artifact', (req, res) => {
     if (!ARTIFACT_TOKEN) return res.status(500).json({ ok: false, error: "ARTIFACT_TOKEN not set on server" });
     if (req.query.token !== ARTIFACT_TOKEN) return res.status(403).json({ ok: false, error: "Auth failed" });
 
-    // Имя только из basename, без путей и точек-точек
     let rawName = String(req.get('x-filename') || req.query.name || 'artifact.bin');
     let safeName = path.basename(rawName).replace(/[^a-zA-Z0-9.\-_]/g, '_') || 'artifact.bin';
-    const savePath = path.join(ARTIFACT_DIR, safeName); // всегда внутри ARTIFACT_DIR
+    const savePath = path.join(ARTIFACT_DIR, safeName); 
 
     let bytes = 0; let aborted = false;
     const writer = fs.createWriteStream(savePath);
@@ -1151,7 +1136,6 @@ app.post('/artifact', (req, res) => {
     writer.on('finish', async () => {
         if (aborted) return res.status(413).json({ ok: false, error: "File too large" });
         console.log(`[ARTIFACT] Принят файл: ${savePath} (${(bytes/1024).toFixed(1)} KB)`);
-        // Опциональный push в GitHub (агент GITHUB_TOKEN не видит)
         let github = { ok: false, skipped: true, reason: "GitHub не настроен" };
         if (GITHUB_ENABLED) {
             github = await pushArtifactToGitHub(savePath, safeName);
@@ -1168,7 +1152,6 @@ app.post('/artifact', (req, res) => {
 // ==========================================
 app.post('/gemini', async (req, res) => {
     if (req.query.token !== PROXY_SECRET) return res.status(403).json({ok: false, error: "Auth failed"});
-    // Обработчик опроса уведомлений планировщика
     if (req.body.action === 'poll_inbox') {
         const notifications = messageInbox.map(msg => ({
             time: msg.time,
@@ -1182,7 +1165,6 @@ app.post('/gemini', async (req, res) => {
             admin_mode: adminMode
         });
     }
-    // Проверяем входящие накопленные ответы от отработавших cron-задач
     let cronNotificationsHtml = "";
     if (messageInbox.length > 0) {
         cronNotificationsHtml = '<div style="background:#fff3cd; border-left:5px solid #ffc107; padding:12px; margin-bottom:15px; border-radius:6px; font-size:12px; color:#856404; max-height: 400px; overflow-y: auto;"><b>🔔 Результаты фоновых задач планировщика:</b><br>' + messageInbox.map(m => `⏰ [${m.time} Kyiv]: ${m.text}`).join('<hr style="border:0; border-top:1px solid #ffeeba; margin:10px 0;">') + '</div>';
@@ -1326,7 +1308,6 @@ ${deliveryHint}
 <i>Пример: <code>!ls -la /tmp</code></i>`;
         return res.json({ ok: true, text: respHtml });
     }
-    // Режим администратора
     if (userText === '/admin on') {
         adminMode = true;
         adminHistory = [
@@ -1346,7 +1327,6 @@ ${deliveryHint}
         console.log("[ADMIN] Режим администратора ОТКЛЮЧЕН.");
         return res.json({ ok: true, text: "🛑 <b>Режим администратора отключен.</b> Сессия /github также сброшена." });
     }
-    // Режим выполнения Antigravity: async (фон) / sync (ожидание)
     if (userText === '/ag_async on' || userText === '/ag_async off') {
         antigravityNonBlocking = (userText === '/ag_async on');
         console.log("[ANTIGRAVITY] Неблокирующий режим: " + (antigravityNonBlocking ? "ON" : "OFF"));
@@ -1497,13 +1477,11 @@ ${deliveryHint}
         console.log("[GEMINI] Память контекста нейросети очищена.");
         if (userText === 'clear') return res.json({ok: true, text: "История очищена"});
     }
-    // /github — задача с подключением инструкций github.md (только в admin-режиме)
     if (userText.startsWith('/github')) {
         if (!adminMode) {
             return res.json({ ok: true, text: "⚠️ Сначала включите режим администратора: <code>/admin on</code>, затем повторите <code>/github …</code>." });
         }
         const ghTask = userText.replace(/^\/github\s*/i, '').trim();
-        // Сброс сессии GitHub
         if (/^(clear|reset|новый|сброс)$/i.test(ghTask)) {
             githubHistory = [];
             githubSessionActive = false;
@@ -1527,18 +1505,15 @@ ${deliveryHint}
                     `Лимит: 50 вызовов инструментов за ход; прогресс сохраняется.`
             });
         }
-        // «продолжай» без доп. текста — модель сама подхватит историю
         const taskForModel = /^(продолжай|continue|далее|продолжить)$/i.test(ghTask)
             ? 'Продолжи выполнение предыдущей задачи с того места, где остановился. Не начинай заново — используй уже сделанный прогресс из истории. Если всё уже сделано — кратко сообщи итог.'
             : ghTask;
         return handleAdminMessage(taskForModel, req, res, cronNotificationsHtml, { withGithub: true });
     }
-    // Передаем cronNotificationsHtml в функцию администратора
     if (adminMode && userText && !userText.startsWith('/') && !userText.startsWith('!')) {
         return handleAdminMessage(userText, req, res, cronNotificationsHtml);
     }
     const modelName = req.body.model || "gemini-2.5-flash";
-    // --- Antigravity: отдельный путь через Interactions API ---
     if (isAntigravityModel(modelName)) {
         if (req.body.b64 && req.body.mimeType && !String(req.body.mimeType).startsWith('image/')) {
             return res.json({ ok: true, text: "⚠️ Antigravity через этот интерфейс поддерживает только текст и изображения — файл не прикреплён." });
@@ -1550,14 +1525,12 @@ ${deliveryHint}
                 { type: "image", data: req.body.b64, mime_type: req.body.mimeType }
             ];
         }
-        // НЕБЛОКИРУЮЩИЙ режим: мгновенная заглушка, задача в фоне
         if (antigravityNonBlocking) {
             runAntigravityInBackground({ mode: 'chat', input: agInput, systemInstruction: getAntigravitySystemInstruction("Ты — полезный ИИ-ассистент.") });
             let stub = "✅ <b>Задача Antigravity принята в фоновый режим.</b><br>Прогресс и ответ появятся во входящих (📬 Планировщик). Следите за блоками прогресса — они приходят каждые ~10 секунд.";
             if (cronNotificationsHtml) stub = cronNotificationsHtml + '<br>' + stub;
             return res.json({ ok: true, text: stub });
         }
-        // БЛОКИРУЮЩИЙ режим: ждём завершения и возвращаем в пузыре
         try {
             const ag = await callAntigravityAgent({
                 input: agInput,
@@ -1599,19 +1572,13 @@ ${deliveryHint}
         return res.status(500).json({ ok: false, error: err.message });
     }
 });
-// ==========================================
-// ANTIGRAVITY В РЕЖИМЕ АДМИНИСТРАТОРА
-// ==========================================
 async function handleAntigravityAdmin(userText, req, res, cronNotificationsHtml = "", withGithub = false) {
-    // Antigravity не имеет инструмента github_ops (он доступен только обычным Gemini-моделям в admin).
-    // При /github просто добавляем текстовые инструкции; для полноценного GitHub лучше выбрать Gemini Flash.
     let basePrompt = adminSystemPrompt || "Ты — автономный агент-администратор. Выполняй задачу и возвращай краткий результат.";
     if (withGithub && githubSystemPrompt) {
         basePrompt += "\n\n=== РЕЖИМ GITHUB ===\n" + githubSystemPrompt +
             "\n\nВАЖНО: инструмент github_ops доступен только в обычном admin-режиме (модели Gemini Flash / Lite, НЕ Antigravity). " +
             "В Antigravity токен GitHub тебе недоступен — не пытайся его искать. Если нужна запись в репозиторий, попроси пользователя выбрать модель без Antigravity.";
     }
-    // НЕБЛОКИРУЮЩИЙ режим: мгновенная заглушка, задача в фоне
     if (antigravityNonBlocking) {
         runAntigravityInBackground({
             mode: 'admin',
@@ -1625,7 +1592,6 @@ async function handleAntigravityAdmin(userText, req, res, cronNotificationsHtml 
         if (cronNotificationsHtml) stub = cronNotificationsHtml + '<br>' + stub;
         return res.json({ ok: true, text: stub });
     }
-    // БЛОКИРУЮЩИЙ режим: ждём завершения и возвращаем в пузыре
     try {
         const ag = await callAntigravityAgent({
             input: userText,
@@ -1645,14 +1611,10 @@ async function handleAntigravityAdmin(userText, req, res, cronNotificationsHtml 
         return res.status(500).json({ ok: false, error: err.message });
     }
 }
-// ==========================================
-// АВТОНОМНЫЙ АДМИНИСТРАТОР С ИНСТРУМЕНТАМИ
-// ==========================================
 async function handleAdminMessage(userText, req, res, cronNotificationsHtml = "", options = {}) {
     if (!GEMINI_API_KEY) return res.status(500).json({ok: false, error: "Отсутствует GEMINI_API_KEY"});
     const preferredModel = req.body.model || "gemini-2.5-flash";
     const withGithub = !!(options && options.withGithub);
-    // --- Antigravity: агент работает через Interactions API со своими инструментами ---
     if (isAntigravityModel(preferredModel)) {
         return handleAntigravityAdmin(userText, req, res, cronNotificationsHtml, withGithub);
     }
@@ -1781,7 +1743,6 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
             }
         ]
     }];
-    // /github: продолжаем сохранённую сессию, если она есть; иначе стартуем с github.md
     let historyForChat;
     if (withGithub) {
         if (githubHistory && githubHistory.length > 0) {
@@ -1799,7 +1760,7 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
     const chat = model.startChat({ history: historyForChat, tools: tools });
     const executedCommands = [];
     let iterations = 0;
-    const maxIterations = withGithub ? 50 : 50; // admin / github: до 50 вызовов инструментов за один ход
+    const maxIterations = withGithub ? 50 : 50; 
     try {
         let result = await chat.sendMessage(userText);
         while (result.response && result.response.candidates && result.response.candidates[0]) {
@@ -1999,7 +1960,6 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                     } catch (err) {
                         ghResult = JSON.stringify({ ok: false, error: err.message });
                     }
-                    // не светим токен даже если модель вдруг попросила env
                     ghResult = maskSecrets(ghResult);
                     console.log(`[ADMIN] github_ops result: ${String(ghResult).substring(0, 300)}`);
                     const funcResponse = { name: call.name, response: { result: ghResult } };
@@ -2017,12 +1977,11 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                     });
                     finalText += `\n</details>`;
                 }
-                // Сохраняем историю: admin → adminHistory; github → githubHistory (для /github continue)
                 try {
                     const hist = await chat.getHistory();
                     if (withGithub) {
                         githubHistory = hist;
-                        githubSessionActive = false; // задача штатно завершена
+                        githubSessionActive = false; 
                     } else {
                         adminHistory = hist;
                     }
@@ -2035,7 +1994,6 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
             }
             iterations++;
             if (iterations >= maxIterations) {
-                // Сохраняем точку остановки — следующий /github продолжит с этой истории
                 try {
                     const hist = await chat.getHistory();
                     if (withGithub) {
