@@ -1078,12 +1078,12 @@ global.fetch = async (input, init) => {
                 let newHeaders = init.headers;
                 try {
                     const h = new Headers(init.headers || {});
-                    h.delete('content-length');
+                    h.set('content-length', Buffer.byteLength(newBody, 'utf8').toString());
                     newHeaders = h;
                 } catch (_) {
                     if (init.headers && typeof init.headers === 'object') {
                         newHeaders = { ...init.headers };
-                        delete newHeaders['content-length'];
+                        newHeaders['content-length'] = Buffer.byteLength(newBody, 'utf8').toString();
                         delete newHeaders['Content-Length'];
                     }
                 }
