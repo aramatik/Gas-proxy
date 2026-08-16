@@ -2007,7 +2007,7 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = " 
                     } else {
                         adminHistory = hist;
                     }
-                } catch ( ) {}
+                } catch (e) {}
                 let finalResponseText = finalText;
                 if (cronNotificationsHtml) {
                     finalResponseText = cronNotificationsHtml + '<br>' + finalResponseText;
@@ -2025,7 +2025,7 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = " 
                     } else {
                         adminHistory = hist;
                     }
-                } catch ( ) {}
+                } catch (e) {}
                 let limitText = `⚠️ <b>Достигнут лимит операций (${maxIterations}).</b> Прогресс сохранён.<br>` +
                     (withGithub
                         ? `Продолжите той же сессией: <code>/github продолжай</code> или <code>/github</code> + следующая инструкция.<br>` +
@@ -2044,7 +2044,7 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = " 
         try {
             const hist = await chat.getHistory();
             if (withGithub) { githubHistory = hist; } else { adminHistory = hist; }
-        } catch ( ) {}
+        } catch (e) {}
         return res.json({ ok: true, text: "Не удалось получить ответ от ИИ." });
     } catch (err) {
         console.error("[ADMIN ERROR]", err.message);
