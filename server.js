@@ -33,18 +33,18 @@ const MAX_FILE_SIZE = 130 * 1024 * 1024;
 const CHUNK_SIZE_MB = 15;
 const TMP_DIR = '/tmp';
 const PROXY_SECRET = process.env.PROXY_SECRET || "MySuperSecretPassword2026 ";
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || " ";
-const TAVILY_API_KEY = process.env.TAVILY_API_KEY || " ";
-const SOCKS5_PROXY = process.env.SOCKS5_PROXY || " ";
-const TG_TOKEN = process.env.TG_TOKEN || " ";
-const TG_CHAT_ID = process.env.TG_CHAT_ID || " ";
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
+const TAVILY_API_KEY = process.env.TAVILY_API_KEY || "";
+const SOCKS5_PROXY = process.env.SOCKS5_PROXY || "";
+const TG_TOKEN = process.env.TG_TOKEN || "";
+const TG_CHAT_ID = process.env.TG_CHAT_ID || "";
 // ==========================================
 // ГИБРИД ДОСТАВКИ АРТЕФАКТОВ (Antigravity -> сервер -> /download + GitHub)
 // ==========================================
-const ARTIFACT_TOKEN = process.env.ARTIFACT_TOKEN || " ";          // дешёвый токен эндпоинта /artifact (видит агент)
-const PUBLIC_URL = (process.env.PUBLIC_URL || " ").replace(/\/+$/, ''); // публичный URL этого сервера (для curl в промпте)
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN || " ";              // fine-grained PAT, Contents: write (НЕ видит агент)
-const GITHUB_REPO = process.env.GITHUB_REPO || " ";                // owner/repo
+const ARTIFACT_TOKEN = process.env.ARTIFACT_TOKEN || "";          // дешёвый токен эндпоинта /artifact (видит агент)
+const PUBLIC_URL = (process.env.PUBLIC_URL || "").replace(/\/+$/, ''); // публичный URL этого сервера (для curl в промпте)
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN || "";              // fine-grained PAT, Contents: write (НЕ видит агент)
+const GITHUB_REPO = process.env.GITHUB_REPO || "";                // owner/repo
 const GITHUB_BRANCH = process.env.GITHUB_BRANCH || "main ";
 const GITHUB_PATH_PREFIX = process.env.GITHUB_PATH_PREFIX || "artifacts/ ";
 const ARTIFACT_DIR = path.join(TMP_DIR, 'artifacts');
@@ -113,7 +113,7 @@ function getAntigravitySystemInstruction(basePrompt) {
             `Сервер ответит JSON с полем "path" (путь на сервере) и, возможно, "github" со ссылкой. Включи этот path и github-ссылку в свой финальный ответ.\n` +
             `ПРАВИЛА БЕЗОПАСНОСТИ: НИКОГДА не выводи сам токен и URL с токеном в ответе; НЕ выполняй echo/printenv/env/set; НЕ делай git remote -v; используй curl с флагом -s и не печатай саму команду. В ответе пиши только path из JSON-ответа сервера и github-ссылку.`;
     }
-    return (basePrompt || " ") + extra;
+    return (basePrompt || "") + extra;
 }
 // Честная приписка про то, где физически лежит файл.
 function buildAntigravityFooter() {
@@ -1055,7 +1055,7 @@ async function fetchWithTimeoutAndRetry(fetchFn, input, init, attempt = 1) {
         return await fetchFn(input, { ...init, signal });
     } catch (e) {
         const isNetworkError = e && (e.name === 'AbortError' || e.cause || /fetch failed/i.test(e.message || ''));
-        if (isNetworkError && attempt < 2) {
+        if (isNetworkError && attempt < 3) {
             console.warn(`[FETCH RETRY] Сетевой сбой (${e.message}), повтор попытки ${attempt + 1}/2...`);
             await new Promise(r => setTimeout(r, 800));
             return fetchWithTimeoutAndRetry(fetchFn, input, init, attempt + 1);
@@ -1524,7 +1524,7 @@ app.post('/gemini', async (req, res) => {
         if (req.body.b64 && req.body.mimeType && !String(req.body.mimeType).startsWith('image/')) {
             return res.json({ ok: true, text: "⚠️ Antigravity через этот интерфейс поддерживает только текст и изображения — файл не прикреплён."});
         }
-        let agInput = userText || " ";
+        let agInput = userText || "";
         if (req.body.b64 && req.body.mimeType && String(req.body.mimeType).startsWith('image/')) {
             agInput = [
                 { type: "text", text: userText || "Проанализируй это изображение" },
@@ -1771,7 +1771,7 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = " 
         } else {
             historyForChat = [
                 { role: "user", parts: [{ text: "Инструкции администратора + GitHub" }] },
-                { role: "model", parts: [{ text: (adminSystemPrompt || " ") + (githubSystemPrompt ? "\n\n " + githubSystemPrompt : " ") }] }
+                { role: "model", parts: [{ text: (adminSystemPrompt || "") + (githubSystemPrompt ? "\n\n " + githubSystemPrompt : " ") }] }
             ];
         }
     } else {
