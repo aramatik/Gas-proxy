@@ -820,24 +820,56 @@ function runAntigravityInBackground(opts) {
         }
     })().catch(e => console.error("[ANTIGRAVITY BG UNHANDLED]", e && e.message));
 }
+// Строгая проверка: ровно 5 полей cron (минуты часы день месяц день_недели)
+function isStrictCronPattern(p) {
+    if (!p || typeof p !== 'string') return false;
+    const cleaned = p.trim().replace(/\s+/g, ' ');
+    const fields = cleaned.split(' ');
+    if (fields.length !== 5) return false;
+    // каждый field не пустой и не состоит только из пробелов
+    if (fields.some(f => !f || !f.trim())) return false;
+    // node-cron validate + наша проверка
+    return cron.validate(cleaned);
+}
+
 async function getCronPattern(humanText) {
-    // gemini-2.5-flash часто недоступен новым пользователям → пробуем актуальные модели
-    const modelsToTry = [DEFAULT_MODEL, "gemini-3.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-flash"];
+    // Простые эвристики без ИИ (быстрее и надёжнее на Apply.build)
+    const t = String(humanText).toLowerCase();
+    if (/каждую?\s*минут|every\s*minute|раз\s*в\s*минут/i.test(t)) return '* * * * *';
+    if (/каждые?\s*2\s*минут/i.test(t)) return '*/2 * * * *';
+    if (/каждые?\s*3\s*минут/i.test(t)) return '*/3 * * * *';
+    if (/каждые?\s*5\s*минут/i.test(t)) return '*/5 * * * *';
+    if (/каждые?\s*10\s*минут/i.test(t)) return '*/10 * * * *';
+    if (/каждые?\s*15\s*минут/i.test(t)) return '*/15 * * * *';
+    if (/каждые?\s*30\s*минут|полчас/i.test(t)) return '*/30 * * * *';
+    if (/каждый\s*час|раз\s*в\s*час|every\s*hour/i.test(t)) return '0 * * * *';
+    if (/каждые?\s*2\s*часа/i.test(t)) return '0 */2 * * *';
+    if (/каждый\s*день|раз\s*в\s*день|daily/i.test(t)) return '0 9 * * *';
+
+    const modelsToTry = [DEFAULT_MODEL, "gemini-3.5-flash", "gemini-2.5-flash-lite"];
     let lastError = null;
+    const prompt =
+        "Ты — конвертер в cron. Верни ТОЛЬКО одну строку из РОВНО 5 полей через пробел (минуты часы день_месяца месяц день_недели).\n" +
+        "Примеры правильных ответов:\n" +
+        "* * * * *\n" +
+        "*/5 * * * *\n" +
+        "0 */2 * * *\n" +
+        "30 9 * * 1-5\n" +
+        "ЗАПРЕЩЕНО возвращать одно поле, markdown, кавычки, пояснения. Только 5 полей.\n" +
+        "Фраза: " + humanText;
+
     for (const modelName of modelsToTry) {
         try {
             const model = genAI.getGenerativeModel({ model: modelName });
-            const result = await model.generateContent(
-                "Переведи фразу строго в стандартный cron-pattern из 5 параметров (минуты, часы, день, месяц, день недели). Верни ТОЛЬКО строку, например '*/2 * * * *'. Никаких других символов. Фраза: " + humanText
-            );
+            const result = await model.generateContent(prompt);
             let pattern = result.response.text().trim();
-            // убираем возможные кавычки/markdown
-            pattern = pattern.replace(/^[`'"]+|[`'"]+$/g, '').trim();
-            if (cron.validate(pattern)) {
+            // убираем markdown/кавычки/лишние строки
+            pattern = pattern.split('\n')[0].replace(/^[`'"]+|[`'"]+$/g, '').trim();
+            if (isStrictCronPattern(pattern)) {
                 console.log(`[CRON PATTERN] Успех моделью ${modelName}: ${pattern}`);
-                return pattern;
+                return pattern.replace(/\s+/g, ' ');
             }
-            console.warn(`[CRON PATTERN] Модель ${modelName} вернула невалидный паттерн: ${pattern}`);
+            console.warn(`[CRON PATTERN] Модель ${modelName} вернула невалидный паттерн: "${pattern}"`);
         } catch (e) {
             lastError = e;
             console.warn(`[CRON PATTERN] Модель ${modelName} не сработала: ${e.message}`);
@@ -939,7 +971,24 @@ function startCronTask(job) {
             }];
             const chat = model.startChat({ history: [], tools: tools });
             const executedCommands = [];
-            let result = await chat.sendMessage(job.taskText);
+            // На Apply.build нестриминговый generateContent часто падает с "fetch failed" —
+            // делаем 2–3 попытки с паузой.
+            async function sendWithRetry(msg, attempts = 3) {
+                let lastErr;
+                for (let a = 1; a <= attempts; a++) {
+                    try {
+                        return await chat.sendMessage(msg);
+                    } catch (e) {
+                        lastErr = e;
+                        const isNet = /fetch failed|aborted|ECONNRESET|ETIMEDOUT|socket hang up/i.test(String(e && e.message));
+                        console.warn(`[CRON JOB ${job.id}] sendMessage попытка ${a}/${attempts} ошибка: ${e.message}`);
+                        if (!isNet || a === attempts) throw e;
+                        await new Promise(r => setTimeout(r, 1500 * a));
+                    }
+                }
+                throw lastErr;
+            }
+            let result = await sendWithRetry(job.taskText);
             let iterations = 0;
             const maxIterations = 10;
             while (result.response && result.response.candidates && result.response.candidates[0]) {
@@ -961,7 +1010,7 @@ function startCronTask(job) {
                         }
                         executedCommands.push({ command: cmd, result: execResult });
                         const funcResponse = { name: call.name, response: { result: execResult } };
-                        result = await chat.sendMessage([{ functionResponse: funcResponse }]);
+                        result = await sendWithRetry([{ functionResponse: funcResponse }]);
                     } else if (call.name === "search_web") {
                         // *** ИСПРАВЛЕНО: search и download объединены в одну рабочую ветку ***
                         const action = call.args.action;
@@ -1002,7 +1051,7 @@ function startCronTask(job) {
                             searchResult = `Ошибка поиска/загрузки: ${err.message}`;
                         }
                         const funcResponse = { name: call.name, response: { result: searchResult } };
-                        result = await chat.sendMessage([{ functionResponse: funcResponse }]);
+                        result = await sendWithRetry([{ functionResponse: funcResponse }]);
                     } else { break; }
                 } else {
                     let finalText = parts.map(p => p.text).join('');
@@ -1295,7 +1344,7 @@ app.post('/gemini', async (req, res) => {
         let pattern = "";
         let taskText = "";
         const potentialCron = parts.slice(0, 5).join(' ');
-        if (parts.length >= 6 && cron.validate(potentialCron)) {
+        if (parts.length >= 6 && isStrictCronPattern(potentialCron)) {
             pattern = potentialCron;
             taskText = parts.slice(5).join(' ').trim();
         } else {
@@ -1306,9 +1355,10 @@ app.post('/gemini', async (req, res) => {
                 return res.json({ ok: true, text: "❌ Ошибка генерации cron-паттерна: " + err.message });
             }
         }
-        if (!cron.validate(pattern)) {
-            return res.json({ ok: true, text: `❌ Не удалось определить валидный cron-pattern для: <code>${payload}</code>` });
+        if (!isStrictCronPattern(pattern)) {
+            return res.json({ ok: true, text: `❌ Не удалось определить валидный cron-pattern (нужно 5 полей) для: <code>${payload}</code>` });
         }
+        pattern = pattern.trim().replace(/\s+/g, ' ');
         const jobId = 'job_' + Date.now();
         const newJob = {
             id: jobId,
