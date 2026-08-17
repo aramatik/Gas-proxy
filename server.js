@@ -12,6 +12,24 @@ const util = require('util');
 const { exec } = require('child_process');
 const execPromise = util.promisify(exec);
 const { GoogleGenerativeAI } = require('@google/generative-ai');
+// ==========================================
+// ФИКС СЕТИ: форсируем IPv4 для всех исходящих fetch() (undici)
+// На части хостингов у контейнера "битый"/недоступный исходящий IPv6:
+// интерфейс формально есть, реального маршрута наружу нет. Встроенный
+// fetch (undici) не делает Happy Eyeballs, как curl/браузеры — если DNS
+// вернул AAAA-запись, он пробует именно её и виснет на TCP-соединении
+// на несколько минут, прежде чем упасть с общей ошибкой "fetch failed".
+// Форсирование IPv4 убирает саму возможность этого зависания.
+// ==========================================
+try {
+    let undici;
+    try { undici = require('node:undici'); } catch (_) { undici = require('undici'); }
+    const { Agent, setGlobalDispatcher } = undici;
+    setGlobalDispatcher(new Agent({ connect: { family: 4 } }));
+    console.log('[SYSTEM] Исходящие fetch()-запросы форсированы на IPv4 (undici Agent).');
+} catch (e) {
+    console.warn('[SYSTEM WARNING] Не удалось форсировать IPv4 для fetch — пакет undici не резолвится. Выполните: npm install undici. Ошибка:', e.message);
+}
 const cron = require('node-cron');
 const FormData = require('form-data');
 const app = express();
@@ -27,6 +45,10 @@ const TAVILY_API_KEY = process.env.TAVILY_API_KEY || "";
 const SOCKS5_PROXY = process.env.SOCKS5_PROXY || "";
 const TG_TOKEN = process.env.TG_TOKEN || "";
 const TG_CHAT_ID = process.env.TG_CHAT_ID || "";
+// ==========================================
+// МОДЕЛЬ ПО УМОЛЧАНИЮ (gemini-2.5-flash ограничен для новых пользователей)
+// ==========================================
+const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 // ==========================================
 // ГИБРИД ДОСТАВКИ АРТЕФАКТОВ (Antigravity -> сервер -> /download + GitHub)
 // ==========================================
@@ -799,11 +821,30 @@ function runAntigravityInBackground(opts) {
     })().catch(e => console.error("[ANTIGRAVITY BG UNHANDLED]", e && e.message));
 }
 async function getCronPattern(humanText) {
-    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
-    const result = await model.generateContent("Переведи фразу строго в стандартный cron-pattern из 5 параметров (минуты, часы, день, месяц, день недели). Верни ТОЛЬКО строку, например '*/2 * * * *'. Никаких других символов. Фраза: " + humanText);
-    let pattern = result.response.text().trim();
-    if (!cron.validate(pattern)) return "*/5 * * * *"; // fallback
-    return pattern;
+    // gemini-2.5-flash часто недоступен новым пользователям → пробуем актуальные модели
+    const modelsToTry = [DEFAULT_MODEL, "gemini-3.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-flash"];
+    let lastError = null;
+    for (const modelName of modelsToTry) {
+        try {
+            const model = genAI.getGenerativeModel({ model: modelName });
+            const result = await model.generateContent(
+                "Переведи фразу строго в стандартный cron-pattern из 5 параметров (минуты, часы, день, месяц, день недели). Верни ТОЛЬКО строку, например '*/2 * * * *'. Никаких других символов. Фраза: " + humanText
+            );
+            let pattern = result.response.text().trim();
+            // убираем возможные кавычки/markdown
+            pattern = pattern.replace(/^[`'"]+|[`'"]+$/g, '').trim();
+            if (cron.validate(pattern)) {
+                console.log(`[CRON PATTERN] Успех моделью ${modelName}: ${pattern}`);
+                return pattern;
+            }
+            console.warn(`[CRON PATTERN] Модель ${modelName} вернула невалидный паттерн: ${pattern}`);
+        } catch (e) {
+            lastError = e;
+            console.warn(`[CRON PATTERN] Модель ${modelName} не сработала: ${e.message}`);
+        }
+    }
+    console.error("[CRON PATTERN] Все модели отказали, используем fallback */5 * * * *", lastError && lastError.message);
+    return "*/5 * * * *";
 }
 // ==========================================
 // СИСТЕМА ОЧЕРЕДИ ДЛЯ CRON-ЗАДАЧ (INBOX)
@@ -850,7 +891,7 @@ function startCronTask(job) {
                 addMessageToInbox(`[Ошибка задачи ${job.id}]: Отсутствует GEMINI_API_KEY`);
                 return;
             }
-            const modelName = job.model || "gemini-2.5-flash";
+            const modelName = job.model || DEFAULT_MODEL;
             // --- Antigravity: фоновая задача через Interactions API ---
             if (isAntigravityModel(modelName)) {
                 try {
@@ -931,7 +972,7 @@ function startCronTask(job) {
                                 if (!query) throw new Error("No query provided");
                                 if (!TAVILY_API_KEY) throw new Error("TAVILY_API_KEY not set");
                                 const requestBody = { api_key: TAVILY_API_KEY, query: query, max_results: 5, search_depth: "basic" };
-                                const tavRes = await axios.post('https://api.tavily.com/search', requestBody);
+                                const tavRes = await axios.post('https://api.tavily.com/search', requestBody, { timeout: 20000 });
                                 if (tavRes.data && tavRes.data.results) {
                                     searchResult = tavRes.data.results.map((r, i) => `[${i+1}] ${r.title}\n${r.content}\n${r.url}`).join('\n\n');
                                 } else { searchResult = "Ничего не найдено."; }
@@ -1054,6 +1095,32 @@ let geminiLimits = {};
 if (fs.existsSync(LIMITS_FILE)) {
     try { geminiLimits = JSON.parse(fs.readFileSync(LIMITS_FILE, 'utf8')); } catch(e){}
 }
+// ==========================================
+// СЕТЕВАЯ УСТОЙЧИВОСТЬ: таймаут + один авторетрай для fetch()
+// Вместо того чтобы виснуть на несколько минут на мёртвом соединении и
+// только потом падать с "fetch failed", обрываем попытку через
+// FETCH_TIMEOUT_MS и один раз автоматически повторяем сетевые сбои —
+// в подавляющем большинстве случаев повтор сразу проходит успешно.
+// ==========================================
+const FETCH_TIMEOUT_MS = 120000; // общая страховка от вечного зависания; для admin-цикла есть отдельный idle-таймаут в sendAndDrainStream
+async function fetchWithTimeoutAndRetry(fetchFn, input, init, attempt = 1) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    try {
+        const signal = (init && init.signal) ? init.signal : controller.signal;
+        return await fetchFn(input, { ...init, signal });
+    } catch (e) {
+        const isNetworkError = e && (e.name === 'AbortError' || e.cause || /fetch failed/i.test(e.message || ''));
+        if (isNetworkError && attempt < 2) {
+            console.warn(`[FETCH RETRY] Сетевой сбой (${e.message}), повтор попытки ${attempt + 1}/2...`);
+            await new Promise(r => setTimeout(r, 800));
+            return fetchWithTimeoutAndRetry(fetchFn, input, init, attempt + 1);
+        }
+        throw e;
+    } finally {
+        clearTimeout(timer);
+    }
+}
 const originalFetch = global.fetch;
 global.fetch = async (input, init) => {
     // ============================================================
@@ -1092,7 +1159,7 @@ global.fetch = async (input, init) => {
         }
     } catch (e) { /* если тело не JSON — шлём как есть */ }
 
-    const response = await originalFetch(input, patchedInit);
+    const response = await fetchWithTimeoutAndRetry(originalFetch, input, patchedInit);
 
     // --- телеметрия лимитов ---
     let url = typeof input === 'string' ? input : (input && input.url ? input.url : '');
@@ -1247,7 +1314,7 @@ app.post('/gemini', async (req, res) => {
             id: jobId,
             pattern: pattern,
             taskText: taskText,
-            model: req.body.model || "gemini-2.5-flash",
+            model: req.body.model || DEFAULT_MODEL,
             createdAt: getKyivTime()
         };
         scheduledJobs.push(newJob);
@@ -1468,7 +1535,7 @@ ${deliveryHint}
                 if (ftMatch) { apiQuery = apiQuery.replace(/(?:^|\s)filetype:([a-z0-9]+)/i, '').trim(); apiQuery += ` (file document ${ftMatch[1]})`; }
                 const requestBody = { api_key: TAVILY_API_KEY, query: apiQuery || "index", max_results: 6, search_depth: "basic" };
                 if (includeDomains.length > 0) requestBody.include_domains = includeDomains;
-                const response = await axios.post('https://api.tavily.com/search', requestBody);
+                const response = await axios.post('https://api.tavily.com/search', requestBody, { timeout: 20000 });
                 if (response.data && response.data.results && response.data.results.length > 0) {
                     let results = response.data.results.map((r, i) => `[${i+1}] ${r.title}\n${r.content}\nСсылка: ${r.url}`);
                     searchResultsText = `Результаты:\n\n${results.join('\n\n')}`;
@@ -1536,7 +1603,7 @@ ${deliveryHint}
     if (adminMode && userText && !userText.startsWith('/') && !userText.startsWith('!')) {
         return handleAdminMessage(userText, req, res, cronNotificationsHtml);
     }
-    const modelName = req.body.model || "gemini-2.5-flash";
+    const modelName = req.body.model || DEFAULT_MODEL;
     // --- Antigravity: отдельный путь через Interactions API ---
     if (isAntigravityModel(modelName)) {
         if (req.body.b64 && req.body.mimeType && !String(req.body.mimeType).startsWith('image/')) {
@@ -1649,7 +1716,7 @@ async function handleAntigravityAdmin(userText, req, res, cronNotificationsHtml 
 // ==========================================
 async function handleAdminMessage(userText, req, res, cronNotificationsHtml = "", options = {}) {
     if (!GEMINI_API_KEY) return res.status(500).json({ok: false, error: "Отсутствует GEMINI_API_KEY"});
-    const preferredModel = req.body.model || "gemini-2.5-flash";
+    const preferredModel = req.body.model || DEFAULT_MODEL;
     const withGithub = !!(options && options.withGithub);
     // --- Antigravity: агент работает через Interactions API со своими инструментами ---
     if (isAntigravityModel(preferredModel)) {
@@ -1663,6 +1730,10 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
             sys = sys + "\n\n=== РЕЖИМ GITHUB (активен для этой задачи) ===\n" + githubSystemPrompt;
         }
         modelConfig.systemInstruction = sys;
+        // Стрим + видимые "мысли": байты начинают идти намного раньше, чем при
+        // обычном sendMessage(), пока модель "думает" — это не даёт соединению
+        // выглядеть "тихим" для прокси/WAF с idle-таймаутом (см. apply.build).
+        modelConfig.generationConfig = { thinkingConfig: { includeThoughts: true } };
     }
     const model = genAI.getGenerativeModel(modelConfig);
     const tools = [{
@@ -1799,10 +1870,49 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
     const executedCommands = [];
     let iterations = 0;
     const maxIterations = withGithub ? 50 : 50; // admin / github: до 50 вызовов инструментов за один ход
+    // Отправка через sendMessageStream + активное вычитывание потока вместо
+    // sendMessage(). На платформах с idle-таймаутом на исходящих соединениях
+    // (похоже на apply.build, падение ~через 30с без данных) обычный
+    // sendMessage() молчит до конца thinking-этапа и его обрывают. Стриминг
+    // заставляет байты идти намного раньше — плюс собственный idle-вотчдог
+    // (сбрасывается на каждом чанке) и один автоповтор при сбое/тишине.
+    async function sendAndDrainStream(msg, attempt = 1) {
+        const IDLE_MS = 45000; // нет ни одного чанка 45с подряд — считаем соединение мёртвым
+        const t0 = Date.now();
+        try {
+            const streamResult = await chat.sendMessageStream(msg);
+            const iterator = streamResult.stream[Symbol.asyncIterator]();
+            let chunkCount = 0;
+            while (true) {
+                let idleTimer;
+                const idlePromise = new Promise((_, reject) => {
+                    idleTimer = setTimeout(() => reject(new Error('Gemini stream idle timeout (45с без данных)')), IDLE_MS);
+                });
+                let step;
+                try {
+                    step = await Promise.race([iterator.next(), idlePromise]);
+                } finally {
+                    clearTimeout(idleTimer);
+                }
+                if (step.done) break;
+                chunkCount++;
+                if (chunkCount === 1) console.log(`[ADMIN STREAM] Первый чанк через ${Date.now() - t0}мс`);
+            }
+            console.log(`[ADMIN STREAM] Готово: ${chunkCount} чанк(ов) за ${Date.now() - t0}мс`);
+            return await streamResult.response;
+        } catch (e) {
+            if (attempt < 2) {
+                console.warn(`[ADMIN STREAM RETRY] ${e.message} (после ${Date.now() - t0}мс), повтор...`);
+                await new Promise(r => setTimeout(r, 800));
+                return sendAndDrainStream(msg, attempt + 1);
+            }
+            throw e;
+        }
+    }
     try {
-        let result = await chat.sendMessage(userText);
-        while (result.response && result.response.candidates && result.response.candidates[0]) {
-            const candidate = result.response.candidates[0];
+        let response = await sendAndDrainStream(userText);
+        while (response && response.candidates && response.candidates[0]) {
+            const candidate = response.candidates[0];
             const parts = candidate.content.parts;
             const functionCall = parts.find(part => part.functionCall);
             if (functionCall) {
@@ -1822,7 +1932,7 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                     executedCommands.push({ command: cmd, result: execResult });
                     console.log(`[ADMIN] Результат: ${execResult.substring(0, 200)}`);
                     const funcResponse = { name: call.name, response: { result: execResult } };
-                    result = await chat.sendMessage([{ functionResponse: funcResponse }]);
+                    response = await sendAndDrainStream([{ functionResponse: funcResponse }]);
                 } else if (call.name === "search_web") {
                     const action = call.args.action;
                     console.log(`[ADMIN] Поиск/загрузка: action=${action}`);
@@ -1833,7 +1943,7 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                             if (!query) throw new Error("No query provided");
                             if (!TAVILY_API_KEY) throw new Error("TAVILY_API_KEY not set");
                             const requestBody = { api_key: TAVILY_API_KEY, query: query, max_results: 5, search_depth: "basic" };
-                            const tavRes = await axios.post('https://api.tavily.com/search', requestBody);
+                            const tavRes = await axios.post('https://api.tavily.com/search', requestBody, { timeout: 20000 });
                             if (tavRes.data && tavRes.data.results) {
                                 searchResult = tavRes.data.results.map((r, i) => `[${i+1}] ${r.title}\n${r.content}\n${r.url}`).join('\n\n');
                             } else {
@@ -1864,7 +1974,7 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                     }
                     console.log(`[ADMIN] Результат операции: ${searchResult.substring(0, 200)}`);
                     const funcResponse = { name: call.name, response: { result: searchResult } };
-                    result = await chat.sendMessage([{ functionResponse: funcResponse }]);
+                    response = await sendAndDrainStream([{ functionResponse: funcResponse }]);
                 } else if (call.name === "send_message_to_telegram") {
                     let execResult;
                     if (!TG_TOKEN) {
@@ -1889,7 +1999,7 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                     }
                     console.log(`[ADMIN] send_message_to_telegram: ${execResult}`);
                     const funcResponse = { name: call.name, response: { result: execResult } };
-                    result = await chat.sendMessage([{ functionResponse: funcResponse }]);
+                    response = await sendAndDrainStream([{ functionResponse: funcResponse }]);
                 } else if (call.name === "send_file_to_telegram") {
                     let execResult;
                     if (!TG_TOKEN) {
@@ -1921,7 +2031,7 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                     }
                     console.log(`[ADMIN] send_file_to_telegram: ${execResult}`);
                     const funcResponse = { name: call.name, response: { result: execResult } };
-                    result = await chat.sendMessage([{ functionResponse: funcResponse }]);
+                    response = await sendAndDrainStream([{ functionResponse: funcResponse }]);
                 } else if (call.name === "toggle_proxy") {
                     const state = call.args.state;
                     let execResult;
@@ -1938,7 +2048,7 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                     }
                     console.log(`[ADMIN] toggle_proxy: ${execResult}`);
                     const funcResponse = { name: call.name, response: { result: execResult } };
-                    result = await chat.sendMessage([{ functionResponse: funcResponse }]);
+                    response = await sendAndDrainStream([{ functionResponse: funcResponse }]);
                 } else if (call.name === "manage_cron_tasks") {
                     let execResult;
                     const action = call.args.action;
@@ -1989,7 +2099,7 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                     }
                     console.log(`[ADMIN] manage_cron_tasks: ${execResult}`);
                     const funcResponse = { name: call.name, response: { result: execResult } };
-                    result = await chat.sendMessage([{ functionResponse: funcResponse }]);
+                    response = await sendAndDrainStream([{ functionResponse: funcResponse }]);
                 } else if (call.name === "github_ops") {
                     console.log(`[ADMIN] github_ops: action=${call.args && call.args.action}`);
                     let ghResult;
@@ -2002,13 +2112,13 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                     ghResult = maskSecrets(ghResult);
                     console.log(`[ADMIN] github_ops result: ${String(ghResult).substring(0, 300)}`);
                     const funcResponse = { name: call.name, response: { result: ghResult } };
-                    result = await chat.sendMessage([{ functionResponse: funcResponse }]);
+                    response = await sendAndDrainStream([{ functionResponse: funcResponse }]);
                 } else {
                     console.log("[ADMIN] Неизвестная функция:", call.name);
                     break;
                 }
             } else {
-                let finalText = parts.map(p => p.text).join('');
+                let finalText = parts.filter(p => !p.thought).map(p => p.text).join('');
                 if (executedCommands.length > 0) {
                     finalText += `\n\n<details><summary>📋 <b>Терминал</b> (нажмите, чтобы развернуть)</summary>\n`;
                     executedCommands.forEach((cmd, index) => {
