@@ -15,8 +15,8 @@ const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 // ==========================================
 // ФИКС СЕТИ: форсируем IPv4 для всех исходящих запросов
-// Встроенный модуль dns не требует установки дополнительных пакетов.
-// Это заставляет Node.js предпочитать IPv4 при резолвинге доменов.
+// Встроенный модуль dns не требует установки.
+// Заставляет Node.js предпочитать IPv4 при резолвинге доменов.
 // ==========================================
 const dns = require('dns');
 dns.setDefaultResultOrder('ipv4first');
@@ -68,9 +68,6 @@ let adminHistory = [];
 let githubHistory = [];
 let githubSessionActive = false;
 
-// ==========================================
-// ANTIGRAVITY: состояние multi-turn + режим выполнения
-// ==========================================
 let geminiAntigravityPrevId = null;
 let geminiAntigravityEnvId = null;
 let adminAntigravityPrevId = null;
@@ -97,9 +94,6 @@ if (GEMINI_API_KEY) {
     genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 }
 
-// ==========================================
-// МАСКИРОВКА СЕКРЕТОВ В ЛОГАХ
-// ==========================================
 function maskSecrets(s) {
     let r = String(s);
     if (ARTIFACT_TOKEN) r = r.split(ARTIFACT_TOKEN).join('ARTIFACT');
@@ -107,9 +101,6 @@ function maskSecrets(s) {
     return r;
 }
 
-// ==========================================
-// ГИБРИД: системная инструкция и футер для Antigravity
-// ==========================================
 function getAntigravitySystemInstruction(basePrompt) {
     let extra = "";
     if (ARTIFACT_DELIVERY_ENABLED) {
@@ -132,9 +123,6 @@ function buildAntigravityFooter() {
         `⚠️ <b>Все созданные файлы (.bin, .zip и т.д.) остаются в sandbox Google и НЕДОСТУПНЫ на этом сервере</b> — скачать их через <code>/download</code> нельзя. Если нужен файл-артефакт, используйте обычный админ-режим: выберите модель <b>Gemini 3.5 Flash Lite / 3.6 Flash</b> вместо Antigravity — там команды выполняются на этом сервере и файл появится в <code>/tmp</code>.`;
 }
 
-// ==========================================
-// ГИБРИД: push артефакта в GitHub (Contents API, без git)
-// ==========================================
 async function pushArtifactToGitHub(filePath, safeName) {
     if (!GITHUB_ENABLED) return { ok: false, skipped: true, reason: "GITHUB_TOKEN/GITHUB_REPO не настроены" };
     try {
@@ -171,9 +159,6 @@ async function pushArtifactToGitHub(filePath, safeName) {
     }
 }
 
-// ==========================================
-// GITHUB OPS — полноценная работа с репозиторием (Contents API)
-// ==========================================
 function githubApiHeaders() {
     return {
         'Authorization': `Bearer ${GITHUB_TOKEN}`,
@@ -377,7 +362,6 @@ async function githubOps(args) {
             }, null, 2);
         }
 
-        // ---------- GitHub Actions ----------
         const actionsBase = `https://api.github.com/repos/${GITHUB_REPO}/actions`;
 
         if (action === 'list_workflows') {
@@ -478,7 +462,7 @@ async function githubOps(args) {
                     }
                 };
                 walk(extractDir);
-            } catch (unzipErr) {
+            } catch (e) {
                 extracted = [];
                 extractDir = null;
             }
@@ -548,9 +532,6 @@ async function githubOps(args) {
     }
 }
 
-// ==========================================
-// ПОДДЕРЖКА ANTIGRAVITY (Interactions API)
-// ==========================================
 function isAntigravityModel(modelName) {
     return !!(modelName && String(modelName).toLowerCase().includes('antigravity'));
 }
@@ -705,9 +686,6 @@ async function callAntigravityAgent(opts) {
     };
 }
 
-// ==========================================
-// ANTIGRAVITY: НЕБЛОКИРУЮЩИЙ ФОНОВЫЙ ЗАПУСК
-// ==========================================
 function runAntigravityInBackground(opts) {
     const mode = opts.mode;
     (async () => {
@@ -745,9 +723,6 @@ async function getCronPattern(humanText) {
     return pattern;
 }
 
-// ==========================================
-// СИСТЕМА ОЧЕРЕДИ ДЛЯ CRON-ЗАДАЧ (INBOX)
-// ==========================================
 const MESSAGES_FILE = path.join(TMP_DIR, 'inbox.json');
 const JOBS_FILE = path.join(TMP_DIR, 'scheduled_jobs.json');
 let messageInbox = [];
@@ -930,9 +905,6 @@ function initAllCronJobs() {
     });
 }
 
-// ==========================================
-// СИСТЕМА ЛОГИРОВАНИЯ (с маскировкой секретов)
-// ==========================================
 const MAX_LOG_LINES = 100;
 let serverLogs = [];
 
@@ -991,42 +963,15 @@ function decodeBuffer(buffer, contentType) {
     }
 }
 
-// ==========================================
-// ТЕЛЕМЕТРИЯ ЛИМИТОВ
-// ==========================================
 const LIMITS_FILE = path.join(TMP_DIR, 'gemini_limits.json');
 let geminiLimits = {};
 if (fs.existsSync(LIMITS_FILE)) {
     try { geminiLimits = JSON.parse(fs.readFileSync(LIMITS_FILE, 'utf8')); } catch (e) {}
 }
 
-// ==========================================
-// СЕТЕВАЯ УСТОЙЧИВОСТЬ: таймаут + ретрай для обычного fetch
-// ==========================================
-const FETCH_TIMEOUT_MS = 180000;
-
-async function fetchWithTimeoutAndRetry(fetchFn, input, init, attempt = 1) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-    try {
-        const signal = (init && init.signal) ? init.signal : controller.signal;
-        return await fetchFn(input, { ...init, signal });
-    } catch (e) {
-        const isNetworkError = e && (e.name === 'AbortError' || e.cause || /fetch failed/i.test(e.message || ''));
-        if (isNetworkError && attempt < 3) {
-            console.warn(`[FETCH RETRY] Сетевой сбой (${e.message}), повтор попытки ${attempt + 1}/3...`);
-            await new Promise(r => setTimeout(r, 800));
-            return fetchWithTimeoutAndRetry(fetchFn, input, init, attempt + 1);
-        }
-        throw e;
-    } finally {
-        clearTimeout(timer);
-    }
-}
-
 // ============================================================
 // ПАТЧ ГЛОБАЛЬНОГО fetch:
-// 1. Для Google Generative Language API — перенаправляем трафик через axios
+// 1. Для Google Generative Language API — трафик идёт через axios
 //    (стек node:http), минуя дефектный undici на Apply.build.
 // 2. Сохраняем патч ролей 'function' -> 'user' для новых моделей.
 // 3. Сохраняем телеметрию лимитов.
@@ -1102,11 +1047,11 @@ global.fetch = async (input, init) => {
 
             console.log(`[AXIOS TRANSPORT] ${urlStr.substring(0, 80)}... -> ${axRes.status}`);
         } catch (axErr) {
-            console.warn('[AXIOS TRANSPORT] axios сбой, фолбэк на fetch:', axErr.message);
-            response = await fetchWithTimeoutAndRetry(originalFetch, input, patchedInit);
+            console.log(`[AXIOS TRANSPORT] сбой, фолбэк на fetch: ${axErr.message}`);
+            response = await originalFetch(input, patchedInit);
         }
     } else {
-        response = await fetchWithTimeoutAndRetry(originalFetch, input, patchedInit);
+        response = await originalFetch(input, patchedInit);
     }
 
     // --- телеметрия лимитов ---
@@ -1138,9 +1083,6 @@ global.fetch = async (input, init) => {
     return response;
 };
 
-// ==========================================
-// ЭНДПОИНТ ПРИЁМА АРТЕФАКТОВ ОТ ANTIGRAVITY
-// ==========================================
 app.post('/artifact', (req, res) => {
     if (!ARTIFACT_TOKEN) return res.status(500).json({ ok: false, error: "ARTIFACT_TOKEN not set on server" });
     if (req.query.token !== ARTIFACT_TOKEN) return res.status(403).json({ ok: false, error: "Auth failed" });
@@ -1174,9 +1116,6 @@ app.post('/artifact', (req, res) => {
     });
 });
 
-// ==========================================
-// МАРШРУТ УПРАВЛЕНИЯ И GEMINI
-// ==========================================
 app.post('/gemini', async (req, res) => {
     if (req.query.token !== PROXY_SECRET) return res.status(403).json({ ok: false, error: "Auth failed" });
 
@@ -1547,7 +1486,7 @@ app.post('/gemini', async (req, res) => {
         }
         if (antigravityNonBlocking) {
             runAntigravityInBackground({ mode: 'chat', input: agInput, systemInstruction: getAntigravitySystemInstruction("Ты — полезный ИИ-ассистент.") });
-            let stub = "✅ <b>Задача Antigravity принята в фоновый режим.</b><br>Прогресс и ответ появятся во входящих (📬 Планировщик).";
+            let stub = "✅ <b>Задача Antigravity принята в фоновый режим.</b><br>Прогресс и ответ появятся во входящих (📬 Планировщик). Следите за блоками прогресса — они приходят каждые ~10 секунд.";
             if (cronNotificationsHtml) stub = cronNotificationsHtml + '<br>' + stub;
             return res.json({ ok: true, text: stub });
         }
@@ -1595,9 +1534,6 @@ app.post('/gemini', async (req, res) => {
     }
 });
 
-// ==========================================
-// ANTIGRAVITY В РЕЖИМЕ АДМИНИСТРАТОРА
-// ==========================================
 async function handleAntigravityAdmin(userText, req, res, cronNotificationsHtml = "", withGithub = false) {
     let basePrompt = adminSystemPrompt || "Ты — автономный агент-администратор. Выполняй задачу и возвращай краткий результат.";
     if (withGithub && githubSystemPrompt) {
@@ -1611,7 +1547,7 @@ async function handleAntigravityAdmin(userText, req, res, cronNotificationsHtml 
             input: userText,
             systemInstruction: getAntigravitySystemInstruction(basePrompt)
         });
-        let stub = "✅ <b>Задача Antigravity принята в фоновый режим.</b><br>Прогресс и итоговый результат появятся во входящих (📬 Планировщик).";
+        let stub = "✅ <b>Задача Antigravity принята в фоновый режим.</b><br>Прогресс и итоговый результат появятся во входящих (📬 Планировщик). Следите за блоками прогресса — они приходят каждые ~10 секунд.";
         if (withGithub) {
             stub += "<br><br>ℹ️ <b>Подсказка:</b> полноценный <code>github_ops</code> работает на моделях <b>Gemini Flash / Lite</b> (не Antigravity).";
         }
@@ -1638,28 +1574,7 @@ async function handleAntigravityAdmin(userText, req, res, cronNotificationsHtml 
     }
 }
 
-// ==========================================
-// АВТОНОМНЫЙ АДМИНИСТРАТОР С ИНСТРУМЕНТАМИ
-// ==========================================
 async function handleAdminMessage(userText, req, res, cronNotificationsHtml = "", options = {}) {
-    // === ФИКС APPLY.BUILD: async admin через inbox (только при явном ADMIN_ASYNC=true) ===
-    if (adminMode && process.env.ADMIN_ASYNC === 'true') {
-        const stub = "⏳ <b>Задача принята в фоновое выполнение.</b><br>Из-за задержек сети ответ генерируется дольше обычного. Результат придёт во входящие (📬 Планировщик).";
-        res.json({ ok: true, text: cronNotificationsHtml ? cronNotificationsHtml + '<br>' + stub : stub });
-        const fakeRes = {
-            json: (o) => { if (o && o.text) addMessageToInbox(o.text); else if (o && o.error) addMessageToInbox(`❌ <b>Ошибка:</b> ${o.error}`); },
-            status: () => fakeRes
-        };
-        handleAdminMessageCore(userText, req, fakeRes, "", options).catch(e => {
-            console.error("[ADMIN ASYNC ERROR]", e.message);
-            addMessageToInbox(`❌ <b>Критическая ошибка:</b> ${e.message}`);
-        });
-        return;
-    }
-    return handleAdminMessageCore(userText, req, res, cronNotificationsHtml, options);
-}
-
-async function handleAdminMessageCore(userText, req, res, cronNotificationsHtml = "", options = {}) {
     if (!GEMINI_API_KEY) return res.status(500).json({ ok: false, error: "Отсутствует GEMINI_API_KEY" });
     const preferredModel = req.body.model || "gemini-2.5-flash";
     const withGithub = !!(options && options.withGithub);
@@ -2091,9 +2006,6 @@ async function handleAdminMessageCore(userText, req, res, cronNotificationsHtml 
     }
 }
 
-// ==========================================
-// ОСНОВНОЙ ПРОКСИ
-// ==========================================
 app.get('/', async (req, res) => {
     const reqToken = req.query.token;
     if (reqToken !== PROXY_SECRET) return res.status(403).send('Forbidden.');
@@ -2306,9 +2218,6 @@ app.get('/', async (req, res) => {
     }
 });
 
-// ==========================================
-// ИНИЦИАЛИЗАЦИЯ И ЗАПУСК СЕРВЕРА
-// ==========================================
 async function startServer() {
     console.log("[SYSTEM] Проверка окружения перед запуском...");
     try {
