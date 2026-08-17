@@ -798,8 +798,10 @@ function runAntigravityInBackground(opts) {
         }
     })().catch(e => console.error("[ANTIGRAVITY BG UNHANDLED]", e && e.message));
 }
-async function getCronPattern(humanText) {
-    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+async function getCronPattern(humanText, modelName) {
+    // Используем выбранную в чате модель; fallback — актуальная flash-модель (gemini-2.5-flash уже недоступна новым пользователям)
+    const modelId = (modelName && String(modelName).trim()) || "gemini-2.0-flash";
+    const model = genAI.getGenerativeModel({ model: modelId });
     const result = await model.generateContent("Переведи фразу строго в стандартный cron-pattern из 5 параметров (минуты, часы, день, месяц, день недели). Верни ТОЛЬКО строку, например '*/2 * * * *'. Никаких других символов. Фраза: " + humanText);
     let pattern = result.response.text().trim();
     if (!cron.validate(pattern)) return "*/5 * * * *"; // fallback
@@ -850,7 +852,7 @@ function startCronTask(job) {
                 addMessageToInbox(`[Ошибка задачи ${job.id}]: Отсутствует GEMINI_API_KEY`);
                 return;
             }
-            const modelName = job.model || "gemini-2.5-flash";
+            const modelName = job.model || "gemini-2.0-flash";
             // --- Antigravity: фоновая задача через Interactions API ---
             if (isAntigravityModel(modelName)) {
                 try {
@@ -1233,7 +1235,7 @@ app.post('/gemini', async (req, res) => {
             taskText = parts.slice(5).join(' ').trim();
         } else {
             try {
-                pattern = await getCronPattern(payload);
+                pattern = await getCronPattern(payload, req.body.model);
                 taskText = payload;
             } catch (err) {
                 return res.json({ ok: true, text: "❌ Ошибка генерации cron-паттерна: " + err.message });
@@ -1247,7 +1249,7 @@ app.post('/gemini', async (req, res) => {
             id: jobId,
             pattern: pattern,
             taskText: taskText,
-            model: req.body.model || "gemini-2.5-flash",
+            model: req.body.model || "gemini-2.0-flash",
             createdAt: getKyivTime()
         };
         scheduledJobs.push(newJob);
@@ -1536,7 +1538,7 @@ ${deliveryHint}
     if (adminMode && userText && !userText.startsWith('/') && !userText.startsWith('!')) {
         return handleAdminMessage(userText, req, res, cronNotificationsHtml);
     }
-    const modelName = req.body.model || "gemini-2.5-flash";
+    const modelName = req.body.model || "gemini-2.0-flash";
     // --- Antigravity: отдельный путь через Interactions API ---
     if (isAntigravityModel(modelName)) {
         if (req.body.b64 && req.body.mimeType && !String(req.body.mimeType).startsWith('image/')) {
@@ -1649,7 +1651,7 @@ async function handleAntigravityAdmin(userText, req, res, cronNotificationsHtml 
 // ==========================================
 async function handleAdminMessage(userText, req, res, cronNotificationsHtml = "", options = {}) {
     if (!GEMINI_API_KEY) return res.status(500).json({ok: false, error: "Отсутствует GEMINI_API_KEY"});
-    const preferredModel = req.body.model || "gemini-2.5-flash";
+    const preferredModel = req.body.model || "gemini-2.0-flash";
     const withGithub = !!(options && options.withGithub);
     // --- Antigravity: агент работает через Interactions API со своими инструментами ---
     if (isAntigravityModel(preferredModel)) {
