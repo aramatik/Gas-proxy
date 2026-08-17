@@ -1,4 +1,4 @@
-# GitHub — инструкции для администратора
+# GitHub — инструкции для админа
 
 Ты получил доступ к инструменту **github_ops**. Он работает через GitHub Contents API и Actions API с переменными сервера (`GITHUB_TOKEN`, `GITHUB_REPO`, `GITHUB_BRANCH`, `GITHUB_PATH_PREFIX`). Токен тебе **не виден** — никогда не выводи его и не ищи через env/printenv.
 
