@@ -12,6 +12,28 @@ const pipeline = promisify(stream.pipeline);
 const BUCKET = process.env.NF_STORAGE_BUCKET || 'artifacts';
 const PREFIX = (process.env.NF_STORAGE_PREFIX || 'artifacts/').replace(/\/+$/, '') + '/';
 
+// Лимит addon (байты). Env: NF_STORAGE_QUOTA / NF_STORAGE_QUOTA_GB / NF_STORAGE_SIZE
+// По умолчанию 6 ГиБ — типичный Northflank Storage addon
+function parseQuotaBytes() {
+  const raw = process.env.NF_STORAGE_QUOTA || process.env.NF_STORAGE_QUOTA_BYTES || process.env.NF_STORAGE_SIZE || '';
+  if (raw) {
+    const s = String(raw).trim().toLowerCase();
+    const m = s.match(/^(\d+(?:\.\d+)?)\s*(b|kb|kib|mb|mib|gb|gib|tb|tib)?$/);
+    if (m) {
+      const n = parseFloat(m[1]);
+      const u = m[2] || 'b';
+      const mul = ({ b:1, kb:1000, kib:1024, mb:1e6, mib:1024**2, gb:1e9, gib:1024**3, tb:1e12, tib:1024**4 })[u] || 1;
+      return Math.floor(n * mul);
+    }
+    const n = parseInt(s, 10);
+    if (!isNaN(n) && n > 0) return n;
+  }
+  const gb = parseFloat(process.env.NF_STORAGE_QUOTA_GB || '');
+  if (!isNaN(gb) && gb > 0) return Math.floor(gb * 1024 * 1024 * 1024);
+  return 6 * 1024 * 1024 * 1024; // 6 GiB default
+}
+const QUOTA = parseQuotaBytes();
+
 function parseEndpoint(url) {
   if (!url) return null;
   try {
@@ -164,7 +186,18 @@ async function listObjects(prefix = PREFIX, recursive = true) {
       });
     });
     stream.on('error', (err) => resolve({ ok: false, error: err.message, items }));
-    stream.on('end', () => resolve({ ok: true, count: items.length, items }));
+    stream.on('end', () => {
+      const used = items.reduce((s, it) => s + (parseInt(it.size, 10) || 0), 0);
+      resolve({
+        ok: true,
+        count: items.length,
+        items,
+        used,
+        quota: QUOTA,
+        free: Math.max(0, QUOTA - used),
+        total: QUOTA
+      });
+    });
   });
 }
 
@@ -210,6 +243,12 @@ async function status() {
   try {
     await ensureBucket();
     const buckets = await client.listBuckets();
+    // used = сумма размеров всех объектов в PREFIX
+    let used = 0;
+    try {
+      const listed = await listObjects(PREFIX, true);
+      if (listed && listed.ok) used = listed.used || 0;
+    } catch (_) {}
     return {
       ok: true,
       enabled: true,
@@ -217,7 +256,11 @@ async function status() {
       prefix: PREFIX,
       buckets: buckets.map(b => b.name),
       endpoint: process.env.NF_STORAGE_MINIO_ENDPOINT || process.env.NF_STORAGE_HOST,
-      tls: process.env.NF_STORAGE_TLS_ENABLED
+      tls: process.env.NF_STORAGE_TLS_ENABLED,
+      used,
+      quota: QUOTA,
+      free: Math.max(0, QUOTA - used),
+      total: QUOTA
     };
   } catch (err) {
     return { ok: false, enabled: true, error: err.message };
@@ -229,6 +272,7 @@ module.exports = {
   client,
   BUCKET,
   PREFIX,
+  QUOTA,
   ensureBucket,
   uploadFile,
   uploadBuffer,
