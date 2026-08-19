@@ -14,6 +14,7 @@ const execPromise = util.promisify(exec);
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const cron = require('node-cron');
 const FormData = require('form-data');
+const minioStorage = require('./minioStorage');
 const app = express();
 app.use(compression());
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
@@ -45,6 +46,18 @@ if (!fs.existsSync(ARTIFACT_DIR)) {
 // Доставка активна, только если заданы и URL, и токен эндпоинта
 const ARTIFACT_DELIVERY_ENABLED = !!(PUBLIC_URL && ARTIFACT_TOKEN);
 const GITHUB_ENABLED = !!(GITHUB_TOKEN && GITHUB_REPO);
+// ==========================================
+// MINIO (Northflank Storage Addon) — все NF_STORAGE_* переменные
+// ==========================================
+const MINIO_ENABLED = minioStorage.ENABLED;
+(async () => {
+    if (MINIO_ENABLED) {
+        const ok = await minioStorage.ensureBucket();
+        console.log(`[MINIO] Инициализация bucket: ${ok ? 'OK' : 'ОШИБКА'}`);
+    } else {
+        console.log('[MINIO] Отключён (нет NF_STORAGE_ACCESS_KEY / HOST / ENDPOINT)');
+    }
+})();
 let genAI = null;
 let geminiHistory = [];          // история обычного чата
 let adminMode = false;
@@ -1157,10 +1170,103 @@ app.post('/artifact', (req, res) => {
         if (GITHUB_ENABLED) {
             github = await pushArtifactToGitHub(savePath, safeName);
         }
-        res.json({ ok: true, path: savePath, size: bytes, github: github });
+        // === MINIO: постоянное хранилище (6 ГБ на Northflank) ===
+        let minio = { ok: false, skipped: true, reason: "MinIO не настроен" };
+        if (MINIO_ENABLED) {
+            const stamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').slice(0, 19);
+            const objectKey = `${stamp}_${safeName}`;
+            minio = await minioStorage.uploadFile(savePath, objectKey, {
+                contentType: 'application/octet-stream',
+                'x-amz-meta-source': 'artifact-endpoint'
+            });
+        }
+        res.json({ ok: true, path: savePath, size: bytes, github: github, minio: minio });
     });
     writer.on('error', (e) => {
         console.error("[ARTIFACT WRITE ERROR]", e.message);
+        if (!res.headersSent) res.status(500).json({ ok: false, error: e.message });
+    });
+});
+// ==========================================
+// MINIO API ENDPOINTS
+// ==========================================
+app.get('/minio/status', async (req, res) => {
+    if (req.query.token !== PROXY_SECRET && req.query.token !== ARTIFACT_TOKEN) {
+        return res.status(403).json({ ok: false, error: 'Forbidden' });
+    }
+    const st = await minioStorage.status();
+    res.json(st);
+});
+
+app.get('/minio/list', async (req, res) => {
+    if (req.query.token !== PROXY_SECRET && req.query.token !== ARTIFACT_TOKEN) {
+        return res.status(403).json({ ok: false, error: 'Forbidden' });
+    }
+    const prefix = req.query.prefix || undefined;
+    const result = await minioStorage.listObjects(prefix);
+    res.json(result);
+});
+
+app.get('/minio/download', async (req, res) => {
+    if (req.query.token !== PROXY_SECRET && req.query.token !== ARTIFACT_TOKEN) {
+        return res.status(403).json({ ok: false, error: 'Forbidden' });
+    }
+    const key = req.query.key;
+    if (!key) return res.status(400).json({ ok: false, error: 'key required' });
+    try {
+        const stream = await minioStorage.getObjectStream(key);
+        const filename = path.basename(key);
+        res.set('Content-Type', 'application/octet-stream');
+        res.set('Content-Disposition', `attachment; filename="${filename}"`);
+        stream.pipe(res);
+    } catch (err) {
+        res.status(404).json({ ok: false, error: err.message });
+    }
+});
+
+app.get('/minio/presign', async (req, res) => {
+    if (req.query.token !== PROXY_SECRET && req.query.token !== ARTIFACT_TOKEN) {
+        return res.status(403).json({ ok: false, error: 'Forbidden' });
+    }
+    const key = req.query.key;
+    if (!key) return res.status(400).json({ ok: false, error: 'key required' });
+    const expires = parseInt(req.query.expires || '3600', 10);
+    const result = await minioStorage.presignedGet(key, expires);
+    res.json(result);
+});
+
+app.post('/minio/upload', async (req, res) => {
+    if (req.query.token !== PROXY_SECRET && req.query.token !== ARTIFACT_TOKEN) {
+        return res.status(403).json({ ok: false, error: 'Forbidden' });
+    }
+    if (!MINIO_ENABLED) return res.status(503).json({ ok: false, error: 'MinIO disabled' });
+
+    let rawName = String(req.get('x-filename') || req.query.name || 'upload.bin');
+    let safeName = path.basename(rawName).replace(/[^a-zA-Z0-9.\-_]/g, '_') || 'upload.bin';
+    const tmpPath = path.join(TMP_DIR, `minio_up_${Date.now()}_${safeName}`);
+
+    let bytes = 0; let aborted = false;
+    const writer = fs.createWriteStream(tmpPath);
+    req.on('data', (chunk) => {
+        bytes += chunk.length;
+        if (bytes > ARTIFACT_MAX && !aborted) {
+            aborted = true; req.destroy(); writer.close();
+            try { fs.unlinkSync(tmpPath); } catch (_) {}
+        }
+    });
+    req.pipe(writer);
+    writer.on('finish', async () => {
+        if (aborted) return res.status(413).json({ ok: false, error: 'File too large' });
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').slice(0, 19);
+        const objectKey = `${stamp}_${safeName}`;
+        const result = await minioStorage.uploadFile(tmpPath, objectKey, {
+            contentType: req.get('content-type') || 'application/octet-stream'
+        });
+        try { fs.unlinkSync(tmpPath); } catch (_) {}
+        res.json(result);
+    });
+    writer.on('error', (e) => {
+        try { fs.unlinkSync(tmpPath); } catch (_) {}
         if (!res.headersSent) res.status(500).json({ ok: false, error: e.message });
     });
 });
@@ -2323,7 +2429,7 @@ async function startServer() {
     const PORT = process.env.PORT || 8080;
     app.listen(PORT, () => {
         console.log(`[SYSTEM] Сервер успешно запущен на порту ${PORT}`);
-        console.log(`[SYSTEM] Доставка артефактов: ${ARTIFACT_DELIVERY_ENABLED ? 'ВКЛ' : 'ВЫКЛ'} | GitHub: ${GITHUB_ENABLED ? 'ВКЛ (' + GITHUB_REPO + ')' : 'ВЫКЛ'}`);
+        console.log(`[SYSTEM] Доставка артефактов: ${ARTIFACT_DELIVERY_ENABLED ? 'ВКЛ' : 'ВЫКЛ'} | GitHub: ${GITHUB_ENABLED ? 'ВКЛ (' + GITHUB_REPO + ')' : 'ВЫКЛ'} | MinIO: ${MINIO_ENABLED ? 'ВКЛ' : 'ВЫКЛ'}`);
         initAllCronJobs();
     });
 }
