@@ -1270,11 +1270,312 @@ app.post('/minio/upload', async (req, res) => {
         if (!res.headersSent) res.status(500).json({ ok: false, error: e.message });
     });
 });
+
+// ==========================================
+// MINIO JSON API (для FileManager: list/upload/delete/mkdir/move/copy/to_tmp/...)
+// ==========================================
+app.post('/minio', async (req, res) => {
+    if (req.query.token !== PROXY_SECRET && req.query.token !== ARTIFACT_TOKEN) {
+        return res.status(403).json({ ok: false, error: 'Forbidden' });
+    }
+    if (!MINIO_ENABLED) {
+        return res.status(503).json({ ok: false, error: 'MinIO disabled (нет NF_STORAGE_*)' });
+    }
+    const op = String(req.body.op || req.body.action || '').toLowerCase();
+    const PREFIX = minioStorage.PREFIX || '';
+    const BUCKET = minioStorage.BUCKET;
+    const client = minioStorage.client;
+
+    function fullKey(k) {
+        k = String(k || '').replace(/^\/+/, '');
+        if (!k) return PREFIX;
+        if (PREFIX && k.startsWith(PREFIX)) return k;
+        return PREFIX + k;
+    }
+    function relKey(k) {
+        k = String(k || '');
+        if (PREFIX && k.startsWith(PREFIX)) return k.substring(PREFIX.length);
+        return k;
+    }
+
+    try {
+        if (op === 'status') {
+            const st = await minioStorage.status();
+            return res.json(st);
+        }
+
+        if (op === 'list') {
+            let prefix = String(req.body.prefix || req.query.prefix || '');
+            prefix = prefix.replace(/^\/+/, '');
+            const listPrefix = prefix ? fullKey(prefix.endsWith('/') ? prefix : prefix + '/') : PREFIX;
+            // non-recursive listing by delimiter is not exposed; use recursive and group on client
+            const result = await minioStorage.listObjects(listPrefix, true);
+            if (!result.ok) return res.json(result);
+            const items = (result.items || []).map(it => ({
+                name: relKey(it.name),
+                key: relKey(it.name),
+                size: it.size || 0,
+                lastModified: it.lastModified,
+                etag: it.etag
+            }));
+            return res.json({ ok: true, count: items.length, items, prefix: relKey(listPrefix), bucket: BUCKET });
+        }
+
+        if (op === 'upload') {
+            const keyIn = String(req.body.key || req.body.filename || '');
+            if (!keyIn) return res.status(400).json({ ok: false, error: 'key required' });
+            const b64 = req.body.b64;
+            if (b64 === undefined || b64 === null) return res.status(400).json({ ok: false, error: 'b64 required' });
+            const buf = Buffer.from(String(b64), 'base64');
+            const contentType = req.body.contentType || req.body.content_type || 'application/octet-stream';
+            const result = await minioStorage.uploadBuffer(buf, fullKey(keyIn), { contentType });
+            if (result.ok) result.key = relKey(result.key);
+            return res.json(result);
+        }
+
+        if (op === 'upload_from_server') {
+            const localPath = String(req.body.local_path || req.body.path || '');
+            const keyIn = String(req.body.key || path.basename(localPath));
+            if (!localPath || !fs.existsSync(localPath)) {
+                return res.status(400).json({ ok: false, error: 'local_path not found: ' + localPath });
+            }
+            const result = await minioStorage.uploadFile(localPath, fullKey(keyIn), {
+                contentType: req.body.contentType || 'application/octet-stream'
+            });
+            if (result.ok) result.key = relKey(result.key);
+            return res.json(result);
+        }
+
+        if (op === 'to_tmp' || op === 'download') {
+            const keyIn = String(req.body.key || '');
+            if (!keyIn) return res.status(400).json({ ok: false, error: 'key required' });
+            let localPath = String(req.body.local_path || '');
+            if (!localPath) {
+                const base = path.basename(keyIn.replace(/\/+$/, '')) || ('minio_' + Date.now());
+                localPath = path.join(TMP_DIR, base);
+            }
+            const result = await minioStorage.downloadToFile(fullKey(keyIn), localPath);
+            if (result.ok) result.key = relKey(result.key);
+            return res.json(result);
+        }
+
+        if (op === 'delete' || op === 'remove') {
+            let keys = req.body.keys;
+            if (!keys && req.body.key) keys = [req.body.key];
+            if (!Array.isArray(keys) || keys.length === 0) {
+                return res.status(400).json({ ok: false, error: 'key/keys required' });
+            }
+            const results = [];
+            for (const k of keys) {
+                const kk = String(k);
+                // if "folder" (ends with /) — delete all under prefix
+                if (kk.endsWith('/')) {
+                    const list = await minioStorage.listObjects(fullKey(kk), true);
+                    if (list.ok && list.items) {
+                        for (const it of list.items) {
+                            results.push(await minioStorage.removeObject(it.name));
+                        }
+                    }
+                    // also try remove marker if any
+                    results.push(await minioStorage.removeObject(fullKey(kk)));
+                } else {
+                    results.push(await minioStorage.removeObject(fullKey(kk)));
+                }
+            }
+            const failed = results.filter(r => !r.ok);
+            return res.json({
+                ok: failed.length === 0,
+                deleted: results.filter(r => r.ok).length,
+                error: failed.length ? failed[0].error : undefined
+            });
+        }
+
+        if (op === 'mkdir') {
+            let keyIn = String(req.body.key || req.body.prefix || '');
+            if (!keyIn) return res.status(400).json({ ok: false, error: 'key required' });
+            if (!keyIn.endsWith('/')) keyIn += '/';
+            // S3 "folder" = zero-byte object with trailing slash
+            const result = await minioStorage.uploadBuffer(Buffer.alloc(0), fullKey(keyIn), {
+                contentType: 'application/x-directory'
+            });
+            if (result.ok) result.key = relKey(result.key);
+            return res.json(result);
+        }
+
+        if (op === 'presign') {
+            const keyIn = String(req.body.key || '');
+            if (!keyIn) return res.status(400).json({ ok: false, error: 'key required' });
+            const expiry = parseInt(req.body.expiry || req.body.expires || '3600', 10);
+            return res.json(await minioStorage.presignedGet(fullKey(keyIn), expiry));
+        }
+
+        if (op === 'copy' || op === 'move') {
+            const from = String(req.body.from || req.body.key || '');
+            const to = String(req.body.to || req.body.dest || '');
+            if (!from || !to) return res.status(400).json({ ok: false, error: 'from and to required' });
+            const srcKey = fullKey(from);
+            const dstKey = fullKey(to);
+            try {
+                // minio-js: copyObject(bucket, object, sourceObject)
+                await client.copyObject(BUCKET, dstKey, '/' + BUCKET + '/' + srcKey);
+                if (op === 'move') {
+                    await minioStorage.removeObject(srcKey);
+                }
+                return res.json({ ok: true, from: relKey(srcKey), to: relKey(dstKey), op });
+            } catch (err) {
+                // fallback: download + upload for small files
+                try {
+                    const tmp = path.join(TMP_DIR, 'minio_mv_' + Date.now());
+                    const dl = await minioStorage.downloadToFile(srcKey, tmp);
+                    if (!dl.ok) return res.json(dl);
+                    const up = await minioStorage.uploadFile(tmp, dstKey);
+                    try { fs.unlinkSync(tmp); } catch (_) {}
+                    if (!up.ok) return res.json(up);
+                    if (op === 'move') await minioStorage.removeObject(srcKey);
+                    return res.json({ ok: true, from: relKey(srcKey), to: relKey(dstKey), op, via: 'download-upload' });
+                } catch (e2) {
+                    return res.json({ ok: false, error: err.message || e2.message });
+                }
+            }
+        }
+
+        return res.status(400).json({ ok: false, error: 'Unknown minio op: ' + op });
+    } catch (err) {
+        console.error('[MINIO API]', err.message);
+        return res.status(500).json({ ok: false, error: err.message });
+    }
+});
+
 // ==========================================
 // МАРШРУТ УПРАВЛЕНИЯ И GEMINI
 // ==========================================
 app.post('/gemini', async (req, res) => {
     if (req.query.token !== PROXY_SECRET) return res.status(403).json({ok: false, error: "Auth failed"});
+    // MinIO ops from FileManager (тот же payload, что и POST /minio)
+    if (req.body.action === 'minio') {
+        // переиспользуем тот же код через внутренний вызов: просто проксируем логику
+        req.url = '/minio?token=' + encodeURIComponent(PROXY_SECRET);
+        // inline dispatch
+        const op = String(req.body.op || '').toLowerCase();
+        if (!MINIO_ENABLED) return res.status(503).json({ ok: false, error: 'MinIO disabled (нет NF_STORAGE_*)' });
+        const PREFIX = minioStorage.PREFIX || '';
+        const BUCKET = minioStorage.BUCKET;
+        const client = minioStorage.client;
+        function fullKey(k) {
+            k = String(k || '').replace(/^\/+/, '');
+            if (!k) return PREFIX;
+            if (PREFIX && k.startsWith(PREFIX)) return k;
+            return PREFIX + k;
+        }
+        function relKey(k) {
+            k = String(k || '');
+            if (PREFIX && k.startsWith(PREFIX)) return k.substring(PREFIX.length);
+            return k;
+        }
+        try {
+            if (op === 'status') return res.json(await minioStorage.status());
+            if (op === 'list') {
+                let prefix = String(req.body.prefix || '');
+                prefix = prefix.replace(/^\/+/, '');
+                const listPrefix = prefix ? fullKey(prefix.endsWith('/') ? prefix : prefix + '/') : PREFIX;
+                const result = await minioStorage.listObjects(listPrefix, true);
+                if (!result.ok) return res.json(result);
+                const items = (result.items || []).map(it => ({
+                    name: relKey(it.name), key: relKey(it.name),
+                    size: it.size || 0, lastModified: it.lastModified, etag: it.etag
+                }));
+                return res.json({ ok: true, count: items.length, items, prefix: relKey(listPrefix), bucket: BUCKET });
+            }
+            if (op === 'upload') {
+                const keyIn = String(req.body.key || req.body.filename || '');
+                if (!keyIn) return res.status(400).json({ ok: false, error: 'key required' });
+                if (req.body.b64 === undefined || req.body.b64 === null) return res.status(400).json({ ok: false, error: 'b64 required' });
+                const buf = Buffer.from(String(req.body.b64), 'base64');
+                const result = await minioStorage.uploadBuffer(buf, fullKey(keyIn), {
+                    contentType: req.body.contentType || 'application/octet-stream'
+                });
+                if (result.ok) result.key = relKey(result.key);
+                return res.json(result);
+            }
+            if (op === 'upload_from_server') {
+                const localPath = String(req.body.local_path || req.body.path || '');
+                const keyIn = String(req.body.key || path.basename(localPath));
+                if (!localPath || !fs.existsSync(localPath)) return res.status(400).json({ ok: false, error: 'local_path not found: ' + localPath });
+                const result = await minioStorage.uploadFile(localPath, fullKey(keyIn), { contentType: req.body.contentType || 'application/octet-stream' });
+                if (result.ok) result.key = relKey(result.key);
+                return res.json(result);
+            }
+            if (op === 'to_tmp' || op === 'download') {
+                const keyIn = String(req.body.key || '');
+                if (!keyIn) return res.status(400).json({ ok: false, error: 'key required' });
+                let localPath = String(req.body.local_path || '');
+                if (!localPath) {
+                    const base = path.basename(keyIn.replace(/\/+$/, '')) || ('minio_' + Date.now());
+                    localPath = path.join(TMP_DIR, base);
+                }
+                const result = await minioStorage.downloadToFile(fullKey(keyIn), localPath);
+                if (result.ok) result.key = relKey(result.key);
+                return res.json(result);
+            }
+            if (op === 'delete' || op === 'remove') {
+                let keys = req.body.keys;
+                if (!keys && req.body.key) keys = [req.body.key];
+                if (!Array.isArray(keys) || keys.length === 0) return res.status(400).json({ ok: false, error: 'key/keys required' });
+                const results = [];
+                for (const k of keys) {
+                    const kk = String(k);
+                    if (kk.endsWith('/')) {
+                        const list = await minioStorage.listObjects(fullKey(kk), true);
+                        if (list.ok && list.items) {
+                            for (const it of list.items) results.push(await minioStorage.removeObject(it.name));
+                        }
+                        results.push(await minioStorage.removeObject(fullKey(kk)));
+                    } else {
+                        results.push(await minioStorage.removeObject(fullKey(kk)));
+                    }
+                }
+                const failed = results.filter(r => !r.ok);
+                return res.json({ ok: failed.length === 0, deleted: results.filter(r => r.ok).length, error: failed.length ? failed[0].error : undefined });
+            }
+            if (op === 'mkdir') {
+                let keyIn = String(req.body.key || req.body.prefix || '');
+                if (!keyIn) return res.status(400).json({ ok: false, error: 'key required' });
+                if (!keyIn.endsWith('/')) keyIn += '/';
+                const result = await minioStorage.uploadBuffer(Buffer.alloc(0), fullKey(keyIn), { contentType: 'application/x-directory' });
+                if (result.ok) result.key = relKey(result.key);
+                return res.json(result);
+            }
+            if (op === 'presign') {
+                const keyIn = String(req.body.key || '');
+                if (!keyIn) return res.status(400).json({ ok: false, error: 'key required' });
+                const expiry = parseInt(req.body.expiry || req.body.expires || '3600', 10);
+                return res.json(await minioStorage.presignedGet(fullKey(keyIn), expiry));
+            }
+            if (op === 'copy' || op === 'move') {
+                const from = String(req.body.from || req.body.key || '');
+                const to = String(req.body.to || req.body.dest || '');
+                if (!from || !to) return res.status(400).json({ ok: false, error: 'from and to required' });
+                const srcKey = fullKey(from);
+                const dstKey = fullKey(to);
+                try {
+                    const tmp = path.join(TMP_DIR, 'minio_mv_' + Date.now());
+                    const dl = await minioStorage.downloadToFile(srcKey, tmp);
+                    if (!dl.ok) return res.json(dl);
+                    const up = await minioStorage.uploadFile(tmp, dstKey);
+                    try { fs.unlinkSync(tmp); } catch (_) {}
+                    if (!up.ok) return res.json(up);
+                    if (op === 'move') await minioStorage.removeObject(srcKey);
+                    return res.json({ ok: true, from: relKey(srcKey), to: relKey(dstKey), op });
+                } catch (e2) {
+                    return res.json({ ok: false, error: e2.message });
+                }
+            }
+            return res.status(400).json({ ok: false, error: 'Unknown minio op: ' + op });
+        } catch (err) {
+            console.error('[MINIO][gemini]', err.message);
+            return res.status(500).json({ ok: false, error: err.message });
+        }
+    }
     // Обработчик опроса уведомлений планировщика
     if (req.body.action === 'poll_inbox') {
         const notifications = messageInbox.map(msg => ({
