@@ -17,8 +17,8 @@ const FormData = require('form-data');
 const minioStorage = require('./minioStorage');
 const app = express();
 app.use(compression());
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
-app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '150mb' }));
+app.use(express.json({ limit: '150mb' }));
 const MAX_FILE_SIZE = 130 * 1024 * 1024;
 const CHUNK_SIZE_MB = 15;
 const TMP_DIR = '/tmp';
@@ -38,7 +38,7 @@ const GITHUB_REPO = process.env.GITHUB_REPO || "";                // owner/repo
 const GITHUB_BRANCH = process.env.GITHUB_BRANCH || "main";
 const GITHUB_PATH_PREFIX = process.env.GITHUB_PATH_PREFIX || "artifacts/";
 const ARTIFACT_DIR = path.join(TMP_DIR, 'artifacts');
-const ARTIFACT_MAX = 50 * 1024 * 1024; // 50 МБ на приём
+const ARTIFACT_MAX = 130 * 1024 * 1024; // 130 МБ на приём (согласовано с MAX_FILE_SIZE)
 const GITHUB_CONTENTS_MAX = 1 * 1024 * 1024; // лимит GitHub Contents API ~1 МБ
 if (!fs.existsSync(ARTIFACT_DIR)) {
     try { fs.mkdirSync(ARTIFACT_DIR, { recursive: true }); } catch (e) { console.warn("[ARTIFACT] Не удалось создать папку:", e.message); }
@@ -1187,6 +1187,119 @@ app.post('/artifact', (req, res) => {
         if (!res.headersSent) res.status(500).json({ ok: false, error: e.message });
     });
 });
+
+// ==========================================
+// FILE UPLOAD (raw binary, без base64) — FM / APK
+// POST /file-upload?token=PROXY_SECRET
+// Headers:
+//   X-Filename: оригинальное имя
+//   X-Dest: fs | minio
+//   X-Path: полный путь FS (/tmp/a.bin) или ключ MinIO (folder/a.bin)
+//   Content-Type: application/octet-stream
+// Body: сырые байты файла
+// ==========================================
+const FILE_UPLOAD_MAX = parseInt(process.env.FILE_UPLOAD_MAX || String(512 * 1024 * 1024), 10); // 512 МБ по умолчанию
+
+function sanitizeUploadName(raw) {
+    let name = path.basename(String(raw || 'upload.bin'));
+    name = name.replace(/[\x00-\x1f\\/<>:"|?*]/g, '_').replace(/_+/g, '_').trim();
+    if (!name || name === '.' || name === '..') name = 'upload.bin';
+    return name;
+}
+
+app.post('/file-upload', (req, res) => {
+    if (req.query.token !== PROXY_SECRET && req.query.token !== ARTIFACT_TOKEN) {
+        return res.status(403).json({ ok: false, error: 'Forbidden' });
+    }
+
+    const dest = String(req.get('x-dest') || req.query.dest || 'fs').toLowerCase();
+    let filename = sanitizeUploadName(req.get('x-filename') || req.query.name || 'upload.bin');
+    let targetPath = String(req.get('x-path') || req.query.path || '').trim();
+
+    // FS: если X-Path — директория или пусто → /tmp/filename; если путь с именем — используем его
+    let savePath;
+    let minioKey = '';
+    if (dest === 'minio') {
+        if (!MINIO_ENABLED) return res.status(503).json({ ok: false, error: 'MinIO disabled' });
+        minioKey = targetPath.replace(/^\/+/, '');
+        if (!minioKey || minioKey.endsWith('/')) minioKey = (minioKey || '') + filename;
+        // временный файл на диск, потом в MinIO
+        savePath = path.join(TMP_DIR, 'up_' + Date.now() + '_' + filename.replace(/[^\w.\-]+/g, '_'));
+    } else {
+        if (targetPath && !targetPath.endsWith('/')) {
+            // полный путь к файлу
+            savePath = path.resolve(targetPath);
+            filename = path.basename(savePath);
+        } else {
+            const dir = targetPath && targetPath.endsWith('/') ? targetPath.slice(0, -1) : (targetPath || TMP_DIR);
+            const resolvedDir = path.resolve(dir || TMP_DIR);
+            savePath = path.join(resolvedDir, filename);
+        }
+        // не даём выйти совсем в произвольные места через .. — мягкая проверка
+        if (savePath.indexOf('\0') >= 0) {
+            return res.status(400).json({ ok: false, error: 'bad path' });
+        }
+        try { fs.mkdirSync(path.dirname(savePath), { recursive: true }); } catch (_) {}
+    }
+
+    let bytes = 0;
+    let aborted = false;
+    const writer = fs.createWriteStream(savePath);
+
+    req.on('data', (chunk) => {
+        bytes += chunk.length;
+        if (bytes > FILE_UPLOAD_MAX && !aborted) {
+            aborted = true;
+            req.destroy();
+            writer.close();
+            try { fs.unlinkSync(savePath); } catch (_) {}
+        }
+    });
+    req.pipe(writer);
+
+    writer.on('finish', async () => {
+        if (aborted) {
+            return res.status(413).json({
+                ok: false,
+                error: `Файл слишком большой (лимит ${Math.floor(FILE_UPLOAD_MAX / 1024 / 1024)} МБ). Env FILE_UPLOAD_MAX`
+            });
+        }
+        try {
+            if (dest === 'minio') {
+                const result = await minioStorage.uploadFile(savePath, minioKey, {
+                    contentType: req.get('content-type') || 'application/octet-stream'
+                });
+                try { fs.unlinkSync(savePath); } catch (_) {}
+                if (!result.ok) return res.status(500).json(result);
+                console.log(`[FILE-UPLOAD] MinIO ${minioKey} (${bytes} bytes)`);
+                return res.json({
+                    ok: true,
+                    dest: 'minio',
+                    key: result.key || minioKey,
+                    filename,
+                    size: bytes
+                });
+            }
+            console.log(`[FILE-UPLOAD] FS ${savePath} (${bytes} bytes)`);
+            return res.json({
+                ok: true,
+                dest: 'fs',
+                path: savePath,
+                filename,
+                size: bytes
+            });
+        } catch (e) {
+            try { fs.unlinkSync(savePath); } catch (_) {}
+            console.error('[FILE-UPLOAD]', e.message);
+            return res.status(500).json({ ok: false, error: e.message });
+        }
+    });
+    writer.on('error', (e) => {
+        try { fs.unlinkSync(savePath); } catch (_) {}
+        if (!res.headersSent) res.status(500).json({ ok: false, error: e.message });
+    });
+});
+
 // ==========================================
 // MINIO API ENDPOINTS
 // ==========================================
@@ -1242,7 +1355,8 @@ app.post('/minio/upload', async (req, res) => {
     if (!MINIO_ENABLED) return res.status(503).json({ ok: false, error: 'MinIO disabled' });
 
     let rawName = String(req.get('x-filename') || req.query.name || 'upload.bin');
-    let safeName = path.basename(rawName).replace(/[^a-zA-Z0-9.\-_]/g, '_') || 'upload.bin';
+    let safeName = path.basename(rawName).replace(/[\x00-\x1f\\/<>:"|?*]/g, '_').replace(/_+/g, '_').trim() || 'upload.bin';
+    if (safeName === '.' || safeName === '..') safeName = 'upload.bin';
     const tmpPath = path.join(TMP_DIR, `minio_up_${Date.now()}_${safeName}`);
 
     let bytes = 0; let aborted = false;
@@ -1257,8 +1371,8 @@ app.post('/minio/upload', async (req, res) => {
     req.pipe(writer);
     writer.on('finish', async () => {
         if (aborted) return res.status(413).json({ ok: false, error: 'File too large' });
-        const stamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').slice(0, 19);
-        const objectKey = `${stamp}_${safeName}`;
+        // имя: query.key / body не используется (raw stream); сохраняем оригинальное имя
+        const objectKey = String(req.query.key || req.get('x-object-key') || safeName).replace(/^\/+/, '');
         const result = await minioStorage.uploadFile(tmpPath, objectKey, {
             contentType: req.get('content-type') || 'application/octet-stream'
         });
@@ -1620,7 +1734,10 @@ app.post('/gemini', async (req, res) => {
     }
     if (req.body.action === 'upload') {
         try {
-            const filename = req.body.filename.replace(/[^a-zA-Z0-9.\-_]/g, '_');
+            let filename = path.basename(String(req.body.filename || 'upload.bin'));
+            // сохраняем оригинал: только убираем path-separators и управляющие
+            filename = filename.replace(/[\x00-\x1f\\/<>:"|?*]/g, '_').replace(/_+/g, '_').trim() || 'upload.bin';
+            if (filename === '.' || filename === '..') filename = 'upload.bin';
             const savePath = path.join(TMP_DIR, filename);
             fs.writeFileSync(savePath, Buffer.from(req.body.b64, 'base64'));
             console.log(`[UPLOAD] Файл сохранен: ${savePath}`);
