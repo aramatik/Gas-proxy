@@ -1318,7 +1318,21 @@ app.post('/minio', async (req, res) => {
                 lastModified: it.lastModified,
                 etag: it.etag
             }));
-            return res.json({ ok: true, count: items.length, items, prefix: relKey(listPrefix), bucket: BUCKET });
+            const used = typeof result.used === 'number'
+                ? result.used
+                : items.reduce((s, it) => s + (it.size || 0), 0);
+            const quota = (typeof result.quota === 'number' ? result.quota : minioStorage.QUOTA) || 0;
+            return res.json({
+                ok: true,
+                count: items.length,
+                items,
+                prefix: relKey(listPrefix),
+                bucket: BUCKET,
+                used,
+                quota,
+                free: Math.max(0, quota - used),
+                total: quota
+            });
         }
 
         if (op === 'upload') {
@@ -1484,7 +1498,14 @@ app.post('/gemini', async (req, res) => {
                     name: relKey(it.name), key: relKey(it.name),
                     size: it.size || 0, lastModified: it.lastModified, etag: it.etag
                 }));
-                return res.json({ ok: true, count: items.length, items, prefix: relKey(listPrefix), bucket: BUCKET });
+                const used = typeof result.used === 'number'
+                    ? result.used
+                    : items.reduce((s, it) => s + (it.size || 0), 0);
+                const quota = (typeof result.quota === 'number' ? result.quota : minioStorage.QUOTA) || 0;
+                return res.json({
+                    ok: true, count: items.length, items, prefix: relKey(listPrefix), bucket: BUCKET,
+                    used, quota, free: Math.max(0, quota - used), total: quota
+                });
             }
             if (op === 'upload') {
                 const keyIn = String(req.body.key || req.body.filename || '');
