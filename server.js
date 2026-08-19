@@ -1207,7 +1207,16 @@ function sanitizeUploadName(raw) {
     return name;
 }
 
+app.options('/file-upload', (req, res) => {
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Content-Type, X-Filename, X-Dest, X-Path');
+    res.set('Access-Control-Max-Age', '86400');
+    return res.status(204).end();
+});
+
 app.post('/file-upload', (req, res) => {
+    res.set('Access-Control-Allow-Origin', '*');
     if (req.query.token !== PROXY_SECRET && req.query.token !== ARTIFACT_TOKEN) {
         return res.status(403).json({ ok: false, error: 'Forbidden' });
     }
