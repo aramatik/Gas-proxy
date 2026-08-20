@@ -1586,6 +1586,63 @@ app.post('/minio', async (req, res) => {
 // ==========================================
 // GitHub FS — файловый менеджер (Contents API)
 // ==========================================
+
+// Скачивание файла из GitHub с принудительным attachment (не открывать как текст в браузере)
+app.get('/github-fs/download', async (req, res) => {
+    if (req.query.token !== PROXY_SECRET && req.query.token !== ARTIFACT_TOKEN) {
+        return res.status(403).send('Forbidden');
+    }
+    if (!GITHUB_ENABLED) {
+        return res.status(503).send('GitHub not configured');
+    }
+    const pathInRepo = normalizeRepoPath(req.query.path || '');
+    if (!pathInRepo) return res.status(400).send('path required');
+    const branch = GITHUB_BRANCH || 'main';
+    const safeName = path.basename(pathInRepo).replace(/[^a-zA-Z0-9.\-_]/g, '_') || 'download.bin';
+
+    try {
+        const metaUrl = `https://api.github.com/repos/${GITHUB_REPO}/contents/${pathInRepo}?ref=${encodeURIComponent(branch)}`;
+        const meta = await axios.get(metaUrl, { headers: githubApiHeaders(), timeout: 30000 });
+        const data = meta.data;
+        if (!data || data.type === 'dir' || Array.isArray(data)) {
+            return res.status(400).send('path is a directory');
+        }
+
+        let buf;
+        if (data.download_url) {
+            const fileResp = await axios.get(data.download_url, {
+                responseType: 'arraybuffer',
+                headers: {
+                    'User-Agent': 'northflank-github-fs',
+                    'Accept': 'application/octet-stream',
+                    // для private repo download_url уже с token; для public достаточно
+                    ...(GITHUB_TOKEN ? { 'Authorization': `Bearer ${GITHUB_TOKEN}` } : {})
+                },
+                timeout: 180000,
+                maxContentLength: 100 * 1024 * 1024,
+                maxRedirects: 5
+            });
+            buf = Buffer.from(fileResp.data);
+        } else if (data.encoding === 'base64' && data.content) {
+            buf = Buffer.from(String(data.content).replace(/\n/g, ''), 'base64');
+        } else {
+            return res.status(404).send('No content');
+        }
+
+        res.set('Content-Type', 'application/octet-stream');
+        res.set('Content-Disposition', `attachment; filename="${safeName}"`);
+        res.set('Content-Length', String(buf.length));
+        res.set('Cache-Control', 'no-store');
+        console.log(`[GITHUB-FS] Download ${pathInRepo} (${buf.length} bytes) → ${safeName}`);
+        return res.send(buf);
+    } catch (err) {
+        const status = (err.response && err.response.status) || 500;
+        const detail = (err.response && err.response.data && (err.response.data.message || JSON.stringify(err.response.data))) || err.message;
+        console.error('[GITHUB-FS DOWNLOAD]', detail);
+        if (!res.headersSent) return res.status(status === 404 ? 404 : 500).send(String(detail).substring(0, 200));
+    }
+});
+
 app.post('/github-fs', async (req, res) => {
     if (req.query.token !== PROXY_SECRET && req.query.token !== ARTIFACT_TOKEN) {
         return res.status(403).json({ ok: false, error: 'Forbidden' });
@@ -1772,13 +1829,11 @@ app.post('/github-fs', async (req, res) => {
         }
 
         if (op === 'presign') {
-            const getRaw = await githubOps({ action: 'get', path: pathInRepo, branch });
-            const getData = typeof getRaw === 'string' ? JSON.parse(getRaw) : getRaw;
-            if (!getData.ok) return res.json(getData);
-            if (!getData.download_url && !getData.html_url) {
-                return res.json({ ok: false, error: 'Нет download_url' });
-            }
-            return res.json({ ok: true, url: getData.download_url || getData.html_url });
+            // Прокси через наш сервер — Content-Disposition: attachment (иначе Chrome открывает raw как текст)
+            if (!pathInRepo) return res.json({ ok: false, error: 'path обязателен' });
+            const baseUrl = (PUBLIC_URL || '').replace(/\/+$/, '') || `${req.protocol}://${req.get('host')}`;
+            const url = `${baseUrl}/github-fs/download?token=${encodeURIComponent(PROXY_SECRET)}&path=${encodeURIComponent(pathInRepo)}`;
+            return res.json({ ok: true, url, path: pathInRepo });
         }
 
         return res.json({
