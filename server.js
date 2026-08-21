@@ -1406,10 +1406,13 @@ app.post('/minio', async (req, res) => {
     const client = minioStorage.client;
 
     function fullKey(k) {
+        // Всегда добавляем PREFIX. Раньше startsWith(PREFIX) ломал папку с тем же именем
+        // (PREFIX="artifacts/" + key="artifacts/file" → не префиксировалось → в list файл оказывался в корне).
         k = String(k || '').replace(/^\/+/, '');
-        if (!k) return PREFIX;
-        if (PREFIX && k.startsWith(PREFIX)) return k;
-        return PREFIX + k;
+        if (!PREFIX) return k;
+        var p = PREFIX.endsWith('/') ? PREFIX : (PREFIX + '/');
+        if (!k) return p;
+        return p + k;
     }
     function relKey(k) {
         k = String(k || '');
@@ -1860,10 +1863,12 @@ app.post('/gemini', async (req, res) => {
         const BUCKET = minioStorage.BUCKET;
         const client = minioStorage.client;
         function fullKey(k) {
+            // Всегда PREFIX + key (не startsWith — иначе папка "artifacts" при PREFIX=artifacts/ ломается)
             k = String(k || '').replace(/^\/+/, '');
-            if (!k) return PREFIX;
-            if (PREFIX && k.startsWith(PREFIX)) return k;
-            return PREFIX + k;
+            if (!PREFIX) return k;
+            var p = PREFIX.endsWith('/') ? PREFIX : (PREFIX + '/');
+            if (!k) return p;
+            return p + k;
         }
         function relKey(k) {
             k = String(k || '');
