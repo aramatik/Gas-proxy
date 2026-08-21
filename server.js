@@ -22,7 +22,7 @@ app.use(express.json({ limit: '150mb' }));
 const MAX_FILE_SIZE = 130 * 1024 * 1024;
 const CHUNK_SIZE_MB = 15;
 const TMP_DIR = '/tmp';
-const PROXY_SECRET = process.env.PROXY_SECRET || "MySuperSecretPassword2026";
+const PROXY_SECRET = process.env.PROXY_SECRET || "";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY || "";
 const SOCKS5_PROXY = process.env.SOCKS5_PROXY || "";
@@ -1329,11 +1329,18 @@ app.get('/minio/download', async (req, res) => {
     if (req.query.token !== PROXY_SECRET && req.query.token !== ARTIFACT_TOKEN) {
         return res.status(403).json({ ok: false, error: 'Forbidden' });
     }
-    const key = req.query.key;
+    let key = String(req.query.key || '').replace(/^\/+/, '');
     if (!key) return res.status(400).json({ ok: false, error: 'key required' });
+    // Приводим к storage-ключу с PREFIX (как в POST /minio)
+    const PREFIX = minioStorage.PREFIX || '';
+    if (PREFIX) {
+        const p = PREFIX.endsWith('/') ? PREFIX : (PREFIX + '/');
+        while (key.indexOf(p + p) === 0) key = key.substring(p.length);
+        if (key.indexOf(p) !== 0) key = p + key;
+    }
     try {
         const stream = await minioStorage.getObjectStream(key);
-        const filename = path.basename(key);
+        const filename = path.basename(String(req.query.key || key).replace(/\/+$/, '')) || 'download';
         res.set('Content-Type', 'application/octet-stream');
         res.set('Content-Disposition', `attachment; filename="${filename}"`);
         stream.pipe(res);
@@ -1346,8 +1353,14 @@ app.get('/minio/presign', async (req, res) => {
     if (req.query.token !== PROXY_SECRET && req.query.token !== ARTIFACT_TOKEN) {
         return res.status(403).json({ ok: false, error: 'Forbidden' });
     }
-    const key = req.query.key;
+    let key = String(req.query.key || '').replace(/^\/+/, '');
     if (!key) return res.status(400).json({ ok: false, error: 'key required' });
+    const PREFIX = minioStorage.PREFIX || '';
+    if (PREFIX) {
+        const p = PREFIX.endsWith('/') ? PREFIX : (PREFIX + '/');
+        while (key.indexOf(p + p) === 0) key = key.substring(p.length);
+        if (key.indexOf(p) !== 0) key = p + key;
+    }
     const expires = parseInt(req.query.expires || '3600', 10);
     const result = await minioStorage.presignedGet(key, expires);
     res.json(result);
@@ -1406,17 +1419,23 @@ app.post('/minio', async (req, res) => {
     const client = minioStorage.client;
 
     function fullKey(k) {
-        // Всегда добавляем PREFIX. Раньше startsWith(PREFIX) ломал папку с тем же именем
-        // (PREFIX="artifacts/" + key="artifacts/file" → не префиксировалось → в list файл оказывался в корне).
+        // Ключи API — относительные (без PREFIX). В storage: ровно один PREFIX.
+        // Не схлопываем user-папку "artifacts" (PREFIX+artifacts/file → artifacts/artifacts/file).
+        // Снимаем только случайный двойной PREFIX (artifacts/artifacts/artifacts/...).
         k = String(k || '').replace(/^\/+/, '');
         if (!PREFIX) return k;
         var p = PREFIX.endsWith('/') ? PREFIX : (PREFIX + '/');
         if (!k) return p;
+        while (k.indexOf(p + p) === 0) k = k.substring(p.length);
+        if (k.indexOf(p) === 0) return k;
         return p + k;
     }
     function relKey(k) {
         k = String(k || '');
-        if (PREFIX && k.startsWith(PREFIX)) return k.substring(PREFIX.length);
+        if (!PREFIX) return k;
+        var p = PREFIX.endsWith('/') ? PREFIX : (PREFIX + '/');
+        while (k.indexOf(p) === 0) k = k.substring(p.length);
+        if (PREFIX && k === PREFIX.replace(/\/+$/, '')) return '';
         return k;
     }
 
@@ -1863,11 +1882,14 @@ app.post('/gemini', async (req, res) => {
         const BUCKET = minioStorage.BUCKET;
         const client = minioStorage.client;
         function fullKey(k) {
-            // Всегда PREFIX + key (не startsWith — иначе папка "artifacts" при PREFIX=artifacts/ ломается)
+            // Ровно один PREFIX. Снимаем только PREFIX+PREFIX; user-ключ с тем же именем что PREFIX
+            // остаётся как storage-ключ с одним PREFIX (скачивание не плодит artifacts/artifacts).
             k = String(k || '').replace(/^\/+/, '');
             if (!PREFIX) return k;
             var p = PREFIX.endsWith('/') ? PREFIX : (PREFIX + '/');
             if (!k) return p;
+            while (k.indexOf(p + p) === 0) k = k.substring(p.length);
+            if (k.indexOf(p) === 0) return k;
             return p + k;
         }
         function relKey(k) {
