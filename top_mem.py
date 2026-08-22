@@ -23,5 +23,10 @@ for pid in os.listdir("/proc"):
 processes.sort(key=lambda x: x[2], reverse=True)
 print("PID   | RSS (MB) | COMMAND")
 print("-" * 50)
-for pid, cmd, rss in processes[:10]:
+total_rss = 0
+for pid, cmd, rss in processes:
+    total_rss += rss
     print(f"{pid:<5} | {rss/1024/1024:<8.2f} | {cmd[:50]}")
+
+print("-" * 50)
+print(f"TOTAL : {total_rss/1024/1024:.2f} MB")
