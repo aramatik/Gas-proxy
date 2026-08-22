@@ -641,97 +641,125 @@ function isAntigravityModel(modelName) {
     return !!(modelName && String(modelName).toLowerCase().includes('antigravity'));
 }
 
+/** Собрать вложения из body: files[] и/или legacy b64+mimeType. Без дублей. */
+function collectInlineFiles(req) {
+    const out = [];
+    const seen = Object.create(null);
+    const body = (req && req.body) || {};
+    function add(b64, mimeType, name) {
+        if (!b64 || !mimeType) return;
+        const key = String(mimeType) + ':' + String(b64).length + ':' + String(b64).slice(0, 64);
+        if (seen[key]) return;
+        seen[key] = true;
+        out.push({ b64: String(b64), mimeType: String(mimeType), name: name ? String(name) : '' });
+    }
+    if (Array.isArray(body.files)) {
+        for (const f of body.files) {
+            if (!f) continue;
+            add(f.b64, f.mimeType || f.mime_type, f.name || f.filename);
+        }
+    }
+    // legacy: одно вложение
+    if (body.b64 && body.mimeType) add(body.b64, body.mimeType, body.filename || body.name);
+    // защита от раздувания запроса
+    const MAX_FILES = 12;
+    if (out.length > MAX_FILES) {
+        console.warn(`[ATTACH] Обрезано вложений: ${out.length} → ${MAX_FILES}`);
+        return out.slice(0, MAX_FILES);
+    }
+    return out;
+}
+
 /**
  * Input для Antigravity с учётом вложений.
- * Antigravity работает в sandbox Google и НЕ видит /tmp сервера —
- * картинки → multimodal image; текстовые файлы → содержимое в промпт;
- * бинарники → пояснение. Пути могут содержать пробелы.
+ * Sandbox Google ≠ FS сервера: картинки → image-input; текст с /tmp → в промпт.
+ * Пути могут содержать пробелы (до конца строки).
  */
 function buildAntigravityInput(userText, req) {
     const text0 = (userText && String(userText).trim()) ? String(userText) : '';
-    const b64 = req && req.body && req.body.b64 ? String(req.body.b64) : '';
-    const mime = req && req.body && req.body.mimeType ? String(req.body.mimeType) : '';
-    const isImage = !!(mime && mime.indexOf('image/') === 0);
+    const inlineFiles = collectInlineFiles(req);
 
-    // Пути до конца строки (пробелы в имени допустимы)
     const pathRe = /(?:^|\n)\s*(\/(?:tmp|usr\/src\/app|home)[^\n\r]+)/g;
     const paths = [];
-    const seen = Object.create(null);
+    const seenP = Object.create(null);
     let m;
     while ((m = pathRe.exec(text0)) !== null) {
         const p = m[1].replace(/[\s.,;:]+$/, '').trim();
-        if (p && !seen[p]) { seen[p] = true; paths.push(p); }
+        if (p && !seenP[p]) { seenP[p] = true; paths.push(p); }
     }
 
     const textParts = [];
     if (text0) textParts.push(text0);
-
     const imageBlocks = [];
     const notes = [];
+    const imageExts = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.bmp': 'image/bmp' };
 
-    if (b64 && isImage) {
-        imageBlocks.push({ type: 'image', data: b64, mime_type: mime });
-        notes.push('[Вложение: изображение ' + mime + ' передано агенту как image-input — анализируй его напрямую, НЕ ищи файл в /tmp sandbox]');
-    } else if (b64 && mime) {
-        try {
-            const buf = Buffer.from(b64, 'base64');
-            if (buf.length <= 200 * 1024) {
-                const sample = buf.subarray(0, Math.min(buf.length, 4096));
-                if (!sample.includes(0)) {
-                    textParts.push('\n\n=== Содержимое вложения (' + mime + ') ===\n' + buf.toString('utf8'));
-                    notes.push('[Вложение: текстовое содержимое вставлено в промпт]');
+    for (const f of inlineFiles) {
+        if (String(f.mimeType).indexOf('image/') === 0) {
+            imageBlocks.push({ type: 'image', data: f.b64, mime_type: f.mimeType });
+            notes.push('[Вложение: изображение ' + f.mimeType + (f.name ? ' «' + f.name + '»' : '') + ' → image-input]');
+        } else {
+            try {
+                const buf = Buffer.from(f.b64, 'base64');
+                if (buf.length <= 200 * 1024) {
+                    const sample = buf.subarray(0, Math.min(buf.length, 4096));
+                    if (!sample.includes(0)) {
+                        textParts.push('\n\n=== Содержимое вложения' + (f.name ? ' «' + f.name + '»' : '') + ' (' + f.mimeType + ') ===\n' + buf.toString('utf8'));
+                        notes.push('[Текстовое вложение вставлено в промпт]');
+                    } else {
+                        notes.push('[Бинарное вложение ' + f.mimeType + ' — sandbox не видит /tmp сервера; используйте Gemini Flash/Lite admin]');
+                    }
                 } else {
-                    notes.push('[Вложение: бинарный файл ' + mime + ' (' + buf.length + ' байт). Antigravity sandbox не видит /tmp сервера. Для бинарников используйте Gemini Flash/Lite в admin.]');
+                    notes.push('[Вложение слишком большое для промпта: ' + buf.length + ' байт]');
                 }
-            } else {
-                notes.push('[Вложение слишком большое для вставки в промпт: ' + buf.length + ' байт]');
+            } catch (e) {
+                notes.push('[Ошибка b64: ' + e.message + ']');
             }
-        } catch (e) {
-            notes.push('[Вложение: ошибка декодирования b64: ' + e.message + ']');
         }
     }
 
-    const imageExts = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.bmp': 'image/bmp' };
+    // пути на сервере, ещё не покрытые inline
     for (const fp of paths) {
         try {
-            if (!fs.existsSync(fp)) {
-                notes.push('[Файл не найден на сервере: ' + fp + ']');
-                continue;
-            }
+            if (!fs.existsSync(fp)) { notes.push('[Нет на сервере: ' + fp + ']'); continue; }
             const st = fs.statSync(fp);
             if (!st.isFile()) continue;
             const base = path.basename(fp);
             const ext = path.extname(fp).toLowerCase();
             if (imageExts[ext] && st.size <= 8 * 1024 * 1024) {
-                if (!(b64 && isImage)) {
-                    imageBlocks.push({ type: 'image', data: fs.readFileSync(fp).toString('base64'), mime_type: imageExts[ext] });
-                    notes.push('[Изображение с сервера «' + base + '» передано как image-input — анализируй напрямую]');
-                }
+                // не дублируем, если уже есть столько же image из inline
+                imageBlocks.push({ type: 'image', data: fs.readFileSync(fp).toString('base64'), mime_type: imageExts[ext] });
+                notes.push('[Изображение с сервера «' + base + '» → image-input]');
             } else if (st.size <= 200 * 1024) {
                 const buf = fs.readFileSync(fp);
                 const sample = buf.subarray(0, Math.min(buf.length, 4096));
                 if (!sample.includes(0)) {
                     textParts.push('\n\n=== Файл на сервере: ' + fp + ' ===\n' + buf.toString('utf8'));
-                    notes.push('[Текстовый файл «' + base + '» прочитан с сервера и вставлен в промпт — НЕ ищи его в sandbox /tmp]');
+                    notes.push('[Текст «' + base + '» с сервера в промпте]');
                 } else {
-                    notes.push('[Бинарный файл на сервере: ' + fp + ' (' + st.size + ' байт). Sandbox Antigravity его не видит.]');
+                    notes.push('[Бинарник на сервере: ' + fp + ' (' + st.size + ' байт)]');
                 }
             } else {
-                notes.push('[Файл на сервере слишком большой для вставки: ' + fp + ' (' + st.size + ' байт)]');
+                notes.push('[Слишком большой на сервере: ' + fp + ' (' + st.size + ' байт)]');
             }
         } catch (e) {
             notes.push('[Ошибка чтения ' + fp + ': ' + e.message + ']');
         }
     }
 
+    // лимит картинок для AG
+    const MAX_IMG = 10;
+    const imgs = imageBlocks.slice(0, MAX_IMG);
+    if (imageBlocks.length > MAX_IMG) notes.push('[Обрезано image-input: ' + imageBlocks.length + ' → ' + MAX_IMG + ']');
+
     if (notes.length) {
         textParts.push('\n\n=== Служебные заметки о вложениях ===\n' + notes.join('\n'));
-        textParts.push('\nВАЖНО: пути /tmp/... на сервере Northflank НЕ существуют в твоём sandbox. Не вызывай ls/cat/read_file по этим путям. Содержимое текста/картинок уже передано выше, если это было возможно.');
+        textParts.push('\nВАЖНО: /tmp/... на Northflank ≠ sandbox. Не вызывай ls/cat/read_file по этим путям — содержимое уже передано выше, если возможно.');
     }
 
     const finalText = textParts.join('') || ' ';
-    if (imageBlocks.length === 0) return finalText;
-    return [{ type: 'text', text: finalText }].concat(imageBlocks);
+    if (imgs.length === 0) return finalText;
+    return [{ type: 'text', text: finalText }].concat(imgs);
 }
 
 function extractAntigravityText(interaction) {
@@ -2210,9 +2238,12 @@ ${deliveryHint}
     }
     const msgParts = [];
     if (userText) msgParts.push(userText);
-    if (req.body.b64 && req.body.mimeType) {
-        msgParts.push({ inlineData: { data: req.body.b64, mimeType: req.body.mimeType } });
-        console.log(`[GEMINI] К запросу прикреплен файл: ${req.body.mimeType}`);
+    const chatFiles = collectInlineFiles(req);
+    for (const f of chatFiles) {
+        msgParts.push({ inlineData: { data: f.b64, mimeType: f.mimeType } });
+    }
+    if (chatFiles.length) {
+        console.log(`[GEMINI] К запросу прикреплено файлов: ${chatFiles.length} (${chatFiles.map(f => f.mimeType + (f.name ? ':' + f.name : '')).join(', ')})`);
     }
     if (msgParts.length === 0) return res.status(400).json({ok: false, error: "Пустой запрос"});
     console.log(`[GEMINI] Запрос к ИИ. Модель: [${modelName}]. Контекст в памяти: [${geminiHistory.length} сообщений]`);
@@ -2243,7 +2274,6 @@ async function handleAntigravityAdmin(userText, req, res, cronNotificationsHtml 
             "\n\nВАЖНО: инструмент github_ops доступен только в обычном admin-режиме (модели Gemini Flash / Lite, НЕ Antigravity). " +
             "В Antigravity токен GitHub тебе недоступен — не пытайся его искать. Если нужна запись в репозиторий, попроси пользователя выбрать модель без Antigravity.";
     }
-    // Вложения: картинки → image-input; текст с /tmp → в промпт (sandbox AG ≠ FS сервера)
     const agInput = buildAntigravityInput(userText, req);
     // НЕБЛОКИРУЮЩИЙ режим: мгновенная заглушка, задача в фоне
     if (antigravityNonBlocking) {
@@ -2435,23 +2465,27 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
     let iterations = 0;
     const maxIterations = withGithub ? 50 : 50; // admin / github: до 50 вызовов инструментов за один ход
     try {
-        // Vision/вложения: как в chatbot — inlineData + явная подсказка модели
         const adminMsgParts = [];
+        const adminFiles = collectInlineFiles(req);
         let visionNote = '';
-        if (req.body && req.body.b64 && req.body.mimeType) {
-            adminMsgParts.push({ inlineData: { data: req.body.b64, mimeType: req.body.mimeType } });
-            console.log(`[ADMIN] К запросу прикреплен файл (inlineData): ${req.body.mimeType}`);
-            if (String(req.body.mimeType).startsWith('image/')) {
-                visionNote = '\n\n[СИСТЕМА] К этому сообщению ПРИКРЕПЛЕНО ИЗОБРАЖЕНИЕ (inlineData). ' +
-                    'Опиши/проанализируй его НАПРЯМУЮ как vision-модель. ' +
-                    'ЗАПРЕЩЕНО: tesseract, PIL, OCR через shell, apk add для OCR — изображение уже в контексте запроса.';
+        for (const f of adminFiles) {
+            adminMsgParts.push({ inlineData: { data: f.b64, mimeType: f.mimeType } });
+        }
+        if (adminFiles.length) {
+            console.log(`[ADMIN] К запросу прикреплено файлов (inlineData): ${adminFiles.length} (${adminFiles.map(f => f.mimeType + (f.name ? ':' + f.name : '')).join(', ')})`);
+            const imgCount = adminFiles.filter(f => String(f.mimeType).indexOf('image/') === 0).length;
+            if (imgCount > 0) {
+                visionNote = '\n\n[СИСТЕМА] К сообщению ПРИКРЕПЛЕНО изображений: ' + imgCount +
+                    ' (inlineData). Проанализируй ВСЕ напрямую как vision. ЗАПРЕЩЕНО: tesseract, PIL, OCR через shell, apk add для OCR.';
             }
-        } else if (userText) {
-            // fallback: картинка только путём на сервере (пробелы в имени OK)
+        }
+        // fallback: картинки только путями на сервере (если b64 не пришёл)
+        if (!adminFiles.length && userText) {
             const pathRe = /(?:^|\n)\s*(\/(?:tmp|usr\/src\/app|home)[^\n\r]+)/g;
             const imageExts = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.bmp': 'image/bmp' };
             let mm; const seenP = Object.create(null);
-            while ((mm = pathRe.exec(String(userText))) !== null) {
+            let loaded = 0;
+            while ((mm = pathRe.exec(String(userText))) !== null && loaded < 10) {
                 const fp = mm[1].replace(/[\s.,;:]+$/, '').trim();
                 if (!fp || seenP[fp]) continue;
                 seenP[fp] = true;
@@ -2462,13 +2496,15 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                     const mime = imageExts[path.extname(fp).toLowerCase()];
                     if (!mime) continue;
                     adminMsgParts.push({ inlineData: { data: fs.readFileSync(fp).toString('base64'), mimeType: mime } });
-                    console.log(`[ADMIN] Картинка с сервера как inlineData: ${fp} (${mime})`);
-                    visionNote = '\n\n[СИСТЕМА] Изображение «' + path.basename(fp) + '» ПРИКРЕПЛЕНО к запросу (inlineData). ' +
-                        'Анализируй НАПРЯМУЮ. Не ставь tesseract/PIL и не читай файл через shell для «просмотра» картинки.';
-                    break;
+                    loaded++;
+                    console.log(`[ADMIN] Картинка с сервера как inlineData: ${fp}`);
                 } catch (eImg) {
                     console.warn('[ADMIN] Не удалось прочитать картинку', fp, eImg.message);
                 }
+            }
+            if (loaded > 0) {
+                visionNote = '\n\n[СИСТЕМА] ПРИКРЕПЛЕНО изображений с сервера: ' + loaded +
+                    '. Анализируй ВСЕ напрямую. Не ставь tesseract/PIL для «просмотра».';
             }
         }
         const textForModel = (userText || '') + visionNote;
@@ -2999,3 +3035,4 @@ async function startServer() {
     });
 }
 startServer();
+    
