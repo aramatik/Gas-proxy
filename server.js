@@ -11,6 +11,16 @@ const crypto = require('crypto');
 const util = require('util');
 const { exec } = require('child_process');
 const execPromise = util.promisify(exec);
+
+/** Escape for embedding shell output inside HTML terminal panels. */
+function escapeHtml(s) {
+    return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+}
+
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const cron = require('node-cron');
 const FormData = require('form-data');
@@ -1955,10 +1965,15 @@ ${deliveryHint}
             const { stdout, stderr } = await execPromise(cmd, { timeout: 15000 });
             let output = stdout; if (stderr) output += `\n[STDERR]:\n${stderr}`;
             if (!output) output = "[Выполнено успешно]";
-            if (output.length > 300000) output = output.substring(0, 300000) + "\n...[ОБРЕЗАН]...";
-            return res.json({ ok: true, text: `<b>$</b> <code>${cmd}</code><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#1e1e1e; color:#0f0; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${output}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#555; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
+            // лимит + маркер; экранирование обязательно (!cat server.js содержит </div> и ломает HTML/скролл)
+            if (output.length >300000) output = output.substring(0, 300000) + "\n\n...[ОБРЕЗАН: вывод больше 300000 символов]...";
+            const safeOut = escapeHtml(output);
+            const safeCmd = escapeHtml(cmd);
+            return res.json({ ok: true, text: `<b>$</b> <code>${safeCmd}</code><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#1e1e1e; color:#0f0; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${safeOut}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#555; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
         } catch (err) {
-            return res.json({ ok: true, text: `<b>$</b> <code>${cmd}</code><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#3b1313; color:#f66; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${err.message}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#773333; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
+            const safeCmdE = escapeHtml(cmd);
+            const safeErr = escapeHtml(err.message || String(err));
+            return res.json({ ok: true, text: `<b>$</b> <code>${safeCmdE}</code><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#3b1313; color:#f66; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${safeErr}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#773333; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
         }
     }
     if (userText.startsWith('/search ')) {
