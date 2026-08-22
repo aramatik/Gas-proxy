@@ -640,6 +640,100 @@ async function githubOps(args) {
 function isAntigravityModel(modelName) {
     return !!(modelName && String(modelName).toLowerCase().includes('antigravity'));
 }
+
+/**
+ * Input для Antigravity с учётом вложений.
+ * Antigravity работает в sandbox Google и НЕ видит /tmp сервера —
+ * картинки → multimodal image; текстовые файлы → содержимое в промпт;
+ * бинарники → пояснение. Пути могут содержать пробелы.
+ */
+function buildAntigravityInput(userText, req) {
+    const text0 = (userText && String(userText).trim()) ? String(userText) : '';
+    const b64 = req && req.body && req.body.b64 ? String(req.body.b64) : '';
+    const mime = req && req.body && req.body.mimeType ? String(req.body.mimeType) : '';
+    const isImage = !!(mime && mime.indexOf('image/') === 0);
+
+    // Пути до конца строки (пробелы в имени допустимы)
+    const pathRe = /(?:^|\n)\s*(\/(?:tmp|usr\/src\/app|home)[^\n\r]+)/g;
+    const paths = [];
+    const seen = Object.create(null);
+    let m;
+    while ((m = pathRe.exec(text0)) !== null) {
+        const p = m[1].replace(/[\s.,;:]+$/, '').trim();
+        if (p && !seen[p]) { seen[p] = true; paths.push(p); }
+    }
+
+    const textParts = [];
+    if (text0) textParts.push(text0);
+
+    const imageBlocks = [];
+    const notes = [];
+
+    if (b64 && isImage) {
+        imageBlocks.push({ type: 'image', data: b64, mime_type: mime });
+        notes.push('[Вложение: изображение ' + mime + ' передано агенту как image-input — анализируй его напрямую, НЕ ищи файл в /tmp sandbox]');
+    } else if (b64 && mime) {
+        try {
+            const buf = Buffer.from(b64, 'base64');
+            if (buf.length <= 200 * 1024) {
+                const sample = buf.subarray(0, Math.min(buf.length, 4096));
+                if (!sample.includes(0)) {
+                    textParts.push('\n\n=== Содержимое вложения (' + mime + ') ===\n' + buf.toString('utf8'));
+                    notes.push('[Вложение: текстовое содержимое вставлено в промпт]');
+                } else {
+                    notes.push('[Вложение: бинарный файл ' + mime + ' (' + buf.length + ' байт). Antigravity sandbox не видит /tmp сервера. Для бинарников используйте Gemini Flash/Lite в admin.]');
+                }
+            } else {
+                notes.push('[Вложение слишком большое для вставки в промпт: ' + buf.length + ' байт]');
+            }
+        } catch (e) {
+            notes.push('[Вложение: ошибка декодирования b64: ' + e.message + ']');
+        }
+    }
+
+    const imageExts = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.bmp': 'image/bmp' };
+    for (const fp of paths) {
+        try {
+            if (!fs.existsSync(fp)) {
+                notes.push('[Файл не найден на сервере: ' + fp + ']');
+                continue;
+            }
+            const st = fs.statSync(fp);
+            if (!st.isFile()) continue;
+            const base = path.basename(fp);
+            const ext = path.extname(fp).toLowerCase();
+            if (imageExts[ext] && st.size <= 8 * 1024 * 1024) {
+                if (!(b64 && isImage)) {
+                    imageBlocks.push({ type: 'image', data: fs.readFileSync(fp).toString('base64'), mime_type: imageExts[ext] });
+                    notes.push('[Изображение с сервера «' + base + '» передано как image-input — анализируй напрямую]');
+                }
+            } else if (st.size <= 200 * 1024) {
+                const buf = fs.readFileSync(fp);
+                const sample = buf.subarray(0, Math.min(buf.length, 4096));
+                if (!sample.includes(0)) {
+                    textParts.push('\n\n=== Файл на сервере: ' + fp + ' ===\n' + buf.toString('utf8'));
+                    notes.push('[Текстовый файл «' + base + '» прочитан с сервера и вставлен в промпт — НЕ ищи его в sandbox /tmp]');
+                } else {
+                    notes.push('[Бинарный файл на сервере: ' + fp + ' (' + st.size + ' байт). Sandbox Antigravity его не видит.]');
+                }
+            } else {
+                notes.push('[Файл на сервере слишком большой для вставки: ' + fp + ' (' + st.size + ' байт)]');
+            }
+        } catch (e) {
+            notes.push('[Ошибка чтения ' + fp + ': ' + e.message + ']');
+        }
+    }
+
+    if (notes.length) {
+        textParts.push('\n\n=== Служебные заметки о вложениях ===\n' + notes.join('\n'));
+        textParts.push('\nВАЖНО: пути /tmp/... на сервере Northflank НЕ существуют в твоём sandbox. Не вызывай ls/cat/read_file по этим путям. Содержимое текста/картинок уже передано выше, если это было возможно.');
+    }
+
+    const finalText = textParts.join('') || ' ';
+    if (imageBlocks.length === 0) return finalText;
+    return [{ type: 'text', text: finalText }].concat(imageBlocks);
+}
+
 function extractAntigravityText(interaction) {
     const parts = [];
     if (interaction && Array.isArray(interaction.steps)) {
@@ -2087,16 +2181,7 @@ ${deliveryHint}
     const modelName = req.body.model || "gemini-2.0-flash";
     // --- Antigravity: отдельный путь через Interactions API ---
     if (isAntigravityModel(modelName)) {
-        if (req.body.b64 && req.body.mimeType && !String(req.body.mimeType).startsWith('image/')) {
-            return res.json({ ok: true, text: "⚠️ Antigravity через этот интерфейс поддерживает только текст и изображения — файл не прикреплён." });
-        }
-        let agInput = userText || " ";
-        if (req.body.b64 && req.body.mimeType && String(req.body.mimeType).startsWith('image/')) {
-            agInput = [
-                { type: "text", text: userText || "Проанализируй это изображение" },
-                { type: "image", data: req.body.b64, mime_type: req.body.mimeType }
-            ];
-        }
+        let agInput = buildAntigravityInput(userText || " ", req);
         // НЕБЛОКИРУЮЩИЙ режим: мгновенная заглушка, задача в фоне
         if (antigravityNonBlocking) {
             runAntigravityInBackground({ mode: 'chat', input: agInput, systemInstruction: getAntigravitySystemInstruction("Ты — полезный ИИ-ассистент.") });
@@ -2158,11 +2243,13 @@ async function handleAntigravityAdmin(userText, req, res, cronNotificationsHtml 
             "\n\nВАЖНО: инструмент github_ops доступен только в обычном admin-режиме (модели Gemini Flash / Lite, НЕ Antigravity). " +
             "В Antigravity токен GitHub тебе недоступен — не пытайся его искать. Если нужна запись в репозиторий, попроси пользователя выбрать модель без Antigravity.";
     }
+    // Вложения: картинки → image-input; текст с /tmp → в промпт (sandbox AG ≠ FS сервера)
+    const agInput = buildAntigravityInput(userText, req);
     // НЕБЛОКИРУЮЩИЙ режим: мгновенная заглушка, задача в фоне
     if (antigravityNonBlocking) {
         runAntigravityInBackground({
             mode: 'admin',
-            input: userText,
+            input: agInput,
             systemInstruction: getAntigravitySystemInstruction(basePrompt)
         });
         let stub = "✅ <b>Задача Antigravity принята в фоновый режим.</b><br>Прогресс и итоговый результат появятся во входящих (📬 Планировщик). Следите за блоками прогресса — они приходят каждые ~10 секунд.";
@@ -2175,7 +2262,7 @@ async function handleAntigravityAdmin(userText, req, res, cronNotificationsHtml 
     // БЛОКИРУЮЩИЙ режим: ждём завершения и возвращаем в пузыре
     try {
         const ag = await callAntigravityAgent({
-            input: userText,
+            input: agInput,
             previousInteractionId: adminAntigravityPrevId,
             environmentId: adminAntigravityEnvId,
             systemInstruction: getAntigravitySystemInstruction(basePrompt),
@@ -2348,7 +2435,45 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
     let iterations = 0;
     const maxIterations = withGithub ? 50 : 50; // admin / github: до 50 вызовов инструментов за один ход
     try {
-        let result = await chat.sendMessage(userText);
+        // Vision/вложения: как в chatbot — inlineData + явная подсказка модели
+        const adminMsgParts = [];
+        let visionNote = '';
+        if (req.body && req.body.b64 && req.body.mimeType) {
+            adminMsgParts.push({ inlineData: { data: req.body.b64, mimeType: req.body.mimeType } });
+            console.log(`[ADMIN] К запросу прикреплен файл (inlineData): ${req.body.mimeType}`);
+            if (String(req.body.mimeType).startsWith('image/')) {
+                visionNote = '\n\n[СИСТЕМА] К этому сообщению ПРИКРЕПЛЕНО ИЗОБРАЖЕНИЕ (inlineData). ' +
+                    'Опиши/проанализируй его НАПРЯМУЮ как vision-модель. ' +
+                    'ЗАПРЕЩЕНО: tesseract, PIL, OCR через shell, apk add для OCR — изображение уже в контексте запроса.';
+            }
+        } else if (userText) {
+            // fallback: картинка только путём на сервере (пробелы в имени OK)
+            const pathRe = /(?:^|\n)\s*(\/(?:tmp|usr\/src\/app|home)[^\n\r]+)/g;
+            const imageExts = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp', '.bmp': 'image/bmp' };
+            let mm; const seenP = Object.create(null);
+            while ((mm = pathRe.exec(String(userText))) !== null) {
+                const fp = mm[1].replace(/[\s.,;:]+$/, '').trim();
+                if (!fp || seenP[fp]) continue;
+                seenP[fp] = true;
+                try {
+                    if (!fs.existsSync(fp)) continue;
+                    const st = fs.statSync(fp);
+                    if (!st.isFile() || st.size > 8 * 1024 * 1024) continue;
+                    const mime = imageExts[path.extname(fp).toLowerCase()];
+                    if (!mime) continue;
+                    adminMsgParts.push({ inlineData: { data: fs.readFileSync(fp).toString('base64'), mimeType: mime } });
+                    console.log(`[ADMIN] Картинка с сервера как inlineData: ${fp} (${mime})`);
+                    visionNote = '\n\n[СИСТЕМА] Изображение «' + path.basename(fp) + '» ПРИКРЕПЛЕНО к запросу (inlineData). ' +
+                        'Анализируй НАПРЯМУЮ. Не ставь tesseract/PIL и не читай файл через shell для «просмотра» картинки.';
+                    break;
+                } catch (eImg) {
+                    console.warn('[ADMIN] Не удалось прочитать картинку', fp, eImg.message);
+                }
+            }
+        }
+        const textForModel = (userText || '') + visionNote;
+        if (textForModel) adminMsgParts.unshift(textForModel);
+        let result = await chat.sendMessage(adminMsgParts.length ? adminMsgParts : (userText || ' '));
         while (result.response && result.response.candidates && result.response.candidates[0]) {
             const candidate = result.response.candidates[0];
             const parts = candidate.content.parts;
