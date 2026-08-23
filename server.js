@@ -32,7 +32,7 @@ app.use(express.json({ limit: '150mb' }));
 const MAX_FILE_SIZE = 130 * 1024 * 1024;
 const CHUNK_SIZE_MB = 15;
 const TMP_DIR = '/tmp';
-const PROXY_SECRET = process.env.PROXY_SECRET || "";
+const PROXY_SECRET = process.env.PROXY_SECRET || "MySuperSecretPassword2026";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY || "";
 const SOCKS5_PROXY = process.env.SOCKS5_PROXY || "";
@@ -1739,12 +1739,11 @@ app.post('/gemini', async (req, res) => {
             return res.status(500).json({ok: false, error: err.message});
         }
     }
-    // LiveAudio (MiniVPS): ключ только на время голосовой сессии, не логируем
     if (req.body.action === 'live_credentials') {
         if (!GEMINI_API_KEY) {
             return res.status(500).json({ ok: false, error: 'GEMINI_API_KEY не задан на сервере' });
         }
-        console.log('[LIVE] Выдача credentials для голосовой сессии');
+        console.log('[LIVE] Выдача credentials (key length=' + String(GEMINI_API_KEY).length + ')');
         return res.json({
             ok: true,
             apiKey: GEMINI_API_KEY,
