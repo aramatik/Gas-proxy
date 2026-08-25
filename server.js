@@ -15,20 +15,25 @@ const execPromise = util.promisify(exec);
 /** Escape for embedding shell output inside HTML terminal panels. */
 function escapeHtml(s) {
     return String(s == null ? '' : s)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;');
+        .replace(/&/g, '&')
+        .replace(/</g, '<')
+        .replace(/>/g, '>')
+        .replace(/"/g, '"');
 }
 
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const cron = require('node-cron');
 const FormData = require('form-data');
 const minioStorage = require('./minioStorage');
+
+// === OPENROUTER: Подключаем отдельный модуль для работы с OpenRouter API ===
+const openrouter = require('./openrouter');
+
 const app = express();
 app.use(compression());
 app.use(express.urlencoded({ extended: true, limit: '150mb' }));
 app.use(express.json({ limit: '150mb' }));
+
 const MAX_FILE_SIZE = 130 * 1024 * 1024;
 const CHUNK_SIZE_MB = 15;
 const TMP_DIR = '/tmp';
@@ -38,6 +43,10 @@ const TAVILY_API_KEY = process.env.TAVILY_API_KEY || "";
 const SOCKS5_PROXY = process.env.SOCKS5_PROXY || "";
 const TG_TOKEN = process.env.TG_TOKEN || "";
 const TG_CHAT_ID = process.env.TG_CHAT_ID || "";
+
+// === OPENROUTER: API ключ для OpenRouter ===
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
+
 // ==========================================
 // ГИБРИД ДОСТАВКИ АРТЕФАКТОВ (Antigravity -> сервер -> /download + GitHub)
 // ==========================================
@@ -50,16 +59,20 @@ const GITHUB_PATH_PREFIX = process.env.GITHUB_PATH_PREFIX || "artifacts/";
 const ARTIFACT_DIR = path.join(TMP_DIR, 'artifacts');
 const ARTIFACT_MAX = 130 * 1024 * 1024; // 130 МБ на приём (согласовано с MAX_FILE_SIZE)
 const GITHUB_CONTENTS_MAX = 1 * 1024 * 1024; // лимит GitHub Contents API ~1 МБ
+
 if (!fs.existsSync(ARTIFACT_DIR)) {
     try { fs.mkdirSync(ARTIFACT_DIR, { recursive: true }); } catch (e) { console.warn("[ARTIFACT] Не удалось создать папку:", e.message); }
 }
+
 // Доставка активна, только если заданы и URL, и токен эндпоинта
 const ARTIFACT_DELIVERY_ENABLED = !!(PUBLIC_URL && ARTIFACT_TOKEN);
 const GITHUB_ENABLED = !!(GITHUB_TOKEN && GITHUB_REPO);
+
 // ==========================================
 // MINIO (Northflank Storage Addon) — все NF_STORAGE_* переменные
 // ==========================================
 const MINIO_ENABLED = minioStorage.ENABLED;
+
 (async () => {
     if (MINIO_ENABLED) {
         const ok = await minioStorage.ensureBucket();
@@ -68,12 +81,14 @@ const MINIO_ENABLED = minioStorage.ENABLED;
         console.log('[MINIO] Отключён (нет NF_STORAGE_ACCESS_KEY / HOST / ENDPOINT)');
     }
 })();
+
 let genAI = null;
 let geminiHistory = [];          // история обычного чата
 let adminMode = false;
 let adminHistory = [];           // отдельная история для режима администратора
 let githubHistory = [];          // история сессии /github (для продолжения после лимита итераций)
 let githubSessionActive = false; // true, если предыдущий /github не завершил задачу (лимит/ошибка)
+
 // ==========================================
 // ANTIGRAVITY: состояние multi-turn + режим выполнения
 // ==========================================
@@ -81,9 +96,11 @@ let geminiAntigravityPrevId = null;
 let geminiAntigravityEnvId = null;
 let adminAntigravityPrevId = null;
 let adminAntigravityEnvId = null;
+
 // true  = неблокирующий (async): задача уходит в фон, GAS не висит, результат во входящие
 // false = блокирующий (sync): сервер ждёт завершения и возвращает ответ в пузыре
 let antigravityNonBlocking = true;
+
 // Системный промпт администратора из файла
 let adminSystemPrompt = "";
 try {
@@ -92,6 +109,7 @@ try {
 } catch (e) {
     console.warn("[SYSTEM] admin.md не найден, используется пустой промпт");
 }
+
 // Инструкции GitHub (подключаются только по команде /github, чтобы не раздувать контекст)
 let githubSystemPrompt = "";
 try {
@@ -100,18 +118,21 @@ try {
 } catch (e) {
     console.warn("[SYSTEM] github.md не найден — инструмент github_ops будет без подробных инструкций");
 }
+
 if (GEMINI_API_KEY) {
     genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
 }
+
 // ==========================================
 // МАСКИРОВКА СЕКРЕТОВ В ЛОГАХ
 // ==========================================
 function maskSecrets(s) {
     let r = String(s);
-    if (ARTIFACT_TOKEN) r = r.split(ARTIFACT_TOKEN).join('***ARTIFACT***');
-    if (GITHUB_TOKEN) r = r.split(GITHUB_TOKEN).join('***GITHUB***');
+    if (ARTIFACT_TOKEN) r = r.split(ARTIFACT_TOKEN).join('ARTIFACT');
+    if (GITHUB_TOKEN) r = r.split(GITHUB_TOKEN).join('GITHUB');
     return r;
 }
+
 // ==========================================
 // ГИБРИД: системная инструкция и футер для Antigravity
 // ==========================================
@@ -132,6 +153,7 @@ function getAntigravitySystemInstruction(basePrompt) {
     }
     return (basePrompt || "") + extra;
 }
+
 // Честная приписка про то, где физически лежит файл.
 function buildAntigravityFooter() {
     if (ARTIFACT_DELIVERY_ENABLED) {
@@ -143,6 +165,7 @@ function buildAntigravityFooter() {
     return `\n\n<i>ℹ️ Antigravity выполняет код в собственном sandbox Google, а НЕ на этом сервере.</i><br>` +
         `🚫 MinIO для Antigravity недоступен. Постоянное хранение артефактов — через GitHub (на обычных моделях admin + github_ops) или после настройки <code>/artifact</code>.`;
 }
+
 // ==========================================
 // ГИБРИД: push артефакта в GitHub (Contents API, без git)
 // ==========================================
@@ -182,6 +205,7 @@ async function pushArtifactToGitHub(filePath, safeName) {
         return { ok: false, reason: detail };
     }
 }
+
 // ==========================================
 // GITHUB OPS — полноценная работа с репозиторием (Contents API)
 // ==========================================
@@ -194,10 +218,12 @@ function githubApiHeaders() {
         'Content-Type': 'application/json'
     };
 }
+
 function normalizeRepoPath(p) {
     if (!p) return '';
     return String(p).replace(/^\/+/, '').replace(/\/+/g, '/');
 }
+
 async function githubOps(args) {
     const action = String(args.action || '').toLowerCase();
     const branch = (args.branch && String(args.branch).trim()) || GITHUB_BRANCH || 'main';
@@ -536,7 +562,6 @@ async function githubOps(args) {
             fs.mkdirSync(path.dirname(savePath), { recursive: true });
             fs.writeFileSync(savePath, Buffer.from(resp.data));
             const st = fs.statSync(savePath);
-
             // Попытка распаковать, если есть unzip
             let extracted = [];
             let extractDir = null;
@@ -557,7 +582,6 @@ async function githubOps(args) {
                 extracted = [];
                 extractDir = null;
             }
-
             // Если просили конкретный файл (например firmware.bin) — найти и скопировать
             let binPath = null;
             if (args.file_name && extracted.length) {
@@ -577,7 +601,6 @@ async function githubOps(args) {
                     fs.copyFileSync(binHit.path, binPath);
                 }
             }
-
             return JSON.stringify({
                 ok: true,
                 zip_path: savePath,
@@ -634,12 +657,14 @@ async function githubOps(args) {
         return JSON.stringify({ ok: false, status: status || null, error: detail });
     }
 }
+
 // ==========================================
 // ПОДДЕРЖКА ANTIGRAVITY (Interactions API)
 // ==========================================
 function isAntigravityModel(modelName) {
     return !!(modelName && String(modelName).toLowerCase().includes('antigravity'));
 }
+
 function extractAntigravityText(interaction) {
     const parts = [];
     if (interaction && Array.isArray(interaction.steps)) {
@@ -660,11 +685,13 @@ function extractAntigravityText(interaction) {
     }
     return parts.join('\n') || '[Antigravity не вернул текстового ответа]';
 }
+
 // --- Хелперы прогресса Antigravity ---
 function escHtmlAg(s) {
-    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return String(s).replace(/&/g, '&').replace(/</g, '<').replace(/>/g, '>');
 }
-// Устойчивый парсер шагов: распознаёт реальные типы Antigravity (code_execution_*, thought).
+
+// Устойчивый парсер шагов: распознаёт реальные типы Antigravity (code_execution_, thought).
 function describeAntigravityStep(step, idx) {
     if (!step || typeof step !== 'object') return `⚙️ Шаг ${idx + 1}`;
     const type = String(step.type || step.role || '').toLowerCase();
@@ -696,16 +723,18 @@ function describeAntigravityStep(step, idx) {
     } else if (typeof step.text === 'string') preview = step.text;
     else if (typeof step.content === 'string') preview = step.content;
     if (preview) {
-        preview = preview.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+        preview = preview.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
         if (preview.length > 160) preview = preview.slice(0, 160) + '…';
         return `💬 <b>Antigravity:</b> ${escHtmlAg(preview)}`;
     }
     return `⚙️ <b>Antigravity:</b> шаг ${idx + 1}${type ? ' (' + escHtmlAg(type) + ')' : ''}`;
 }
+
 // Лёгкий push прогресса в inbox БЕЗ записи на диск.
 function pushProgressToInbox(html) {
     messageInbox.push({ time: getKyivTime(), text: html });
 }
+
 // --- Вызов агента: устойчивые таймауты + прогресс + heartbeat ---
 async function callAntigravityAgent(opts) {
     const url = 'https://generativelanguage.googleapis.com/v1beta/interactions';
@@ -724,11 +753,9 @@ async function callAntigravityAgent(opts) {
     console.log(`[ANTIGRAVITY] Отправка задачи агенту (background=${background})...`);
     let resp = await axios.post(url, body, { headers, timeout: 120000 });
     let interaction = resp.data;
-
     if (onProgress) {
         try { onProgress('🚀 <b>Antigravity:</b> задача принята, агент запущен…'); } catch (_) {}
     }
-
     if (background) {
         const maxWaitMs = 10 * 60 * 1000;
         const intervalMs = 3000;
@@ -782,12 +809,10 @@ async function callAntigravityAgent(opts) {
             }
         }
     }
-
     if (interaction && interaction.status === 'failed') {
         const msg = (interaction.error && interaction.error.message) || 'Antigravity: задача завершилась с ошибкой';
         throw new Error(msg);
     }
-
     return {
         id: interaction ? interaction.id : null,
         environmentId: (interaction && (interaction.environment_id || (interaction.environment && interaction.environment.id))) || opts.environmentId || null,
@@ -795,6 +820,7 @@ async function callAntigravityAgent(opts) {
         text: extractAntigravityText(interaction)
     };
 }
+
 // ==========================================
 // ANTIGRAVITY: НЕБЛОКИРУЮЩИЙ ФОНОВЫЙ ЗАПУСК
 // ==========================================
@@ -803,7 +829,7 @@ function runAntigravityInBackground(opts) {
     (async () => {
         try {
             const prevId = (mode === 'admin') ? adminAntigravityPrevId : geminiAntigravityPrevId;
-            const envId  = (mode === 'admin') ? adminAntigravityEnvId  : geminiAntigravityEnvId;
+            const envId = (mode === 'admin') ? adminAntigravityEnvId : geminiAntigravityEnvId;
             const ag = await callAntigravityAgent({
                 input: opts.input,
                 previousInteractionId: prevId,
@@ -827,6 +853,7 @@ function runAntigravityInBackground(opts) {
         }
     })().catch(e => console.error("[ANTIGRAVITY BG UNHANDLED]", e && e.message));
 }
+
 async function getCronPattern(humanText, modelName) {
     // Используем выбранную в чате модель; fallback — актуальная flash-модель (gemini-2.5-flash уже недоступна новым пользователям)
     const modelId = (modelName && String(modelName).trim()) || "gemini-2.0-flash";
@@ -836,6 +863,7 @@ async function getCronPattern(humanText, modelName) {
     if (!cron.validate(pattern)) return "*/5 * * * *"; // fallback
     return pattern;
 }
+
 // ==========================================
 // СИСТЕМА ОЧЕРЕДИ ДЛЯ CRON-ЗАДАЧ (INBOX)
 // ==========================================
@@ -843,15 +871,18 @@ const MESSAGES_FILE = path.join(TMP_DIR, 'inbox.json');
 const JOBS_FILE = path.join(TMP_DIR, 'scheduled_jobs.json');
 let messageInbox = [];
 let scheduledJobs = []; // список активных задач { id, pattern, taskText, model }
+
 if (fs.existsSync(MESSAGES_FILE)) {
     try { messageInbox = JSON.parse(fs.readFileSync(MESSAGES_FILE, 'utf8')); } catch(e){}
 }
 if (fs.existsSync(JOBS_FILE)) {
     try { scheduledJobs = JSON.parse(fs.readFileSync(JOBS_FILE, 'utf8')); } catch(e){}
 }
+
 function saveInbox() {
     fs.writeFileSync(MESSAGES_FILE, JSON.stringify(messageInbox, null, 2));
 }
+
 function saveJobs() {
     fs.writeFileSync(JOBS_FILE, JSON.stringify(scheduledJobs.map(j => ({
         id: j.id,
@@ -861,6 +892,7 @@ function saveJobs() {
         createdAt: j.createdAt
     })), null, 2));
 }
+
 function addMessageToInbox(msgText) {
     messageInbox.push({
         time: getKyivTime(),
@@ -868,8 +900,10 @@ function addMessageToInbox(msgText) {
     });
     saveInbox();
 }
+
 // Карта для хранения активных объектов cron-задач
 const activeCronTasks = {};
+
 function startCronTask(job) {
     if (activeCronTasks[job.id]) {
         activeCronTasks[job.id].stop();
@@ -882,6 +916,7 @@ function startCronTask(job) {
                 return;
             }
             const modelName = job.model || "gemini-2.0-flash";
+
             // --- Antigravity: фоновая задача через Interactions API ---
             if (isAntigravityModel(modelName)) {
                 try {
@@ -896,6 +931,7 @@ function startCronTask(job) {
                 }
                 return;
             }
+
             const modelConfig = { model: modelName };
             modelConfig.systemInstruction = "Ты — автономный агент, выполняющий задачу по расписанию (cron). Твоя цель — выполнить запрошенное действие ЕДИНОРАЗОВО прямо сейчас и вернуть ТОЛЬКО краткий конечный результат. КАТЕГОРИЧЕСКИ ЗАПРЕЩАЕТСЯ создавать bash-скрипты с бесконечными циклами (while true, sleep) или свои планировщики. НЕ ОПИСЫВАЙ шаги, которые ты делал, и не перечисляй выполненные команды — система сама добавит их в лог для пользователя. Дай только ответ на суть задачи (например, только текущий курс или статус). Перед любым поиском или анализом ОБЯЗАТЕЛЬНО выполни команду date, чтобы знать актуальную дату и не использовать устаревшие данные из памяти.";
             const model = genAI.getGenerativeModel(modelConfig);
@@ -999,7 +1035,7 @@ function startCronTask(job) {
                     if (executedCommands.length > 0) {
                         finalText += `\n\n<details><summary>📋 <b>Фоновый терминал</b> (нажмите, чтобы развернуть)</summary>\n`;
                         executedCommands.forEach((cmd, index) => {
-                            finalText += `\n${index + 1}. <code>${cmd.command}</code>\n   ↳ ${cmd.result}`;
+                            finalText += `\n${index + 1}. <code>${cmd.command}</code>\n ↳ ${cmd.result}`;
                         });
                         finalText += `\n</details>`;
                     }
@@ -1019,38 +1055,47 @@ function startCronTask(job) {
     });
     activeCronTasks[job.id] = task;
 }
+
 function initAllCronJobs() {
     console.log(`[CRON] Инициализация сохраненных задач: ${scheduledJobs.length}`);
     scheduledJobs.forEach(job => {
         startCronTask(job);
     });
 }
+
 // ==========================================
 // СИСТЕМА ЛОГИРОВАНИЯ (с маскировкой секретов)
 // ==========================================
 const MAX_LOG_LINES = 100;
 let serverLogs = [];
+
 function getKyivTime() {
     return new Date().toLocaleTimeString('ru-RU', { timeZone: 'Europe/Kyiv', hour12: false });
 }
+
 function captureLog(msg) {
     serverLogs.push(`[${getKyivTime()}] ${msg}`);
     if (serverLogs.length > MAX_LOG_LINES) serverLogs.shift();
 }
+
 const origLog = console.log;
 console.log = function(...args) {
     const formatted = maskSecrets(util.format(...args));
     origLog(formatted);
     captureLog(formatted);
 };
+
 const origErr = console.error;
 console.error = function(...args) {
     const formatted = maskSecrets(util.format(...args));
     origErr(formatted);
     captureLog("ERROR: " + formatted);
 };
+
 console.log("[SYSTEM] Сервер запущен. Часовой пояс: Europe/Kyiv");
+
 let useProxy = false;
+
 function getBrowserHeaders(isMobile = false) {
     const ua = isMobile
         ? 'Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36'
@@ -1063,6 +1108,7 @@ function getBrowserHeaders(isMobile = false) {
         'upgrade-insecure-requests': '1'
     };
 }
+
 function decodeBuffer(buffer, contentType) {
     let charset = 'utf-8';
     if (contentType.toLowerCase().includes('windows-1251')) {
@@ -1077,14 +1123,17 @@ function decodeBuffer(buffer, contentType) {
         return buffer.toString('utf-8');
     }
 }
+
 // ==========================================
 // ТЕЛЕМЕТРИЯ ЛИМИТОВ + ПАТЧ СОВМЕСТИМОСТИ МОДЕЛЕЙ
 // ==========================================
 const LIMITS_FILE = path.join(TMP_DIR, 'gemini_limits.json');
 let geminiLimits = {};
+
 if (fs.existsSync(LIMITS_FILE)) {
     try { geminiLimits = JSON.parse(fs.readFileSync(LIMITS_FILE, 'utf8')); } catch(e){}
 }
+
 const originalFetch = global.fetch;
 global.fetch = async (input, init) => {
     // ============================================================
@@ -1154,6 +1203,7 @@ global.fetch = async (input, init) => {
     }
     return response;
 };
+
 // ==========================================
 // ЭНДПОИНТ ПРИЁМА АРТЕФАКТОВ ОТ ANTIGRAVITY
 // Узкоскоупный: умеет ТОЛЬКО класть файл в /tmp/artifacts/ (+ опц. push в GitHub).
@@ -1167,9 +1217,9 @@ app.post('/artifact', (req, res) => {
     let rawName = String(req.get('x-filename') || req.query.name || 'artifact.bin');
     let safeName = path.basename(rawName).replace(/[^a-zA-Z0-9.\-_]/g, '_') || 'artifact.bin';
     const savePath = path.join(ARTIFACT_DIR, safeName); // всегда внутри ARTIFACT_DIR
-
     let bytes = 0; let aborted = false;
     const writer = fs.createWriteStream(savePath);
+
     req.on('data', (chunk) => {
         bytes += chunk.length;
         if (bytes > ARTIFACT_MAX && !aborted) {
@@ -1177,7 +1227,9 @@ app.post('/artifact', (req, res) => {
             try { fs.unlinkSync(savePath); } catch (_) {}
         }
     });
+
     req.pipe(writer);
+
     writer.on('finish', async () => {
         if (aborted) return res.status(413).json({ ok: false, error: "File too large" });
         console.log(`[ARTIFACT] Принят файл: ${savePath} (${(bytes/1024).toFixed(1)} KB)`);
@@ -1188,6 +1240,7 @@ app.post('/artifact', (req, res) => {
         }
         res.json({ ok: true, path: savePath, size: bytes, github: github });
     });
+
     writer.on('error', (e) => {
         console.error("[ARTIFACT WRITE ERROR]", e.message);
         if (!res.headersSent) res.status(500).json({ ok: false, error: e.message });
@@ -1208,7 +1261,7 @@ const FILE_UPLOAD_MAX = parseInt(process.env.FILE_UPLOAD_MAX || String(512 * 102
 
 function sanitizeUploadName(raw) {
     let name = path.basename(String(raw || 'upload.bin'));
-    name = name.replace(/[\x00-\x1f\\/<>:"|?*]/g, '_').replace(/_+/g, '_').trim();
+    name = name.replace(/[\x00-\x1f\/<>:"|?*]/g, '').replace(/\s+/g, '_').trim();
     if (!name || name === '.' || name === '..') name = 'upload.bin';
     return name;
 }
@@ -1226,7 +1279,6 @@ app.post('/file-upload', (req, res) => {
     if (req.query.token !== PROXY_SECRET && req.query.token !== ARTIFACT_TOKEN) {
         return res.status(403).json({ ok: false, error: 'Forbidden' });
     }
-
     const dest = String(req.get('x-dest') || req.query.dest || 'fs').toLowerCase();
     let filename = sanitizeUploadName(req.get('x-filename') || req.query.name || 'upload.bin');
     let targetPath = String(req.get('x-path') || req.query.path || '').trim();
@@ -1234,6 +1286,7 @@ app.post('/file-upload', (req, res) => {
     // FS: если X-Path — директория или пусто → /tmp/filename; если путь с именем — используем его
     let savePath;
     let minioKey = '';
+
     if (dest === 'minio') {
         if (!MINIO_ENABLED) return res.status(503).json({ ok: false, error: 'MinIO disabled' });
         minioKey = targetPath.replace(/^\/+/, '');
@@ -1270,6 +1323,7 @@ app.post('/file-upload', (req, res) => {
             try { fs.unlinkSync(savePath); } catch (_) {}
         }
     });
+
     req.pipe(writer);
 
     writer.on('finish', async () => {
@@ -1309,6 +1363,7 @@ app.post('/file-upload', (req, res) => {
             return res.status(500).json({ ok: false, error: e.message });
         }
     });
+
     writer.on('error', (e) => {
         try { fs.unlinkSync(savePath); } catch (_) {}
         if (!res.headersSent) res.status(500).json({ ok: false, error: e.message });
@@ -1319,6 +1374,7 @@ app.post('/file-upload', (req, res) => {
 // MINIO API ENDPOINTS
 // ==========================================
 // --- MinIO HTTP: тонкая обёртка над minioStorage (логика ключей/PREFIX только там) ---
+
 app.get('/minio/status', async (req, res) => {
     if (req.query.token !== PROXY_SECRET && req.query.token !== ARTIFACT_TOKEN) {
         return res.status(403).json({ ok: false, error: 'Forbidden' });
@@ -1365,14 +1421,13 @@ app.post('/minio/upload', async (req, res) => {
         return res.status(403).json({ ok: false, error: 'Forbidden' });
     }
     if (!MINIO_ENABLED) return res.status(503).json({ ok: false, error: 'MinIO disabled' });
-
     let rawName = String(req.get('x-filename') || req.query.name || 'upload.bin');
     let safeName = path.basename(rawName).replace(/[\x00-\x1f\\/<>:"|?*]/g, '_').replace(/_+/g, '_').trim() || 'upload.bin';
     if (safeName === '.' || safeName === '..') safeName = 'upload.bin';
     const tmpPath = path.join(TMP_DIR, `minio_up_${Date.now()}_${safeName}`);
-
     let bytes = 0; let aborted = false;
     const writer = fs.createWriteStream(tmpPath);
+
     req.on('data', (chunk) => {
         bytes += chunk.length;
         if (bytes > ARTIFACT_MAX && !aborted) {
@@ -1380,7 +1435,9 @@ app.post('/minio/upload', async (req, res) => {
             try { fs.unlinkSync(tmpPath); } catch (_) {}
         }
     });
+
     req.pipe(writer);
+
     writer.on('finish', async () => {
         if (aborted) return res.status(413).json({ ok: false, error: 'File too large' });
         // имя: query.key / body не используется (raw stream); сохраняем оригинальное имя
@@ -1391,13 +1448,13 @@ app.post('/minio/upload', async (req, res) => {
         try { fs.unlinkSync(tmpPath); } catch (_) {}
         res.json(result);
     });
+
     writer.on('error', (e) => {
         try { fs.unlinkSync(tmpPath); } catch (_) {}
         if (!res.headersSent) res.status(500).json({ ok: false, error: e.message });
     });
 });
 
-// ==========================================
 // ==========================================
 // MINIO JSON API — вся логика в minioStorage.handleApi
 // ==========================================
@@ -1419,15 +1476,12 @@ app.post('/minio', async (req, res) => {
     }
 });
 
-
 // ==========================================
 // МАРШРУТ УПРАВЛЕНИЯ И GEMINI
 // ==========================================
-
 // ==========================================
 // GitHub FS — файловый менеджер (Contents API)
 // ==========================================
-
 // Скачивание файла из GitHub с принудительным attachment (не открывать как текст в браузере)
 app.get('/github-fs/download', async (req, res) => {
     if (req.query.token !== PROXY_SECRET && req.query.token !== ARTIFACT_TOKEN) {
@@ -1448,7 +1502,6 @@ app.get('/github-fs/download', async (req, res) => {
         if (!data || data.type === 'dir' || Array.isArray(data)) {
             return res.status(400).send('path is a directory');
         }
-
         let buf;
         if (data.download_url) {
             const fileResp = await axios.get(data.download_url, {
@@ -1469,7 +1522,6 @@ app.get('/github-fs/download', async (req, res) => {
         } else {
             return res.status(404).send('No content');
         }
-
         res.set('Content-Type', 'application/octet-stream');
         res.set('Content-Disposition', `attachment; filename="${safeName}"`);
         res.set('Content-Length', String(buf.length));
@@ -1690,6 +1742,28 @@ app.post('/github-fs', async (req, res) => {
 // fallback action на /gemini
 app.post('/gemini', async (req, res) => {
     if (req.query.token !== PROXY_SECRET) return res.status(403).json({ok: false, error: "Auth failed"});
+
+    // === OPENROUTER: Маршрутизация к OpenRouter API ===
+    if (openrouter.isOpenRouterModel(req.body.model)) {
+        return openrouter.handleOpenRouterMessage(req, res, {
+            OPENROUTER_API_KEY,
+            TAVILY_API_KEY,
+            TMP_DIR,
+            PUBLIC_URL,
+            adminMode,
+            adminSystemPrompt,
+            githubSystemPrompt,
+            githubOps,
+            maskSecrets,
+            messageInbox,
+            getKyivTime,
+            escapeHtml,
+            useProxy,
+            SOCKS5_PROXY,
+            getBrowserHeaders
+        });
+    }
+
     // MinIO ops from FileManager (тот же payload, что и POST /minio)
     if (req.body.action === 'minio') {
         if (!MINIO_ENABLED) return res.status(503).json({ ok: false, error: 'MinIO disabled (нет NF_STORAGE_*)' });
@@ -1703,6 +1777,7 @@ app.post('/gemini', async (req, res) => {
             return res.status(500).json({ ok: false, error: err.message });
         }
     }
+
     // Обработчик опроса уведомлений планировщика
     if (req.body.action === 'poll_inbox') {
         const notifications = messageInbox.map(msg => ({
@@ -1717,6 +1792,7 @@ app.post('/gemini', async (req, res) => {
             admin_mode: adminMode
         });
     }
+
     // Проверяем входящие накопленные ответы от отработавших cron-задач
     let cronNotificationsHtml = "";
     if (messageInbox.length > 0) {
@@ -1724,11 +1800,12 @@ app.post('/gemini', async (req, res) => {
         messageInbox = [];
         fs.writeFileSync(MESSAGES_FILE, '[]');
     }
+
     if (req.body.action === 'upload') {
         try {
             let filename = path.basename(String(req.body.filename || 'upload.bin'));
             // сохраняем оригинал: только убираем path-separators и управляющие
-            filename = filename.replace(/[\x00-\x1f\\/<>:"|?*]/g, '_').replace(/_+/g, '_').trim() || 'upload.bin';
+            filename = filename.replace(/[\x00-\x1f\/<>:"|?*]/g, ' ').replace(/\s+/g, ' ').trim() || 'upload.bin';
             if (filename === '.' || filename === '..') filename = 'upload.bin';
             const savePath = path.join(TMP_DIR, filename);
             fs.writeFileSync(savePath, Buffer.from(req.body.b64, 'base64'));
@@ -1739,6 +1816,7 @@ app.post('/gemini', async (req, res) => {
             return res.status(500).json({ok: false, error: err.message});
         }
     }
+
     if (req.body.action === 'live_credentials') {
         if (!GEMINI_API_KEY) {
             return res.status(500).json({ ok: false, error: 'GEMINI_API_KEY не задан на сервере' });
@@ -1750,26 +1828,41 @@ app.post('/gemini', async (req, res) => {
             model: 'gemini-2.5-flash-native-audio-preview-09-2025'
         });
     }
-    if (req.body.action === 'get_models') {
 
+    if (req.body.action === 'get_models') {
         try {
-            console.log("[GEMINI] Запрос списка доступных моделей...");
-            const response = await axios.get(`https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_API_KEY}`);
-            const models = response.data.models
-                .filter(m => m.supportedGenerationMethods && m.supportedGenerationMethods.includes("generateContent"))
-                .map(m => {
-                    let cleanId = m.name.replace('models/', '');
-                    let cleanName = m.displayName ? m.displayName.replace('models/', '') : cleanId;
-                    return { id: cleanId, name: cleanName };
-                });
-            console.log(`[GEMINI] Успешно загружено ${models.length} моделей.`);
+            console.log("[MODELS] Запрос списка доступных моделей...");
+            let models = [];
+
+            if (GEMINI_API_KEY) {
+                const response = await axios.get(`https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_API_KEY}`);
+                models = response.data.models
+                    .filter(m => m.supportedGenerationMethods && m.supportedGenerationMethods.includes("generateContent"))
+                    .map(m => {
+                        let cleanId = m.name.replace('models/', '');
+                        let cleanName = m.displayName ? m.displayName.replace('models/', '') : cleanId;
+                        return { id: cleanId, name: cleanName };
+                    });
+            }
+
+            // === OPENROUTER: Добавляем OpenRouter модели, если ключ задан ===
+            if (OPENROUTER_API_KEY) {
+                models.push({ id: "stealth/ox-alpha", name: "Ox Alpha (OpenRouter)" });
+            }
+
+            console.log(`[MODELS] Успешно загружено ${models.length} моделей.`);
             return res.json({ ok: true, models: models });
         } catch (err) {
-            console.error("[GEMINI ERROR] Сбой загрузки списка моделей:", err.message);
+            console.error("[MODELS ERROR] Сбой загрузки списка моделей:", err.message);
+            if (OPENROUTER_API_KEY) {
+                return res.json({ ok: true, models: [{ id: "stealth/ox-alpha", name: "Ox Alpha (OpenRouter)" }] });
+            }
             return res.status(500).json({ ok: false, error: err.message });
         }
     }
+
     let userText = req.body.text ? req.body.text.trim() : "";
+
     if (userText.startsWith('/task ')) {
         const payload = userText.substring(6).trim();
         if (!payload) {
@@ -1806,6 +1899,7 @@ app.post('/gemini', async (req, res) => {
         startCronTask(newJob);
         return res.json({ ok: true, text: `✅ <b>Задача планировщика создана!</b><br>ID: <code>${jobId}</code><br>Расписание: <code>${pattern}</code><br>Задача: <i>${taskText}</i><br><br>ИИ выполнит её в фоновом режиме и сохранит результат во входящие.` });
     }
+
     if (userText === '/tasks') {
         if (scheduledJobs.length === 0) {
             return res.json({ ok: true, text: "📝 Активных фоновых задач планировщика нет." });
@@ -1816,6 +1910,7 @@ app.post('/gemini', async (req, res) => {
         });
         return res.json({ ok: true, text: jobsListHtml });
     }
+
     if (userText.startsWith('/deltask')) {
         const parts = userText.split(' ');
         if (parts.length > 1) {
@@ -1844,6 +1939,7 @@ app.post('/gemini', async (req, res) => {
             return res.json({ ok: true, text: "🧹 <b>Все фоновые cron-задачи удалены!</b>" });
         }
     }
+
     if (userText === '/help') {
         const deliveryHint = ARTIFACT_DELIVERY_ENABLED
             ? `<code>/artifact</code> — приём артефактов от Antigravity <b>настроен</b> (→ /tmp/artifacts/ + GitHub${GITHUB_ENABLED ? '' : ' [не настроен]'}; <b>без MinIO</b>)<br>`
@@ -1876,6 +1972,7 @@ ${deliveryHint}
 <i>Пример: <code>!ls -la /tmp</code></i>`;
         return res.json({ ok: true, text: respHtml });
     }
+
     // Режим администратора
     if (userText === '/admin on') {
         adminMode = true;
@@ -1883,30 +1980,34 @@ ${deliveryHint}
             { role: "user", parts: [{ text: "Инструкции администратора" }] },
             { role: "model", parts: [{ text: adminSystemPrompt || "Инструкции не загружены." }] }
         ];
-        adminAntigravityPrevId = null; adminAntigravityEnvId = null;
+        adminAntigravityPrevId = null;
+        adminAntigravityEnvId = null;
         console.log("[ADMIN] Режим администратора ВКЛЮЧЕН. История инициализирована системным промптом.");
         return res.json({ ok: true, text: "🔧 <b>Режим администратора активирован.</b> Все последующие сообщения будут выполняться как автономные задачи с доступом к терминалу и поиску в интернете." });
     }
+
     if (userText === '/admin off') {
         adminMode = false;
         adminHistory = [];
         githubHistory = [];
         githubSessionActive = false;
-        adminAntigravityPrevId = null; adminAntigravityEnvId = null;
+        adminAntigravityPrevId = null;
+        adminAntigravityEnvId = null;
         console.log("[ADMIN] Режим администратора ОТКЛЮЧЕН.");
         return res.json({ ok: true, text: "🛑 <b>Режим администратора отключен.</b> Сессия /github также сброшена." });
     }
+
     // Режим выполнения Antigravity: async (фон) / sync (ожидание)
     if (userText === '/ag_async on' || userText === '/ag_async off') {
         antigravityNonBlocking = (userText === '/ag_async on');
         console.log("[ANTIGRAVITY] Неблокирующий режим: " + (antigravityNonBlocking ? "ON" : "OFF"));
-        return res.json({ ok: true, text: antigravityNonBlocking
-            ? "⚡ <b>Antigravity: неблокирующий режим ВКЛ (async).</b><br>Задачи уходят в фон мгновенно — GAS не висит и не упрётся в лимит 6 минут. Прогресс и итоговый результат придут во входящие (📬 Планировщик)."
-            : "🔒 <b>Antigravity: блокирующий режим ВКЛ (sync).</b><br>Сервер ждёт завершения задачи и возвращает ответ прямо в пузыре. <b>Внимание:</b> на задачах дольше ~6 минут GAS‑прослойка может оборвать соединение — для долгих задач (компиляция, исследования) используйте <code>/ag_async on</code>." });
+        return res.json({ ok: true, text: antigravityNonBlocking ? "⚡ <b>Antigravity: неблокирующий режим ВКЛ (async).</b><br>Задачи уходят в фон мгновенно — GAS не висит и не упрётся в лимит 6 минут. Прогресс и итоговый результат придут во входящие (📬 Планировщик)." : "🔒 <b>Antigravity: блокирующий режим ВКЛ (sync).</b><br>Сервер ждёт завершения задачи и возвращает ответ прямо в пузыре. <b>Внимание:</b> на задачах дольше ~6 минут GAS‑прослойка может оборвать соединение — для долгих задач (компиляция, исследования) используйте <code>/ag_async on</code>." });
     }
+
     if (userText === '/ag_async') {
-        return res.json({ ok: true, text: `⚡ Режим Antigravity сейчас: <b>${antigravityNonBlocking ? 'НЕБЛОКИРУЮЩИЙ (async, фон)' : 'БЛОКИРУЮЩИЙ (sync, ожидание)'}</b><br>Переключение: <code>/ag_async on</code> | <code>/ag_async off</code>` });
+        return res.json({ ok: true, text:`⚡ Режим Antigravity сейчас: <b>${antigravityNonBlocking ? 'НЕБЛОКИРУЮЩИЙ (async, фон)' : 'БЛОКИРУЮЩИЙ (sync, ожидание)'}</b><br>Переключение: <code>/ag_async on</code> | <code>/ag_async off</code>`});
     }
+
     if (userText === '/proxy on') {
         if (!SOCKS5_PROXY) return res.json({ok: true, text: "❌ Переменная SOCKS5_PROXY не настроена."});
         useProxy = true;
@@ -1914,53 +2015,63 @@ ${deliveryHint}
         const curlBin = path.join(curlDir, 'curl_chrome116');
         if (!fs.existsSync(curlBin)) {
             console.error("[PROXY ERROR] Папка curl-impersonate не найдена!");
-            return res.json({ok: true, text: `❌ Ошибка: Не найдена локальная папка curl-impersonate.`});
+            return res.json({ok: true, text:`❌ Ошибка: Не найдена локальная папка curl-impersonate.`});
         }
         console.log("[PROXY] Ghost Proxy успешно активирован (Локальная версия).");
         return res.json({ok: true, text: "🚀 <b>Ghost Proxy включен!</b><br>Трафик идет через SOCKS5 с локальным curl-impersonate."});
     }
+
     if (userText === '/proxy off') {
         useProxy = false;
         console.log("[PROXY] Ghost Proxy отключен.");
         return res.json({ok: true, text: "🛑 <b>Proxy выключен.</b>"});
     }
+
     if (userText === '/limit') {
-        if (Object.keys(geminiLimits).length === 0) return res.json({ ok: true, text: `📊 <b>Состояние моделей:</b> Отправьте запрос ИИ.` });
-        let tableHtml = `<table style="width:100%; border-collapse:collapse; font-size:11px; margin-top:5px; background:#fff; color:#333;"><tr style="background:#1a73e8; color:white;"><th style="padding:4px; border:1px solid #ccc;">Модель</th><th style="padding:4px; border:1px solid #ccc;">Статус</th><th style="padding:4px; border:1px solid #ccc;">Сброс</th></tr>`;
+        if (Object.keys(geminiLimits).length === 0) return res.json({ ok: true, text:`📊 <b>Состояние моделей:</b> Отправьте запрос ИИ.`});
+        let tableHtml = `<table style="width:100%; border-collapse:collapse; font-size:11px; margin-top:5px; background:#fff; color:#333;">
+<tr style="background:#1a73e8; color:white;">
+<th style="padding:4px; border:1px solid #ccc;">Модель</th>
+<th style="padding:4px; border:1px solid #ccc;">Статус</th>
+<th style="padding:4px; border:1px solid #ccc;">Сброс</th>
+</tr>`;
         for (const [model, data] of Object.entries(geminiLimits)) {
             const statusColor = data.status === 'OK' ? '#28a745' : '#dc3545';
-            tableHtml += `<tr><td style="padding:4px; border:1px solid #ccc; font-weight:bold;">${model}</td><td style="padding:4px; border:1px solid #ccc; text-align:center; font-weight:bold; color:${statusColor};">${data.status}</td><td style="padding:4px; border:1px solid #ccc; text-align:center;">${data.reset}</td></tr>`;
+            tableHtml += `<tr>
+<td style="padding:4px; border:1px solid #ccc; font-weight:bold;">${model}</td>
+<td style="padding:4px; border:1px solid #ccc; text-align:center; font-weight:bold; color:${statusColor};">${data.status}</td>
+<td style="padding:4px; border:1px solid #ccc; text-align:center;">${data.reset}</td>
+</tr>`;
         }
         tableHtml += `</table>`;
-        return res.json({ ok: true, text: `📊 <b>Мониторинг блокировок:</b><br>${tableHtml}` });
+        return res.json({ ok: true, text:`📊 <b>Мониторинг блокировок:</b><br>${tableHtml}`});
     }
+
     if (userText.startsWith('/download ')) {
         const targetPath = userText.substring(10).trim();
-        if (!fs.existsSync(targetPath)) return res.json({ok: true, text: `❌ Файл не найден.`});
+        if (!fs.existsSync(targetPath)) return res.json({ok: true, text:`❌ Файл не найден.`});
         const stat = fs.statSync(targetPath);
-        if (stat.isDirectory()) return res.json({ok: true, text: `❌ Это папка. Сначала запакуйте её: <code>!zip -r /tmp/dir.zip ${targetPath}</code>`});
+        if (stat.isDirectory()) return res.json({ok: true, text:`❌ Это папка. Сначала запакуйте её: <code>!zip -r /tmp/dir.zip ${targetPath}</code>`});
         const mb = (stat.size / 1024 / 1024).toFixed(2);
-        if (stat.size > 15 * 1024 * 1024) return res.json({ok: true, text: `⚠️ Файл слишком большой (${mb} МБ). Максимум 15 МБ.`});
+        if (stat.size > 15 * 1024 * 1024) return res.json({ok: true, text:`⚠️ Файл слишком большой (${mb} МБ). Максимум 15 МБ.`});
         console.log(`[DOWNLOAD] Подготовлен файл: ${targetPath} (${mb} MB)`);
         const fakeUrl = `http://system.local/dl?path=${encodeURIComponent(targetPath)}`;
-        return res.json({ok: true, text: `📦 <b>Файл готов (${mb} MB)</b><br><a href="${fakeUrl}" style="display:inline-block; margin-top:8px; padding:8px 12px; background:#28a745; color:white; text-decoration:none; border-radius:5px; font-weight:bold;">📥 Загрузить на телефон</a>`});
+        return res.json({ok: true, text:`📦 <b>Файл готов (${mb} MB)</b><br><a href="${fakeUrl}" style="display:inline-block; margin-top:8px; padding:8px 12px; background:#28a745; color:white; text-decoration:none; border-radius:5px; font-weight:bold;">📥 Загрузить на телефон</a>`});
     }
+
     if (userText === '/logs') {
         const logsHtml = serverLogs.length ? serverLogs.join('\n') : "Логи пусты.";
-        return res.json({ ok: true, text: `🖥 <b>Логи Northflank:</b><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#e0e0e0; color:#333; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${logsHtml}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#999; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
+        return res.json({ ok: true, text:`🖥 <b>Логи Northflank:</b><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#e0e0e0; color:#333; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${logsHtml}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#999; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>`});
     }
+
     if (userText === '/status') {
         const mem = process.memoryUsage();
         const uptime = Math.floor(process.uptime());
-        const adminStatus = adminMode
-            ? '<span style="color:green; font-weight:bold;">✅ ВКЛЮЧЕН</span>'
-            : '<span style="color:red;">❌ ВЫКЛЮЧЕН</span>';
+        const adminStatus = adminMode ? '<span style="color:green; font-weight:bold;">✅ ВКЛЮЧЕН</span>' : '<span style="color:red;">❌ ВЫКЛЮЧЕН</span>';
         const adminCtx = adminMode ? `<br>🧠 Контекст админа: <b>${adminHistory.length} сообщений</b>` : '';
-        const agMode = antigravityNonBlocking
-            ? '<span style="color:#1a73e8; font-weight:bold;">async (фон)</span>'
-            : '<span style="color:#6f42c1; font-weight:bold;">sync (ожидание)</span>';
+        const agMode = antigravityNonBlocking ? '<span style="color:#1a73e8; font-weight:bold;">async (фон)</span>' : '<span style="color:#6f42c1; font-weight:bold;">sync (ожидание)</span>';
         const deliveryStatus = ARTIFACT_DELIVERY_ENABLED
-            ? `<span style="color:green; font-weight:bold;">✅ настроена</span> → /tmp/artifacts/` + (GITHUB_ENABLED ? ` + GitHub (<code>${escHtmlAg(GITHUB_REPO)}</code>)` : ` <span style="color:#856404;">(GitHub не настроен)</span>`)
+            ? `<span style="color:green; font-weight:bold;">✅ настроена</span> → /tmp/artifacts/` + (GITHUB_ENABLED ? ` + GitHub (<code>${escHtmlAg(GITHUB_REPO)}</code>)` : `<span style="color:#856404">(GitHub не настроен)</span>`)
             : `<span style="color:red;">❌ НЕ настроена</span> (нужны env PUBLIC_URL + ARTIFACT_TOKEN)`;
         const tasksCount = scheduledJobs.length;
         let statusText = `🖥 <b>Статус:</b><br>⏱ Uptime: <b>${Math.floor(uptime/3600)}ч ${Math.floor((uptime%3600)/60)}м</b><br>💾 Память: <b>${(mem.rss / 1024 / 1024).toFixed(1)} MB</b><br>🔒 Ghost Proxy: <b>${useProxy ? '<span style="color:green">ВКЛЮЧЕН</span>' : '<span style="color:red">ВЫКЛЮЧЕН</span>'}</b><br>🔧 Режим администратора: ${adminStatus}${adminCtx}<br>⚡ Antigravity: <b>${agMode}</b><br>📤 Доставка артефактов: ${deliveryStatus}<br>🧠 Контекст обычного чата: <b>${geminiHistory.length} сообщений</b><br>⚙️ Фоновых задач: <b>${tasksCount}</b>`;
@@ -1969,25 +2080,28 @@ ${deliveryHint}
         }
         return res.json({ ok: true, text: statusText });
     }
+
     if (userText.startsWith('!')) {
         const cmd = userText.substring(1).trim();
         if (!cmd) return res.json({ ok: true, text: "⚠️ Введите команду." });
         try {
             console.log(`[CHATOPS] Выполнение: ${cmd}`);
             const { stdout, stderr } = await execPromise(cmd, { timeout: 15000 });
-            let output = stdout; if (stderr) output += `\n[STDERR]:\n${stderr}`;
+            let output = stdout;
+            if (stderr) output += `\n[STDERR]:\n${stderr}`;
             if (!output) output = "[Выполнено успешно]";
             // лимит + маркер; экранирование обязательно (!cat server.js содержит </div> и ломает HTML/скролл)
-            if (output.length >300000) output = output.substring(0, 300000) + "\n\n...[ОБРЕЗАН: вывод больше 300000 символов]...";
+            if (output.length > 300000) output = output.substring(0, 300000) + "\n\n...[ОБРЕЗАН: вывод больше 300000 символов]...";
             const safeOut = escapeHtml(output);
             const safeCmd = escapeHtml(cmd);
-            return res.json({ ok: true, text: `<b>$</b> <code>${safeCmd}</code><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#1e1e1e; color:#0f0; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${safeOut}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#555; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
+            return res.json({ ok: true, text:`<b>$</b> <code>${safeCmd}</code><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#1e1e1e; color:#0f0; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${safeOut}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#555; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>`});
         } catch (err) {
             const safeCmdE = escapeHtml(cmd);
             const safeErr = escapeHtml(err.message || String(err));
-            return res.json({ ok: true, text: `<b>$</b> <code>${safeCmdE}</code><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#3b1313; color:#f66; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${safeErr}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#773333; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>` });
+            return res.json({ ok: true, text:`<b>$</b> <code>${safeCmdE}</code><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#3b1313; color:#f66; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${safeErr}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#773333; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>`});
         }
     }
+
     if (userText.startsWith('/search ')) {
         const query = userText.substring(8).trim();
         if (!query) return res.json({ ok: true, text: "⚠️ Укажите запрос." });
@@ -2017,18 +2131,27 @@ ${deliveryHint}
                 searchResultsText = `✅ Файл успешно скачан!\n📁 Путь: ${savePath}\n📦 Размер: ${(stat.size/1024).toFixed(1)} KB`;
             } else {
                 if (!TAVILY_API_KEY) throw new Error("Не настроен TAVILY_API_KEY.");
-                let apiQuery = query; let includeDomains = [];
+                let apiQuery = query;
+                let includeDomains = [];
                 const siteMatch = apiQuery.match(/(?:^|\s)site:([^\s]+)/i);
-                if (siteMatch) { includeDomains.push(siteMatch[1]); apiQuery = apiQuery.replace(/(?:^|\s)site:([^\s]+)/i, '').trim(); }
+                if (siteMatch) {
+                    includeDomains.push(siteMatch[1]);
+                    apiQuery = apiQuery.replace(/(?:^|\s)site:([^\s]+)/i, '').trim();
+                }
                 const ftMatch = apiQuery.match(/(?:^|\s)filetype:([a-z0-9]+)/i);
-                if (ftMatch) { apiQuery = apiQuery.replace(/(?:^|\s)filetype:([a-z0-9]+)/i, '').trim(); apiQuery += ` (file document ${ftMatch[1]})`; }
+                if (ftMatch) {
+                    apiQuery = apiQuery.replace(/(?:^|\s)filetype:([a-z0-9]+)/i, '').trim();
+                    apiQuery += ` (file document ${ftMatch[1]})`;
+                }
                 const requestBody = { api_key: TAVILY_API_KEY, query: apiQuery || "index", max_results: 6, search_depth: "basic" };
                 if (includeDomains.length > 0) requestBody.include_domains = includeDomains;
                 const response = await axios.post('https://api.tavily.com/search', requestBody);
                 if (response.data && response.data.results && response.data.results.length > 0) {
                     let results = response.data.results.map((r, i) => `[${i+1}] ${r.title}\n${r.content}\nСсылка: ${r.url}`);
                     searchResultsText = `Результаты:\n\n${results.join('\n\n')}`;
-                } else { searchResultsText = `По запросу «${query}» ничего не найдено.`; }
+                } else {
+                    searchResultsText = `По запросу «${query}» ничего не найдено.`;
+                }
             }
             userText = `Команда /search "${query}". Данные:\n\n${searchResultsText}\n\nПроанализируй и дай ответ.`;
         } catch (err) {
@@ -2036,11 +2159,19 @@ ${deliveryHint}
             userText = `Ошибка поиска "${query}": ${err.message}.`;
         }
     }
+
     if (!GEMINI_API_KEY) return res.status(500).json({ok: false, error: "Отсутствует GEMINI_API_KEY"});
+
     if (req.body.clear === 'true') {
         geminiHistory = [];
-        geminiAntigravityPrevId = null; geminiAntigravityEnvId = null;
-        adminAntigravityPrevId = null; adminAntigravityEnvId = null;
+        geminiAntigravityPrevId = null;
+        geminiAntigravityEnvId = null;
+        adminAntigravityPrevId = null;
+        adminAntigravityEnvId = null;
+        
+        // === OPENROUTER: Очистка истории OpenRouter ===
+        openrouter.clearHistory();
+        
         if (adminMode) {
             adminHistory = [
                 { role: "user", parts: [{ text: "Инструкции администратора" }] },
@@ -2052,6 +2183,7 @@ ${deliveryHint}
         console.log("[GEMINI] Память контекста нейросети очищена.");
         if (userText === 'clear') return res.json({ok: true, text: "История очищена"});
     }
+
     // /github — автоматически включает admin-режим и подключает инструкции github.md
     if (userText.startsWith('/github')) {
         let autoAdminNote = "";
@@ -2072,31 +2204,29 @@ ${deliveryHint}
                 ? `💾 Активная сессия: <b>${githubHistory.length}</b> сообщ.${githubSessionActive ? ' (ожидает продолжения после лимита)' : ''}<br>` +
                   `Продолжить: <code>/github продолжай</code> · Сброс: <code>/github clear</code><br><br>`
                 : `Сессия пуста — новый диалог начнётся с первого запроса.<br><br>`;
-            return res.json({
-                ok: true,
-                text: autoAdminNote + `📦 <b>GitHub-инструмент</b> (${GITHUB_ENABLED ? 'настроен: <code>' + GITHUB_REPO + '</code>' : '<span style="color:red">НЕ настроен</span>'})<br>` +
-                    sess +
-                    `Использование: <code>/github [что сделать]</code><br>` +
-                    `Примеры:<br>` +
-                    `• <code>/github покажи корень репозитория</code><br>` +
-                    `• <code>/github создай скетч ESP32-S3, workflow PlatformIO, собери, скачай .bin и пришли в Telegram</code><br>` +
-                    `• <code>/github продолжай</code> — после лимита итераций<br>` +
-                    `• <code>/github clear</code> — сбросить сессию<br><br>` +
-                    `Лимит: 50 вызовов инструментов за ход; прогресс сохраняется.`,
-                admin_mode: true
-            });
+            return res.json({ ok: true, text: autoAdminNote +
+                `📦 <b>GitHub-инструмент</b> (${GITHUB_ENABLED ? 'настроен: <code>' + GITHUB_REPO + '</code>' : '<span style="color:red">НЕ настроен</span>'})<br>` +
+                sess +
+                `Использование: <code>/github [что сделать]</code><br>` +
+                `Примеры:<br>` +
+                `• <code>/github покажи корень репозитория</code><br>` +
+                `• <code>/github создай скетч ESP32-S3, workflow PlatformIO, собери, скачай .bin и пришли в Telegram</code><br>` +
+                `• <code>/github продолжай</code> — после лимита итераций<br>` +
+                `• <code>/github clear</code> — сбросить сессию<br><br>` +
+                `Лимит: 50 вызовов инструментов за ход; прогресс сохраняется.`, admin_mode: true });
         }
         // «продолжай» без доп. текста — модель сама подхватит историю
-        const taskForModel = /^(продолжай|continue|далее|продолжить)$/i.test(ghTask)
-            ? 'Продолжи выполнение предыдущей задачи с того места, где остановился. Не начинай заново — используй уже сделанный прогресс из истории. Если всё уже сделано — кратко сообщи итог.'
-            : ghTask;
+        const taskForModel = /^(продолжай|continue|далее|продолжить)$/i.test(ghTask) ? 'Продолжи выполнение предыдущей задачи с того места, где остановился. Не начинай заново — используй уже сделанный прогресс из истории. Если всё уже сделано — кратко сообщи итог.' : ghTask;
         return handleAdminMessage(taskForModel, req, res, (autoAdminNote || '') + (cronNotificationsHtml || ''), { withGithub: true });
     }
+
     // Передаем cronNotificationsHtml в функцию администратора
     if (adminMode && userText && !userText.startsWith('/') && !userText.startsWith('!')) {
         return handleAdminMessage(userText, req, res, cronNotificationsHtml);
     }
+
     const modelName = req.body.model || "gemini-2.0-flash";
+
     // --- Antigravity: отдельный путь через Interactions API ---
     if (isAntigravityModel(modelName)) {
         if (req.body.b64 && req.body.mimeType && !String(req.body.mimeType).startsWith('image/')) {
@@ -2109,13 +2239,19 @@ ${deliveryHint}
                 { type: "image", data: req.body.b64, mime_type: req.body.mimeType }
             ];
         }
+
         // НЕБЛОКИРУЮЩИЙ режим: мгновенная заглушка, задача в фоне
         if (antigravityNonBlocking) {
-            runAntigravityInBackground({ mode: 'chat', input: agInput, systemInstruction: getAntigravitySystemInstruction("Ты — полезный ИИ-ассистент.") });
+            runAntigravityInBackground({
+                mode: 'chat',
+                input: agInput,
+                systemInstruction: getAntigravitySystemInstruction("Ты — полезный ИИ-ассистент.")
+            });
             let stub = "✅ <b>Задача Antigravity принята в фоновый режим.</b><br>Прогресс и ответ появятся во входящих (📬 Планировщик). Следите за блоками прогресса — они приходят каждые ~10 секунд.";
             if (cronNotificationsHtml) stub = cronNotificationsHtml + '<br>' + stub;
             return res.json({ ok: true, text: stub });
         }
+
         // БЛОКИРУЮЩИЙ режим: ждём завершения и возвращаем в пузыре
         try {
             const ag = await callAntigravityAgent({
@@ -2135,6 +2271,7 @@ ${deliveryHint}
             return res.status(500).json({ ok: false, error: err.message });
         }
     }
+
     const msgParts = [];
     if (userText) msgParts.push(userText);
     if (req.body.b64 && req.body.mimeType) {
@@ -2142,7 +2279,9 @@ ${deliveryHint}
         console.log(`[GEMINI] К запросу прикреплен файл: ${req.body.mimeType}`);
     }
     if (msgParts.length === 0) return res.status(400).json({ok: false, error: "Пустой запрос"});
+
     console.log(`[GEMINI] Запрос к ИИ. Модель: [${modelName}]. Контекст в памяти: [${geminiHistory.length} сообщений]`);
+
     try {
         const isGemma = modelName.toLowerCase().includes('gemma');
         const modelConfig = { model: modelName };
@@ -2158,6 +2297,7 @@ ${deliveryHint}
         return res.status(500).json({ ok: false, error: err.message });
     }
 });
+
 // ==========================================
 // ANTIGRAVITY В РЕЖИМЕ АДМИНИСТРАТОРА
 // ==========================================
@@ -2166,10 +2306,10 @@ async function handleAntigravityAdmin(userText, req, res, cronNotificationsHtml 
     // При /github просто добавляем текстовые инструкции; для полноценного GitHub лучше выбрать Gemini Flash.
     let basePrompt = adminSystemPrompt || "Ты — автономный агент-администратор. Выполняй задачу и возвращай краткий результат.";
     if (withGithub && githubSystemPrompt) {
-        basePrompt += "\n\n=== РЕЖИМ GITHUB ===\n" + githubSystemPrompt +
-            "\n\nВАЖНО: инструмент github_ops доступен только в обычном admin-режиме (модели Gemini Flash / Lite, НЕ Antigravity). " +
+        basePrompt += "\n\n=== РЕЖИМ GITHUB ===\n" + githubSystemPrompt + "\n\nВАЖНО: инструмент github_ops доступен только в обычном admin-режиме (модели Gemini Flash / Lite, НЕ Antigravity). " +
             "В Antigravity токен GitHub тебе недоступен — не пытайся его искать. Если нужна запись в репозиторий, попроси пользователя выбрать модель без Antigravity.";
     }
+
     // НЕБЛОКИРУЮЩИЙ режим: мгновенная заглушка, задача в фоне
     if (antigravityNonBlocking) {
         runAntigravityInBackground({
@@ -2184,6 +2324,7 @@ async function handleAntigravityAdmin(userText, req, res, cronNotificationsHtml 
         if (cronNotificationsHtml) stub = cronNotificationsHtml + '<br>' + stub;
         return res.json({ ok: true, text: stub });
     }
+
     // БЛОКИРУЮЩИЙ режим: ждём завершения и возвращаем в пузыре
     try {
         const ag = await callAntigravityAgent({
@@ -2204,6 +2345,7 @@ async function handleAntigravityAdmin(userText, req, res, cronNotificationsHtml 
         return res.status(500).json({ ok: false, error: err.message });
     }
 }
+
 // ==========================================
 // АВТОНОМНЫЙ АДМИНИСТРАТОР С ИНСТРУМЕНТАМИ
 // ==========================================
@@ -2211,10 +2353,12 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
     if (!GEMINI_API_KEY) return res.status(500).json({ok: false, error: "Отсутствует GEMINI_API_KEY"});
     const preferredModel = req.body.model || "gemini-2.0-flash";
     const withGithub = !!(options && options.withGithub);
+
     // --- Antigravity: агент работает через Interactions API со своими инструментами ---
     if (isAntigravityModel(preferredModel)) {
         return handleAntigravityAdmin(userText, req, res, cronNotificationsHtml, withGithub);
     }
+
     const isGemma = preferredModel.toLowerCase().includes('gemma');
     const modelConfig = { model: preferredModel };
     if (!isGemma) {
@@ -2225,6 +2369,7 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
         modelConfig.systemInstruction = sys;
     }
     const model = genAI.getGenerativeModel(modelConfig);
+
     const tools = [{
         functionDeclarations: [
             {
@@ -2309,11 +2454,8 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                         action: {
                             type: "STRING",
                             enum: [
-                                "status", "list", "get", "put", "delete",
-                                "download_to_server", "create_artifact",
-                                "list_workflows", "trigger_workflow",
-                                "list_runs", "wait_run",
-                                "list_artifacts", "download_artifact"
+                                "status", "list", "get", "put", "delete", "download_to_server", "create_artifact",
+                                "list_workflows", "trigger_workflow", "list_runs", "wait_run", "list_artifacts", "download_artifact"
                             ],
                             description: "Operation to perform"
                         },
@@ -2340,6 +2482,7 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
             }
         ]
     }];
+
     // /github: продолжаем сохранённую сессию, если она есть; иначе стартуем с github.md
     let historyForChat;
     if (withGithub) {
@@ -2355,18 +2498,23 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
     } else {
         historyForChat = adminHistory;
     }
+
     const chat = model.startChat({ history: historyForChat, tools: tools });
     const executedCommands = [];
     let iterations = 0;
     const maxIterations = withGithub ? 50 : 50; // admin / github: до 50 вызовов инструментов за один ход
+
     try {
         let result = await chat.sendMessage(userText);
+
         while (result.response && result.response.candidates && result.response.candidates[0]) {
             const candidate = result.response.candidates[0];
             const parts = candidate.content.parts;
             const functionCall = parts.find(part => part.functionCall);
+
             if (functionCall) {
                 const call = functionCall.functionCall;
+
                 if (call.name === "exec_command") {
                     const cmd = call.args.command;
                     console.log(`[ADMIN] Выполнение команды: ${cmd}`);
@@ -2383,6 +2531,7 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                     console.log(`[ADMIN] Результат: ${execResult.substring(0, 200)}`);
                     const funcResponse = { name: call.name, response: { result: execResult } };
                     result = await chat.sendMessage([{ functionResponse: funcResponse }]);
+
                 } else if (call.name === "search_web") {
                     const action = call.args.action;
                     console.log(`[ADMIN] Поиск/загрузка: action=${action}`);
@@ -2425,6 +2574,7 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                     console.log(`[ADMIN] Результат операции: ${searchResult.substring(0, 200)}`);
                     const funcResponse = { name: call.name, response: { result: searchResult } };
                     result = await chat.sendMessage([{ functionResponse: funcResponse }]);
+
                 } else if (call.name === "send_message_to_telegram") {
                     let execResult;
                     if (!TG_TOKEN) {
@@ -2450,6 +2600,7 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                     console.log(`[ADMIN] send_message_to_telegram: ${execResult}`);
                     const funcResponse = { name: call.name, response: { result: execResult } };
                     result = await chat.sendMessage([{ functionResponse: funcResponse }]);
+
                 } else if (call.name === "send_file_to_telegram") {
                     let execResult;
                     if (!TG_TOKEN) {
@@ -2482,6 +2633,7 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                     console.log(`[ADMIN] send_file_to_telegram: ${execResult}`);
                     const funcResponse = { name: call.name, response: { result: execResult } };
                     result = await chat.sendMessage([{ functionResponse: funcResponse }]);
+
                 } else if (call.name === "toggle_proxy") {
                     const state = call.args.state;
                     let execResult;
@@ -2499,6 +2651,7 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                     console.log(`[ADMIN] toggle_proxy: ${execResult}`);
                     const funcResponse = { name: call.name, response: { result: execResult } };
                     result = await chat.sendMessage([{ functionResponse: funcResponse }]);
+
                 } else if (call.name === "manage_cron_tasks") {
                     let execResult;
                     const action = call.args.action;
@@ -2550,6 +2703,7 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                     console.log(`[ADMIN] manage_cron_tasks: ${execResult}`);
                     const funcResponse = { name: call.name, response: { result: execResult } };
                     result = await chat.sendMessage([{ functionResponse: funcResponse }]);
+
                 } else if (call.name === "github_ops") {
                     console.log(`[ADMIN] github_ops: action=${call.args && call.args.action}`);
                     let ghResult;
@@ -2563,6 +2717,7 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                     console.log(`[ADMIN] github_ops result: ${String(ghResult).substring(0, 300)}`);
                     const funcResponse = { name: call.name, response: { result: ghResult } };
                     result = await chat.sendMessage([{ functionResponse: funcResponse }]);
+
                 } else {
                     console.log("[ADMIN] Неизвестная функция:", call.name);
                     break;
@@ -2572,10 +2727,11 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                 if (executedCommands.length > 0) {
                     finalText += `\n\n<details><summary>📋 <b>Терминал</b> (нажмите, чтобы развернуть)</summary>\n`;
                     executedCommands.forEach((cmd, index) => {
-                        finalText += `\n${index + 1}. <code>${cmd.command}</code>\n   ↳ ${cmd.result}`;
+                        finalText += `\n${index + 1}. <code>${cmd.command}</code>\n ↳ ${cmd.result}`;
                     });
                     finalText += `\n</details>`;
                 }
+
                 // Сохраняем историю: admin → adminHistory; github → githubHistory (для /github continue)
                 try {
                     const hist = await chat.getHistory();
@@ -2586,12 +2742,14 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                         adminHistory = hist;
                     }
                 } catch (_) {}
+
                 let finalResponseText = finalText;
                 if (cronNotificationsHtml) {
                     finalResponseText = cronNotificationsHtml + '<br>' + finalResponseText;
                 }
                 return res.json({ ok: true, text: finalResponseText });
             }
+
             iterations++;
             if (iterations >= maxIterations) {
                 // Сохраняем точку остановки — следующий /github продолжит с этой истории
@@ -2604,25 +2762,34 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                         adminHistory = hist;
                     }
                 } catch (_) {}
+
                 let limitText = `⚠️ <b>Достигнут лимит операций (${maxIterations}).</b> Прогресс сохранён.<br>` +
                     (withGithub
                         ? `Продолжите той же сессией: <code>/github продолжай</code> или <code>/github</code> + следующая инструкция.<br>` +
                           `Сброс сессии GitHub: <code>/github clear</code>`
                         : `Отправьте следующее сообщение в admin-режиме — контекст сохранён.`);
+
                 if (executedCommands.length > 0) {
                     limitText += `\n\n<details><summary>📋 <b>Терминал</b> (нажмите, чтобы развернуть)</summary>\n`;
                     executedCommands.forEach((cmd, index) => {
-                        limitText += `\n${index + 1}. <code>${cmd.command}</code>\n   ↳ ${cmd.result}`;
+                        limitText += `\n${index + 1}. <code>${cmd.command}</code>\n ↳ ${cmd.result}`;
                     });
                     limitText += `\n</details>`;
                 }
+
                 return res.json({ ok: true, text: limitText });
             }
         }
+
         try {
             const hist = await chat.getHistory();
-            if (withGithub) { githubHistory = hist; } else { adminHistory = hist; }
+            if (withGithub) {
+                githubHistory = hist;
+            } else {
+                adminHistory = hist;
+            }
         } catch (_) {}
+
         return res.json({ ok: true, text: "Не удалось получить ответ от ИИ." });
     } catch (err) {
         console.error("[ADMIN ERROR]", err.message);
@@ -2630,7 +2797,7 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
         if (executedCommands.length > 0) {
             errorText += `\n\n<details><summary>📋 <b>Выполненные команды до ошибки</b> (нажмите, чтобы развернуть)</summary>\n`;
             executedCommands.forEach((cmd, index) => {
-                errorText += `\n${index + 1}. <code>${cmd.command}</code>\n   ↳ ${cmd.result}`;
+                errorText += `\n${index + 1}. <code>${cmd.command}</code>\n ↳ ${cmd.result}`;
             });
             errorText += `\n</details>`;
         }
@@ -2647,12 +2814,14 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
         return res.status(500).json({ ok: false, error: errorText });
     }
 }
+
 // ==========================================
 // ОСНОВНОЙ ПРОКСИ
 // ==========================================
 app.get('/', async (req, res) => {
     const reqToken = req.query.token;
     if (reqToken !== PROXY_SECRET) return res.status(403).send('Forbidden.');
+
     const nfDlPath = req.query.nf_dl_path;
     if (nfDlPath) {
         if (!fs.existsSync(nfDlPath)) return res.status(404).send("Not found.");
@@ -2662,14 +2831,17 @@ app.get('/', async (req, res) => {
         console.log(`[DOWNLOAD] Отдача локального файла: ${nfDlPath}`);
         return fs.createReadStream(nfDlPath).pipe(res);
     }
+
     const targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).send('Укажите URL.');
     let imgLim = req.query.img_limit !== undefined ? parseInt(req.query.img_limit) : 10;
     let isMobile = req.query.mobile_ua === 'true';
+
     console.log(`\n[PROXY] Запрос ресурса: ${targetUrl} (Картинки: ${imgLim === -1 ? 'ВСЕ' : imgLim}, Режим: ${isMobile ? 'Mobile' : 'Desktop'})`);
+
     const parsedTarget = new URL.URL(targetUrl);
     const nfFileId = parsedTarget.searchParams.get('nf_fileId');
-    const nfPartName = parsedTarget.searchParams.get('nf_partName');
+    const nfPartName = parsedTarget.searchParams.get('nfPartName');
     if (nfFileId && nfPartName) {
         const partPath = path.join(TMP_DIR, nfFileId, nfPartName);
         if (!fs.existsSync(partPath)) return res.status(404).send("Кэш истек.");
@@ -2679,6 +2851,7 @@ app.get('/', async (req, res) => {
         console.log(`[PROXY] Отдача части архива: ${nfPartName}`);
         return fs.createReadStream(partPath).pipe(res);
     }
+
     let contentType = '';
     let contentDisp = '';
     let responseStatus = 200;
@@ -2686,8 +2859,10 @@ app.get('/', async (req, res) => {
     let htmlContent = '';
     let downloadStream = null;
     let downloadFilePath = '';
+
     try {
         const requestUseProxy = useProxy || req.query.socks === 'true';
+
         if (requestUseProxy && SOCKS5_PROXY) {
             console.log(`[PROXY] Использование Ghost Proxy (локальный curl-impersonate)...`);
             const reqId = crypto.randomUUID();
@@ -2696,7 +2871,9 @@ app.get('/', async (req, res) => {
             const curlBin = path.join(__dirname, 'curl-impersonate', 'curl_chrome116');
             const proxyStr = SOCKS5_PROXY.replace('socks5://', 'socks5h://');
             const shellExec = fs.existsSync('/bin/bash') ? 'bash' : 'sh';
+
             await execPromise(`${shellExec} "${curlBin}" --compressed -m 15 -s -L -x "${proxyStr}" -D "${headFile}" -o "${bodyFile}" "${targetUrl}"`);
+
             const headContent = fs.readFileSync(headFile, 'utf8');
             const headerLines = headContent.split('\r\n');
             for (const line of headerLines) {
@@ -2707,11 +2884,13 @@ app.get('/', async (req, res) => {
                     if (parts.length > 1) responseStatus = parseInt(parts[1]);
                 }
             }
+
             if (contentType.includes('text/html')) {
                 isHtml = true;
                 const bodyBuffer = fs.readFileSync(bodyFile);
                 htmlContent = decodeBuffer(bodyBuffer, contentType);
-                fs.unlinkSync(bodyFile); fs.unlinkSync(headFile);
+                fs.unlinkSync(bodyFile);
+                fs.unlinkSync(headFile);
             } else {
                 downloadFilePath = bodyFile;
                 fs.unlinkSync(headFile);
@@ -2719,17 +2898,27 @@ app.get('/', async (req, res) => {
         } else {
             console.log(`[PROXY] Запрос напрямую (axios)...`);
             const response = await axios.get(targetUrl, {
-                responseType: 'stream', headers: getBrowserHeaders(isMobile), timeout: 15000, validateStatus: () => true
+                responseType: 'stream',
+                headers: getBrowserHeaders(isMobile),
+                timeout: 15000,
+                validateStatus: () => true
             });
+
             responseStatus = response.status;
             contentType = response.headers['content-type'] || '';
             contentDisp = response.headers['content-disposition'] || '';
+
             if (contentType.includes('text/html')) {
                 isHtml = true;
-                let chunks = []; let htmlBytes = 0;
+                let chunks = [];
+                let htmlBytes = 0;
                 for await (const chunk of response.data) {
-                    chunks.push(chunk); htmlBytes += chunk.length;
-                    if (htmlBytes > 20 * 1024 * 1024) { response.data.destroy(); return res.status(400).send("Слишком тяжелая страница."); }
+                    chunks.push(chunk);
+                    htmlBytes += chunk.length;
+                    if (htmlBytes > 20 * 1024 * 1024) {
+                        response.data.destroy();
+                        return res.status(400).send("Слишком тяжелая страница.");
+                    }
                 }
                 const bodyBuffer = Buffer.concat(chunks);
                 htmlContent = decodeBuffer(bodyBuffer, contentType);
@@ -2737,18 +2926,34 @@ app.get('/', async (req, res) => {
                 downloadStream = response.data;
             }
         }
+
         if ([401, 403, 406, 429, 503].includes(responseStatus)) {
             console.warn(`[PROXY WARNING] Сайт заблокировал запрос. HTTP Код: ${responseStatus}`);
-            return res.status(200).send(`<!DOCTYPE html><html><body style="font-family:sans-serif; text-align:center; padding:40px; background:#f8d7da; color:#721c24; border-radius:10px; margin:20px;"><h2 style="margin-top:0;">🚫 Доступ заблокирован (${responseStatus})</h2><p>Целевой сервер отклонил запрос. Попробуйте использовать команду <b>/proxy on</b> в чате.</p></body></html>`);
+            return res.status(200).send(`<!DOCTYPE html>
+<html>
+<body style="font-family:sans-serif; text-align:center; padding:40px; background:#f8d7da; color:#721c24; border-radius:10px; margin:20px;">
+<h2 style="margin-top:0;">🚫 Доступ заблокирован (${responseStatus})</h2>
+<p>Целевой сервер отклонил запрос. Попробуйте использовать команду <b>/proxy on</b> в чате.</p>
+</body>
+</html>`);
         }
+
         if (isHtml && (htmlContent.includes('<title>Just a moment...</title>') || htmlContent.includes('Enable JavaScript and cookies to continue'))) {
             console.warn(`[PROXY WARNING] Обнаружена JS-капча Cloudflare (Код ${responseStatus})`);
-            return res.status(200).send(`<!DOCTYPE html><html><body style="font-family:sans-serif; text-align:center; padding:40px; background:#fff3cd; color:#856404; border-radius:10px; margin:20px;"><h2 style="margin-top:0;">🤖 JS-Капча (Cloudflare)</h2><p>Сайт требует вычисления сложной JavaScript-капчи, которую невозможно выполнить через серверный прокси. Откройте эту ссылку в обычном браузере.</p></body></html>`);
+            return res.status(200).send(`<!DOCTYPE html>
+<html>
+<body style="font-family:sans-serif; text-align:center; padding:40px; background:#fff3cd; color:#856404; border-radius:10px; margin:20px;">
+<h2 style="margin-top:0;">🤖 JS-Капча (Cloudflare)</h2>
+<p>Сайт требует вычисления сложной JavaScript-капчи, которую невозможно выполнить через серверный прокси. Откройте эту ссылку в обычном браузере.</p>
+</body>
+</html>`);
         }
+
         if (isHtml) {
             console.log(`[PROXY] HTML загружен успешно. Парсинг ресурсов...`);
             const $ = cheerio.load(htmlContent);
             const baseUrl = parsedTarget.origin;
+
             const stylesheets = $('link[rel="stylesheet"]').toArray();
             for (let i = 0; i < Math.min(stylesheets.length, 5); i++) {
                 let href = $(stylesheets[i]).attr('href');
@@ -2760,10 +2965,14 @@ app.get('/', async (req, res) => {
                     } catch (e) {}
                 }
             }
+
             const images = $('img').toArray();
             for (let i = 0; i < images.length; i++) {
                 let img = $(images[i]);
-                if (imgLim === 0) { img.attr('src', 'data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=').removeAttr('srcset').removeAttr('data-src').removeAttr('loading'); continue; }
+                if (imgLim === 0) {
+                    img.attr('src', 'data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=').removeAttr('srcset').removeAttr('data-src').removeAttr('loading');
+                    continue;
+                }
                 if (imgLim > 0 && i >= imgLim) break;
                 let src = img.attr('src') || img.attr('data-src') || img.attr('data-original');
                 if (src && !src.startsWith('data:') && src.startsWith('/')) src = baseUrl + src;
@@ -2775,33 +2984,39 @@ app.get('/', async (req, res) => {
                     } catch (e) {}
                 }
             }
+
             if (req.query.nf_dl_html === 'true') {
                 console.log(`[PROXY] Формирование HTML для скачивания: ${parsedTarget.hostname}`);
                 $('head').prepend(`<base href="${parsedTarget.origin}">`);
                 res.set('Content-Type', 'application/octet-stream');
-                res.set('Content-Disposition', `attachment; filename="page_${parsedTarget.hostname.replace(/[^a-zA-Z0-9.-]/g, '_')}.html"`);
+                res.set('Content-Disposition', `attachment; filename="page_${parsedTarget.hostname.replace(/[^a-zA-Z0-9.\-]/g, '_')}.html"`);
                 return res.send($.html());
             }
+
             console.log(`[PROXY] Страница успешно обработана и отправлена.`);
             res.set('Content-Type', 'text/html; charset=utf-8');
             return res.send($.html());
-        }
-        else {
+        } else {
             console.log(`[PROXY] Обнаружен файл (${contentType}). Подготовка к загрузке...`);
             const fileId = crypto.randomUUID();
             const fileDir = path.join(TMP_DIR, fileId);
             fs.mkdirSync(fileDir, { recursive: true });
+
             let fileName = 'download.bin';
             if (contentDisp && contentDisp.includes('filename=')) fileName = contentDisp.split('filename=')[1].replace(/["']/g, '');
             else fileName = path.basename(parsedTarget.pathname) || 'download.bin';
             let safeName = fileName.replace(/[^a-zA-Z0-9.\-_]/g, '_') || "app.bin";
             const filePath = path.join(fileDir, safeName);
-            let downloadedBytes = 0; let isTooLarge = false;
+
+            let downloadedBytes = 0;
+            let isTooLarge = false;
+
             if (downloadFilePath) {
                 downloadedBytes = fs.statSync(downloadFilePath).size;
                 if (downloadedBytes > MAX_FILE_SIZE) {
                     console.warn(`[PROXY] Ошибка: Файл превысил лимит ${MAX_FILE_SIZE/1024/1024} МБ`);
-                    fs.unlinkSync(downloadFilePath); return res.status(200).send(`<h2>🐘 Файл больше ${MAX_FILE_SIZE/1024/1024} МБ.</h2>`);
+                    fs.unlinkSync(downloadFilePath);
+                    return res.status(200).send(`<h2>🐘 Файл больше ${MAX_FILE_SIZE/1024/1024} МБ.</h2>`);
                 }
                 fs.renameSync(downloadFilePath, filePath);
             } else if (downloadStream) {
@@ -2810,15 +3025,31 @@ app.get('/', async (req, res) => {
                     downloadStream.pipe(writer);
                     downloadStream.on('data', (chunk) => {
                         downloadedBytes += chunk.length;
-                        if (downloadedBytes > MAX_FILE_SIZE && !isTooLarge) { isTooLarge = true; downloadStream.destroy(); writer.close(); reject(new Error("FILE_TOO_LARGE")); }
+                        if (downloadedBytes > MAX_FILE_SIZE && !isTooLarge) {
+                            isTooLarge = true;
+                            downloadStream.destroy();
+                            writer.close();
+                            reject(new Error("FILE_TOO_LARGE"));
+                        }
                     });
                     writer.on('close', resolve);
                     writer.on('error', reject);
-                }).catch(err => { if (err.message !== "FILE_TOO_LARGE") throw err; });
-                if (isTooLarge) { fs.rmSync(fileDir, { recursive: true, force: true }); return res.status(200).send(`<h2>🐘 Файл больше ${MAX_FILE_SIZE/1024/1024} МБ.</h2>`); }
+                }).catch(err => {
+                    if (err.message !== "FILE_TOO_LARGE") throw err;
+                });
+
+                if (isTooLarge) {
+                    fs.rmSync(fileDir, { recursive: true, force: true });
+                    return res.status(200).send(`<h2>🐘 Файл больше ${MAX_FILE_SIZE/1024/1024} МБ.</h2>`);
+                }
             }
+
             console.log(`[PROXY] Файл скачан на сервер. Размер: ${(downloadedBytes/1024/1024).toFixed(2)} MB`);
-            setTimeout(() => { try { fs.rmSync(fileDir, { recursive: true, force: true }); } catch(e) {} }, 2 * 60 * 60 * 1000);
+
+            setTimeout(() => {
+                try { fs.rmSync(fileDir, { recursive: true, force: true }); } catch(e) {}
+            }, 2 * 60 * 60 * 1000);
+
             if (downloadedBytes <= CHUNK_SIZE_MB * 1024 * 1024) {
                 console.log(`[PROXY] Отдача файла напрямую клиенту.`);
                 res.set('Content-Type', contentType);
@@ -2827,24 +3058,45 @@ app.get('/', async (req, res) => {
             } else {
                 console.log(`[PROXY] Файл больше ${CHUNK_SIZE_MB} МБ. Запущена упаковка в ZIP архив...`);
                 const zipBaseName = safeName + '.zip';
-                try { await execPromise(`cd "${fileDir}" && zip -s ${CHUNK_SIZE_MB}m "${zipBaseName}" "${safeName}"`); }
-                catch (zipErr) {
+                try {
+                    await execPromise(`cd "${fileDir}" && zip -s ${CHUNK_SIZE_MB}m "${zipBaseName}" "${safeName}"`);
+                } catch (zipErr) {
                     console.error(`[PROXY ERROR] Ошибка создания ZIP:`, zipErr.message);
                     return res.status(500).send("Ошибка архивации");
                 }
                 fs.unlinkSync(filePath);
+
                 const archiveParts = fs.readdirSync(fileDir).filter(f => f.startsWith(safeName + '.')).sort();
                 console.log(`[PROXY] Архив создан успешно (${archiveParts.length} частей).`);
-                let buttonsHtml = ''; let totalCompressedBytes = 0;
+
+                let buttonsHtml = '';
+                let totalCompressedBytes = 0;
                 archiveParts.forEach((partName) => {
-                    parsedTarget.searchParams.set('nf_fileId', fileId); parsedTarget.searchParams.set('nf_partName', partName);
-                    const stat = fs.statSync(path.join(fileDir, partName)); totalCompressedBytes += stat.size;
+                    parsedTarget.searchParams.set('nf_fileId', fileId);
+                    parsedTarget.searchParams.set('nfPartName', partName);
+                    const stat = fs.statSync(path.join(fileDir, partName));
+                    totalCompressedBytes += stat.size;
                     buttonsHtml += `<a href="${parsedTarget.toString()}" target="_blank" style="display:block; margin-bottom:10px; padding:12px; background:#1a73e8; color:white; text-decoration:none; border-radius:5px; font-weight:bold;">📥 Скачать ${partName} <span style="font-weight:normal; font-size:12px;">(${(stat.size/1024/1024).toFixed(1)} МБ)</span></a>`;
                 });
-                const origMB = (downloadedBytes/1024/1024).toFixed(1); const compMB = (totalCompressedBytes/1024/1024).toFixed(1);
-                let savingsHtml = downloadedBytes > totalCompressedBytes ? `<span style="color:#28a745; font-weight:bold;">Сжато до ${compMB} МБ (вы экономите ${((downloadedBytes - totalCompressedBytes)/1024/1024).toFixed(1)} МБ)</span>` : `Размер: ${compMB} МБ`;
+
+                const origMB = (downloadedBytes/1024/1024).toFixed(1);
+                const compMB = (totalCompressedBytes/1024/1024).toFixed(1);
+                let savingsHtml = downloadedBytes > totalCompressedBytes
+                    ? `<span style="color:#28a745; font-weight:bold;">Сжато до ${compMB} МБ (вы экономите ${((downloadedBytes - totalCompressedBytes)/1024/1024).toFixed(1)} МБ)</span>`
+                    : `Размер: ${compMB} МБ`;
+
                 res.set('Content-Type', 'text/html; charset=utf-8');
-                return res.status(200).send(`<!DOCTYPE html><html><body style="background:#f0f2f5; display:flex; justify-content:center; padding:20px; font-family:sans-serif;"><div style="background:white; padding:25px; border-top:5px solid #1a73e8; border-radius:10px; text-align:center; width:100%; max-width:400px; box-shadow:0 4px 10px rgba(0,0,0,0.1);"><h2 style="margin-top:0;">📦 Объемный архив</h2><p style="font-size:14px; margin-bottom:5px;">Оригинал: ${origMB} МБ</p><p style="font-size:14px; margin-top:0; margin-bottom:15px;">${savingsHtml}</p>${buttonsHtml}</div></body></html>`);
+                return res.status(200).send(`<!DOCTYPE html>
+<html>
+<body style="background:#f0f2f5; display:flex; justify-content:center; padding:20px; font-family:sans-serif;">
+<div style="background:white; padding:25px; border-top:5px solid #1a73e8; border-radius:10px; text-align:center; width:100%; max-width:400px; box-shadow:0 4px 10px rgba(0,0,0,0.1);">
+<h2 style="margin-top:0;">📦 Объемный архив</h2>
+<p style="font-size:14px; margin-bottom:5px;">Оригинал: ${origMB} МБ</p>
+<p style="font-size:14px; margin-top:0; margin-bottom:15px;">${savingsHtml}</p>
+${buttonsHtml}
+</div>
+</body>
+</html>`);
             }
         }
     } catch (error) {
@@ -2852,6 +3104,7 @@ app.get('/', async (req, res) => {
         res.status(500).send(`Ошибка шлюза: ${error.message}`);
     }
 });
+
 // ==========================================
 // ИНИЦИАЛИЗАЦИЯ И ЗАПУСК СЕРВЕРА
 // ==========================================
@@ -2878,6 +3131,7 @@ async function startServer() {
     } catch (e) {
         console.warn("[SYSTEM WARNING] Ошибка инициализации:", e.message);
     }
+
     const PORT = process.env.PORT || 8080;
     app.listen(PORT, () => {
         console.log(`[SYSTEM] Сервер успешно запущен на порту ${PORT}`);
@@ -2885,4 +3139,5 @@ async function startServer() {
         initAllCronJobs();
     });
 }
+
 startServer();
