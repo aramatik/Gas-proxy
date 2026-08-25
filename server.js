@@ -1768,23 +1768,57 @@ app.post('/gemini', async (req, res) => {
 
             // === OPENROUTER: Добавляем основную модель и бесплатные модели ===
             if (OPENROUTER_API_KEY) {
-                models.push({ id: "stealth/ox-alpha", name: "Ox Alpha (OpenRouter)" });
+                models.push({ id: "stealth/ox-alpha", name: "🌟 Ox Alpha (OpenRouter Premium)" });
 
                 // Получаем бесплатные модели из OpenRouter API
                 try {
                     const orRes = await axios.get('https://openrouter.ai/api/v1/models', {
                         headers: { 'Authorization': `Bearer ${OPENROUTER_API_KEY}` },
-                        timeout: 10000
+                        timeout: 15000
                     });
                     const orModels = orRes.data.data || [];
-                    for (const m of orModels) {
-                        const isFree = (m.pricing && m.pricing.prompt === "0" && m.pricing.completion === "0") ||
-                                       (m.id && m.id.toLowerCase().includes('free')) ||
-                                       (m.name && m.name.toLowerCase().includes('free'));
-                        if (isFree && m.id !== "stealth/ox-alpha") {
-                            models.push({ id: m.id, name: m.name + ' (OpenRouter Free)' });
+                    const addedIds = new Set(["stealth/ox-alpha"]);
+                    
+                    // Топ бесплатых моделей с приоритетом
+                    const priorityModels = [
+                        "meta-llama/llama-3.3-70b-instruct:free",
+                        "google/gemini-2.0-flash-exp:free",
+                        "deepseek/deepseek-chat-v3.1:free",
+                        "qwen/qwen-2.5-72b-instruct:free",
+                        "mistralai/mistral-small-3.2-24b-instruct:free"
+                    ];
+                    
+                    // Добавляем приоритетные модели первыми
+                    for (const pid of priorityModels) {
+                        const m = orModels.find(x => x.id === pid);
+                        if (m && !addedIds.has(m.id)) {
+                            models.push({ 
+                                id: m.id, 
+                                name: `🆓 ${m.name} (Free)` 
+                            });
+                            addedIds.add(m.id);
                         }
                     }
+                    
+                    // Добавляем остальные бесплатные
+                    for (const m of orModels) {
+                        if (addedIds.has(m.id)) continue;
+                        
+                        const isFree = m.pricing && 
+                                       (m.pricing.prompt === "0" || m.pricing.prompt === 0) && 
+                                       (m.pricing.completion === "0" || m.pricing.completion === 0);
+                        const hasFreeLabel = (m.id && m.id.toLowerCase().includes(':free')) ||
+                                             (m.name && m.name.toLowerCase().includes('free'));
+                        
+                        if ((isFree || hasFreeLabel) && m.id !== "stealth/ox-alpha") {
+                            models.push({ 
+                                id: m.id, 
+                                name: `🆓 ${m.name} (Free)` 
+                            });
+                            addedIds.add(m.id);
+                        }
+                    }
+                    console.log(`[MODELS] OpenRouter: добавлено ${addedIds.size - 1} бесплатных моделей`);
                 } catch (orErr) {
                     console.warn("[MODELS] OpenRouter free models fetch error:", orErr.message);
                 }
@@ -1795,7 +1829,7 @@ app.post('/gemini', async (req, res) => {
         } catch (err) {
             console.error("[MODELS ERROR] Сбой загрузки списка моделей:", err.message);
             if (OPENROUTER_API_KEY) {
-                return res.json({ ok: true, models: [{ id: "stealth/ox-alpha", name: "Ox Alpha (OpenRouter)" }] });
+                return res.json({ ok: true, models: [{ id: "stealth/ox-alpha", name: "🌟 Ox Alpha (OpenRouter Premium)" }] });
             }
             return res.status(500).json({ ok: false, error: err.message });
         }
