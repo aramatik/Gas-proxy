@@ -1,4 +1,4 @@
-// openrouter.js — модуль для работы с OpenRouter API (stealth/ox-alpha)
+// openrouter.js — модуль для работы с OpenRouter API
 const axios = require('axios');
 const { exec } = require('child_process');
 const util = require('util');
@@ -8,40 +8,46 @@ const URL = require('url');
 
 const execPromise = util.promisify(exec);
 
-// История сессии для OpenRouter
 let openRouterHistory = [];
 
 /**
- * Проверяет, является ли модель OpenRouter моделью
+ * Проверяет, является ли модель OpenRouter моделью.
+ * OpenRouter модели имеют формат "provider/model" (содержат "/"),
+ * а Gemini модели — "gemini-X.X-..." или "gemma-..." (без "/").
  */
 function isOpenRouterModel(modelName) {
-    return !!(modelName && String(modelName).toLowerCase().includes('stealth/'));
+    if (!modelName) return false;
+    const name = String(modelName).toLowerCase();
+    
+    // Antigravity обрабатывается отдельным путём
+    if (name.includes('antigravity')) return false;
+    
+    // Gemini/Gemma модели НЕ содержат '/' в названии
+    if (name.startsWith('gemini-') || name.startsWith('gemma-') || name.startsWith('aqa')) {
+        return false;
+    }
+    
+    // Все остальные модели с '/' — это OpenRouter
+    // Примеры: stealth/ox-alpha, minimax/minimax-m2.7:free, meta-llama/llama-3.1, z-ai/glm-5.2:free
+    if (name.includes('/')) return true;
+    
+    return false;
 }
 
-/**
- * Очищает историю OpenRouter
- */
 function clearHistory() {
     openRouterHistory = [];
 }
 
-/**
- * Возвращает текущую историю
- */
 function getHistory() {
     return openRouterHistory;
 }
 
-/**
- * Устанавливает историю (для восстановления состояния)
- */
 function setHistory(history) {
     openRouterHistory = history || [];
 }
 
 /**
  * Основной обработчик запросов к OpenRouter
- * Поддерживает: чат, режим администратора, изображения, вызов инструментов
  */
 async function handleOpenRouterMessage(req, res, options = {}) {
     const {
@@ -69,13 +75,36 @@ async function handleOpenRouterMessage(req, res, options = {}) {
     const model = req.body.model || 'stealth/ox-alpha';
     const userText = req.body.text ? req.body.text.trim() : "";
 
+    // === ВАЖНО: Обработка команд терминала (!) ДО OpenRouter ===
+    // Команды терминала должны выполняться локально, а не отправляться в OpenRouter
+    if (userText.startsWith('!')) {
+        const cmd = userText.substring(1).trim();
+        if (!cmd) return res.json({ ok: true, text: "⚠️ Введите команду." });
+        try {
+            console.log(`[OPENROUTER CHATOPS] Выполнение: ${cmd}`);
+            const { stdout, stderr } = await execPromise(cmd, { timeout: 15000 });
+            let output = stdout;
+            if (stderr) output += `\n[STDERR]:\n${stderr}`;
+            if (!output) output = "[Выполнено успешно]";
+            if (output.length > 300000) output = output.substring(0, 300000) + "\n\n...[ОБРЕЗАН]...";
+            const safeOut = escapeHtml(output);
+            const safeCmd = escapeHtml(cmd);
+            return res.json({ ok: true, text:`<b>$</b> <code>${safeCmd}</code><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#1e1e1e; color:#0f0; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${safeOut}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#555; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>`});
+        } catch (err) {
+            const safeCmdE = escapeHtml(cmd);
+            const safeErr = escapeHtml(err.message || String(err));
+            return res.json({ ok: true, text:`<b>$</b> <code>${safeCmdE}</code><br><div style="position:relative; margin-top:5px;"><div style="font-family:monospace; font-size:10px; max-height:250px; overflow-y:auto; background:#3b1313; color:#f66; padding:8px 8px 30px 8px; border-radius:5px; white-space:pre-wrap;">${safeErr}</div><button onclick="navigator.clipboard.writeText(this.previousElementSibling.innerText); this.innerText='Copied!'; setTimeout(()=>this.innerText='Copy',2000)" style="position:absolute; bottom:5px; right:5px; padding:4px 8px; font-size:10px; background:#773333; color:#fff; border:none; border-radius:3px; cursor:pointer;">Copy</button></div>`});
+        }
+    }
+
     // Получаем и очищаем уведомления cron
     let cronNotificationsHtml = "";
     if (messageInbox && messageInbox.length > 0) {
         cronNotificationsHtml = '<div style="background:#fff3cd; border-left:5px solid #ffc107; padding:12px; margin-bottom:15px; border-radius:6px; font-size:12px; color:#856404; max-height: 400px; overflow-y: auto;"><b>🔔 Результаты фоновых задач:</b><br>' +
             messageInbox.map(m => `⏰ [${m.time} Kyiv]: ${m.text}`).join('<hr style="border:0; border-top:1px solid #ffeeba; margin:10px 0;">') + '</div>';
         messageInbox.length = 0;
-        fs.writeFileSync(path.join(TMP_DIR, 'inbox.json'), '[]');
+        const MESSAGES_FILE = path.join(TMP_DIR, 'inbox.json');
+        fs.writeFileSync(MESSAGES_FILE, '[]');
     }
 
     // Формируем массив сообщений для OpenRouter
@@ -93,10 +122,17 @@ async function handleOpenRouterMessage(req, res, options = {}) {
     // Формируем контент пользователя (текст + изображение)
     let userContent = userText || "Проанализируй это изображение";
     if (req.body.b64 && req.body.mimeType) {
-        userContent = [
-            { type: "text", text: userText || "Проанализируй это изображение" },
-            { type: "image_url", image_url: { url: `data:${req.body.mimeType};base64,${req.body.b64}` } }
-        ];
+        // OpenAI-совместимый формат для изображений
+        const isImage = String(req.body.mimeType).startsWith('image/');
+        if (isImage) {
+            userContent = [
+                { type: "text", text: userText || "Проанализируй это изображение" },
+                { type: "image_url", image_url: { url: `data:${req.body.mimeType};base64,${req.body.b64}` } }
+            ];
+        } else {
+            // Не-изображения — просто упоминаем путь (файл уже загружен на сервер через action: upload)
+            userContent = userText || "Обработай прикреплённый файл.";
+        }
     }
     messages.push({ role: "user", content: userContent });
 
@@ -146,16 +182,16 @@ async function handleOpenRouterMessage(req, res, options = {}) {
                                 type: "string",
                                 enum: ["status", "list", "get", "put", "delete", "download_to_server", "create_artifact", "list_workflows", "trigger_workflow", "list_runs", "wait_run", "list_artifacts", "download_artifact"]
                             },
-                            path: { type: "string", description: "Path inside the repository" },
-                            content: { type: "string", description: "Full text content for put" },
-                            message: { type: "string", description: "Commit message" },
-                            branch: { type: "string", description: "Branch name" },
-                            local_path: { type: "string", description: "Absolute path on this server" },
-                            sha: { type: "string", description: "Blob SHA required for update/delete" },
-                            is_binary: { type: "boolean", description: "If true, content is treated as base64" },
-                            workflow_id: { type: "string", description: "Workflow id or filename" },
-                            run_id: { type: "string", description: "Workflow run id" },
-                            artifact_id: { type: "string", description: "Artifact id" }
+                            path: { type: "string" },
+                            content: { type: "string" },
+                            message: { type: "string" },
+                            branch: { type: "string" },
+                            local_path: { type: "string" },
+                            sha: { type: "string" },
+                            is_binary: { type: "boolean" },
+                            workflow_id: { type: "string" },
+                            run_id: { type: "string" },
+                            artifact_id: { type: "string" }
                         },
                         required: ["action"]
                     }
@@ -174,25 +210,55 @@ async function handleOpenRouterMessage(req, res, options = {}) {
             const payload = {
                 model: model,
                 messages: messages,
-                tools: tools,
                 temperature: 0.7
             };
+            
+            // Добавляем tools только если они определены
+            if (tools) {
+                payload.tools = tools;
+            }
 
-            const response = await axios.post('https://openrouter.ai/api/v1/chat/completions', payload, {
-                headers: {
-                    'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
-                    'Content-Type': 'application/json',
-                    'HTTP-Referer': PUBLIC_URL || 'http://localhost',
-                    'X-Title': 'MiniVPS'
-                },
-                timeout: 120000
-            });
+            console.log(`[OPENROUTER] Запрос к модели: ${model} (итерация ${iterations + 1})`);
+
+            let response;
+            try {
+                response = await axios.post('https://openrouter.ai/api/v1/chat/completions', payload, {
+                    headers: {
+                        'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+                        'Content-Type': 'application/json',
+                        'HTTP-Referer': PUBLIC_URL || 'http://localhost',
+                        'X-Title': 'MiniVPS'
+                    },
+                    timeout: 120000
+                });
+            } catch (apiErr) {
+                // Обработка специфичных ошибок OpenRouter
+                const errData = apiErr.response?.data?.error;
+                if (apiErr.response?.status === 429) {
+                    const remedy = errData?.metadata?.remedy_hint || 'Попробуйте позже или выберите другую модель';
+                    return res.status(429).json({ 
+                        ok: false, 
+                        error: `⏱ <b>Rate limit (429)</b><br>Модель <code>${model}</code> временно перегружена.<br><i>${remedy}</i>` 
+                    });
+                }
+                if (apiErr.response?.status === 400) {
+                    return res.status(400).json({ 
+                        ok: false, 
+                        error: `❌ <b>Ошибка 400</b><br>${errData?.message || 'Модель не поддерживает запрошенные параметры'}` 
+                    });
+                }
+                throw apiErr;
+            }
 
             const choice = response.data.choices[0];
+            if (!choice) {
+                return res.status(500).json({ ok: false, error: "OpenRouter не вернул ответ" });
+            }
+            
             const message = choice.message;
 
             // Если есть вызовы инструментов
-            if (message.tool_calls) {
+            if (message.tool_calls && message.tool_calls.length > 0) {
                 messages.push(message);
 
                 for (const toolCall of message.tool_calls) {
@@ -231,27 +297,10 @@ async function handleOpenRouterMessage(req, res, options = {}) {
                                 const parsed = new URL.URL(url);
                                 const filename = (path.basename(parsed.pathname) || `dl_${Date.now()}`).replace(/[^a-zA-Z0-9.\-_]/g, '_');
                                 const savePath = path.join(TMP_DIR, filename);
-
-                                if (useProxy && SOCKS5_PROXY) {
-                                    // Используем curl-impersonate если доступен
-                                    const curlBin = path.join(__dirname, 'curl-impersonate', 'curl_chrome116');
-                                    if (fs.existsSync(curlBin)) {
-                                        const proxyStr = SOCKS5_PROXY.replace('socks5://', 'socks5h://');
-                                        const shell = fs.existsSync('/bin/bash') ? 'bash' : 'sh';
-                                        await execPromise(`${shell} "${curlBin}" --compressed -m 60 -s -L -x "${proxyStr}" -o "${savePath}" "${url}"`);
-                                    } else {
-                                        const dlRes = await axios.get(url, { responseType: 'stream', headers: getBrowserHeaders(false), timeout: 60000 });
-                                        const writer = fs.createWriteStream(savePath);
-                                        dlRes.data.pipe(writer);
-                                        await new Promise((resolve, reject) => { writer.on('finish', resolve); writer.on('error', reject); });
-                                    }
-                                } else {
-                                    const dlRes = await axios.get(url, { responseType: 'stream', headers: getBrowserHeaders(false), timeout: 60000 });
-                                    const writer = fs.createWriteStream(savePath);
-                                    dlRes.data.pipe(writer);
-                                    await new Promise((resolve, reject) => { writer.on('finish', resolve); writer.on('error', reject); });
-                                }
-
+                                const dlRes = await axios.get(url, { responseType: 'stream', headers: getBrowserHeaders(false), timeout: 60000 });
+                                const writer = fs.createWriteStream(savePath);
+                                dlRes.data.pipe(writer);
+                                await new Promise((resolve, reject) => { writer.on('finish', resolve); writer.on('error', reject); });
                                 const stat = fs.statSync(savePath);
                                 searchResult = `Файл загружен: ${savePath} (${(stat.size / 1024).toFixed(1)} KB)`;
                             }
@@ -306,7 +355,6 @@ async function handleOpenRouterMessage(req, res, options = {}) {
             openRouterHistory.push({ role: "user", content: userContent });
             openRouterHistory.push({ role: "assistant", content: finalText });
 
-            // Ограничиваем историю последними 10 сообщениями
             if (openRouterHistory.length > 10) {
                 openRouterHistory = openRouterHistory.slice(-10);
             }
@@ -320,8 +368,22 @@ async function handleOpenRouterMessage(req, res, options = {}) {
 
     } catch (err) {
         console.error("[OPENROUTER ERROR]", err.response ? err.response.data : err.message);
-        const errMsg = err.response?.data?.error?.message || err.message;
-        return res.status(500).json({ ok: false, error: `OpenRouter: ${errMsg}` });
+        const errData = err.response?.data?.error;
+        const errMsg = errData?.message || err.message;
+        const errCode = err.response?.status || 500;
+        
+        let userFriendlyError = `OpenRouter: ${errMsg}`;
+        if (errCode === 429) {
+            userFriendlyError = `⏱ <b>Rate limit</b><br>Модель <code>${model}</code> временно перегружена. Попробуйте другую модель.`;
+        } else if (errCode === 400) {
+            userFriendlyError = `❌ <b>Ошибка 400</b><br>Модель <code>${model}</code> не поддерживает запрошенные параметры.`;
+        } else if (errCode === 402) {
+            userFriendlyError = `💳 <b>Недостаточно кредитов</b><br>Пополните баланс на OpenRouter.`;
+        } else if (errCode === 502) {
+            userFriendlyError = `🌐 <b>Ошибка 502</b><br>Провайдер модели <code>${model}</code> временно недоступен.`;
+        }
+        
+        return res.status(errCode).json({ ok: false, error: userFriendlyError });
     }
 }
 
