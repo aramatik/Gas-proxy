@@ -15,10 +15,10 @@ const execPromise = util.promisify(exec);
 /** Escape for embedding shell output inside HTML terminal panels. */
 function escapeHtml(s) {
     return String(s == null ? '' : s)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;');
+        .replace(/&/g, '&')
+        .replace(/</g, '<')
+        .replace(/>/g, '>')
+        .replace(/"/g, '"');
 }
 
 const { GoogleGenerativeAI } = require('@google/generative-ai');
@@ -50,20 +50,21 @@ const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
 // ==========================================
 // ГИБРИД ДОСТАВКИ АРТЕФАКТОВ (Antigravity -> сервер -> /download + GitHub)
 // ==========================================
-const ARTIFACT_TOKEN = process.env.ARTIFACT_TOKEN || "";
-const PUBLIC_URL = (process.env.PUBLIC_URL || "").replace(/\/+$/, '');
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN || "";
-const GITHUB_REPO = process.env.GITHUB_REPO || "";
+const ARTIFACT_TOKEN = process.env.ARTIFACT_TOKEN || "";          // дешёвый токен эндпоинта /artifact (видит агент)
+const PUBLIC_URL = (process.env.PUBLIC_URL || "").replace(/\/+$/, ''); // публичный URL этого сервера (для curl в промпте)
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN || "";              // fine-grained PAT, Contents: write (НЕ видит агент)
+const GITHUB_REPO = process.env.GITHUB_REPO || "";                // owner/repo
 const GITHUB_BRANCH = process.env.GITHUB_BRANCH || "main";
 const GITHUB_PATH_PREFIX = process.env.GITHUB_PATH_PREFIX || "artifacts/";
 const ARTIFACT_DIR = path.join(TMP_DIR, 'artifacts');
-const ARTIFACT_MAX = 130 * 1024 * 1024;
-const GITHUB_CONTENTS_MAX = 1 * 1024 * 1024;
+const ARTIFACT_MAX = 130 * 1024 * 1024; // 130 МБ на приём (согласовано с MAX_FILE_SIZE)
+const GITHUB_CONTENTS_MAX = 1 * 1024 * 1024; // лимит GitHub Contents API ~1 МБ
 
 if (!fs.existsSync(ARTIFACT_DIR)) {
     try { fs.mkdirSync(ARTIFACT_DIR, { recursive: true }); } catch (e) { console.warn("[ARTIFACT] Не удалось создать папку:", e.message); }
 }
 
+// Доставка активна, только если заданы и URL, и токен эндпоинта
 const ARTIFACT_DELIVERY_ENABLED = !!(PUBLIC_URL && ARTIFACT_TOKEN);
 const GITHUB_ENABLED = !!(GITHUB_TOKEN && GITHUB_REPO);
 
@@ -82,11 +83,11 @@ const MINIO_ENABLED = minioStorage.ENABLED;
 })();
 
 let genAI = null;
-let geminiHistory = [];
+let geminiHistory = [];          // история обычного чата
 let adminMode = false;
-let adminHistory = [];
-let githubHistory = [];
-let githubSessionActive = false;
+let adminHistory = [];           // отдельная история для режима администратора
+let githubHistory = [];          // история сессии /github (для продолжения после лимита итераций)
+let githubSessionActive = false; // true, если предыдущий /github не завершил задачу (лимит/ошибка)
 
 // ==========================================
 // ANTIGRAVITY: состояние multi-turn + режим выполнения
@@ -95,8 +96,12 @@ let geminiAntigravityPrevId = null;
 let geminiAntigravityEnvId = null;
 let adminAntigravityPrevId = null;
 let adminAntigravityEnvId = null;
+
+// true  = неблокирующий (async): задача уходит в фон, GAS не висит, результат во входящие
+// false = блокирующий (sync): сервер ждёт завершения и возвращает ответ в пузыре
 let antigravityNonBlocking = true;
 
+// Системный промпт администратора из файла
 let adminSystemPrompt = "";
 try {
     adminSystemPrompt = fs.readFileSync(path.join(__dirname, 'admin.md'), 'utf8').trim();
@@ -105,6 +110,7 @@ try {
     console.warn("[SYSTEM] admin.md не найден, используется пустой промпт");
 }
 
+// Инструкции GitHub (подключаются только по команде /github, чтобы не раздувать контекст)
 let githubSystemPrompt = "";
 try {
     githubSystemPrompt = fs.readFileSync(path.join(__dirname, 'github.md'), 'utf8').trim();
@@ -130,6 +136,7 @@ function maskSecrets(s) {
 // ==========================================
 // ГИБРИД: системная инструкция и футер для Antigravity
 // ==========================================
+// Добавляет в промпт агенту инструкцию по загрузке артефакта на сервер (только если гибрид настроен).
 function getAntigravitySystemInstruction(basePrompt) {
     let extra = "";
     if (ARTIFACT_DELIVERY_ENABLED) {
@@ -147,6 +154,7 @@ function getAntigravitySystemInstruction(basePrompt) {
     return (basePrompt || "") + extra;
 }
 
+// Честная приписка про то, где физически лежит файл.
 function buildAntigravityFooter() {
     if (ARTIFACT_DELIVERY_ENABLED) {
         return `\n\n<i>ℹ️ Antigravity выполняет код в собственном sandbox Google.</i><br>` +
@@ -169,6 +177,7 @@ async function pushArtifactToGitHub(filePath, safeName) {
             return { ok: false, reason: `Файл ${stat.size} байт превышает лимит GitHub Contents API (~1 МБ)` };
         }
         const b64 = fs.readFileSync(filePath).toString('base64');
+        // Уникальный путь с таймштампом Kyiv — избегаем конфликтов sha и перезаписи
         const stamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').slice(0, 19);
         const prefix = GITHUB_PATH_PREFIX.replace(/\/+$/, '');
         const repoPath = `${prefix}/${stamp}_${safeName}`;
@@ -254,6 +263,7 @@ async function githubOps(args) {
                 }));
                 return JSON.stringify({ ok: true, branch, path: pathInRepo || '/', count: items.length, items }, null, 2);
             }
+            // одиночный файл, если path указывает на файл
             return JSON.stringify({
                 ok: true,
                 branch,
@@ -280,6 +290,7 @@ async function githubOps(args) {
             let textContent = null;
             if (data.encoding === 'base64' && data.content) {
                 const buf = Buffer.from(data.content.replace(/\n/g, ''), 'base64');
+                // текстовый, если выглядит как UTF-8 без нулей
                 const sample = buf.subarray(0, Math.min(buf.length, 4096));
                 const hasNull = sample.includes(0);
                 if (!hasNull && data.size <= 512 * 1024) {
@@ -377,6 +388,7 @@ async function githubOps(args) {
             const savePath = args.local_path
                 ? String(args.local_path)
                 : path.join(TMP_DIR, safeName);
+            // гарантируем родительскую папку
             fs.mkdirSync(path.dirname(savePath), { recursive: true });
             const fileResp = await axios.get(downloadUrl, {
                 responseType: 'arraybuffer',
@@ -419,6 +431,7 @@ async function githubOps(args) {
                 content: b64,
                 branch
             };
+            // если файл уже есть — подтянуть sha для обновления
             try {
                 const exist = await axios.get(`${base}/${repoPath}?ref=${encodeURIComponent(branch)}`, {
                     headers: githubApiHeaders(), timeout: 15000
@@ -458,6 +471,7 @@ async function githubOps(args) {
         }
 
         if (action === 'trigger_workflow') {
+            // workflow_id — числовой id или имя файла (build-esp32s3.yml / build-esp32s3.yaml)
             let workflowId = args.workflow_id || args.workflow || args.path;
             if (!workflowId) {
                 return JSON.stringify({ ok: false, error: 'Нужен workflow_id (id или имя файла .yml)' });
@@ -481,9 +495,9 @@ async function githubOps(args) {
         if (action === 'list_runs') {
             const params = new URLSearchParams();
             params.set('per_page', String(Math.min(parseInt(args.per_page, 10) || 10, 30)));
-            if (args.workflow_id || args.workflow) params.set('path', '');
+            if (args.workflow_id || args.workflow) params.set('path', ''); // filtered below if needed
             if (branch) params.set('branch', branch);
-            if (args.status) params.set('status', String(args.status));
+            if (args.status) params.set('status', String(args.status)); // queued|in_progress|completed
             let url = `${actionsBase}/runs?${params.toString()}`;
             if (args.workflow_id || args.workflow) {
                 const wf = encodeURIComponent(String(args.workflow_id || args.workflow));
@@ -532,6 +546,7 @@ async function githubOps(args) {
             if (!artifactId) {
                 return JSON.stringify({ ok: false, error: 'Нужен artifact_id (из list_artifacts)' });
             }
+            // GitHub отдаёт 302 на временный URL архива (zip)
             const metaUrl = `${actionsBase}/artifacts/${encodeURIComponent(String(artifactId))}/zip`;
             const resp = await axios.get(metaUrl, {
                 headers: githubApiHeaders(),
@@ -547,6 +562,7 @@ async function githubOps(args) {
             fs.mkdirSync(path.dirname(savePath), { recursive: true });
             fs.writeFileSync(savePath, Buffer.from(resp.data));
             const st = fs.statSync(savePath);
+            // Попытка распаковать, если есть unzip
             let extracted = [];
             let extractDir = null;
             try {
@@ -566,6 +582,7 @@ async function githubOps(args) {
                 extracted = [];
                 extractDir = null;
             }
+            // Если просили конкретный файл (например firmware.bin) — найти и скопировать
             let binPath = null;
             if (args.file_name && extracted.length) {
                 const want = String(args.file_name).toLowerCase();
@@ -598,6 +615,7 @@ async function githubOps(args) {
         }
 
         if (action === 'wait_run') {
+            // Опрос статуса run до completed или таймаута (сек)
             const runId = args.run_id;
             if (!runId) return JSON.stringify({ ok: false, error: 'Нужен run_id' });
             const timeoutSec = Math.min(parseInt(args.timeout_sec, 10) || 180, 300);
@@ -670,9 +688,10 @@ function extractAntigravityText(interaction) {
 
 // --- Хелперы прогресса Antigravity ---
 function escHtmlAg(s) {
-    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return String(s).replace(/&/g, '&').replace(/</g, '<').replace(/>/g, '>');
 }
 
+// Устойчивый парсер шагов: распознаёт реальные типы Antigravity (code_execution_, thought).
 function describeAntigravityStep(step, idx) {
     if (!step || typeof step !== 'object') return `⚙️ Шаг ${idx + 1}`;
     const type = String(step.type || step.role || '').toLowerCase();
@@ -704,17 +723,19 @@ function describeAntigravityStep(step, idx) {
     } else if (typeof step.text === 'string') preview = step.text;
     else if (typeof step.content === 'string') preview = step.content;
     if (preview) {
-        preview = preview.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+        preview = preview.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
         if (preview.length > 160) preview = preview.slice(0, 160) + '…';
         return `💬 <b>Antigravity:</b> ${escHtmlAg(preview)}`;
     }
     return `⚙️ <b>Antigravity:</b> шаг ${idx + 1}${type ? ' (' + escHtmlAg(type) + ')' : ''}`;
 }
 
+// Лёгкий push прогресса в inbox БЕЗ записи на диск.
 function pushProgressToInbox(html) {
     messageInbox.push({ time: getKyivTime(), text: html });
 }
 
+// --- Вызов агента: устойчивые таймауты + прогресс + heartbeat ---
 async function callAntigravityAgent(opts) {
     const url = 'https://generativelanguage.googleapis.com/v1beta/interactions';
     const headers = { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY };
@@ -738,7 +759,7 @@ async function callAntigravityAgent(opts) {
     if (background) {
         const maxWaitMs = 10 * 60 * 1000;
         const intervalMs = 3000;
-        const heartbeatIntervalMs = 30000;
+        const heartbeatIntervalMs = 30000;   // API не отдаёт шаги во время in_progress — шлём индикацию
         const start = Date.now();
         let lastActivityTime = Date.now();
         let consecutiveErrors = 0;
@@ -774,6 +795,7 @@ async function callAntigravityAgent(opts) {
                 }
             }
         }
+        // добиваем шаги из финального interaction (API отдаёт их только при завершении)
         if (interaction) {
             const steps = Array.isArray(interaction.steps) ? interaction.steps : [];
             if (steps.length > processedSteps) {
@@ -833,11 +855,12 @@ function runAntigravityInBackground(opts) {
 }
 
 async function getCronPattern(humanText, modelName) {
+    // Используем выбранную в чате модель; fallback — актуальная flash-модель (gemini-2.5-flash уже недоступна новым пользователям)
     const modelId = (modelName && String(modelName).trim()) || "gemini-2.0-flash";
     const model = genAI.getGenerativeModel({ model: modelId });
     const result = await model.generateContent("Переведи фразу строго в стандартный cron-pattern из 5 параметров (минуты, часы, день, месяц, день недели). Верни ТОЛЬКО строку, например '*/2 * * * *'. Никаких других символов. Фраза: " + humanText);
     let pattern = result.response.text().trim();
-    if (!cron.validate(pattern)) return "*/5 * * * *";
+    if (!cron.validate(pattern)) return "*/5 * * * *"; // fallback
     return pattern;
 }
 
@@ -847,7 +870,7 @@ async function getCronPattern(humanText, modelName) {
 const MESSAGES_FILE = path.join(TMP_DIR, 'inbox.json');
 const JOBS_FILE = path.join(TMP_DIR, 'scheduled_jobs.json');
 let messageInbox = [];
-let scheduledJobs = [];
+let scheduledJobs = []; // список активных задач { id, pattern, taskText, model }
 
 if (fs.existsSync(MESSAGES_FILE)) {
     try { messageInbox = JSON.parse(fs.readFileSync(MESSAGES_FILE, 'utf8')); } catch(e){}
@@ -878,6 +901,7 @@ function addMessageToInbox(msgText) {
     saveInbox();
 }
 
+// Карта для хранения активных объектов cron-задач
 const activeCronTasks = {};
 
 function startCronTask(job) {
@@ -893,6 +917,7 @@ function startCronTask(job) {
             }
             const modelName = job.model || "gemini-2.0-flash";
 
+            // --- Antigravity: фоновая задача через Interactions API ---
             if (isAntigravityModel(modelName)) {
                 try {
                     const ag = await callAntigravityAgent({
@@ -964,6 +989,7 @@ function startCronTask(job) {
                         const funcResponse = { name: call.name, response: { result: execResult } };
                         result = await chat.sendMessage([{ functionResponse: funcResponse }]);
                     } else if (call.name === "search_web") {
+                        // *** ИСПРАВЛЕНО: search и download объединены в одну рабочую ветку ***
                         const action = call.args.action;
                         let searchResult = "";
                         try {
@@ -1110,6 +1136,11 @@ if (fs.existsSync(LIMITS_FILE)) {
 
 const originalFetch = global.fetch;
 global.fetch = async (input, init) => {
+    // ============================================================
+    // ПАТЧ СОВМЕСТИМОСТИ: Gemini 3.5 Flash Lite / 3.6 Flash и новее
+    // Эти модели не принимают роль 'function'. SDK всё ещё пакует
+    // functionResponse в role:'function' — на лету переписываем в 'user'.
+    // ============================================================
     let patchedInit = init;
     try {
         const urlStr = typeof input === 'string' ? input : (input && input.url ? input.url : '');
@@ -1143,6 +1174,7 @@ global.fetch = async (input, init) => {
 
     const response = await originalFetch(input, patchedInit);
 
+    // --- телеметрия лимитов ---
     let url = typeof input === 'string' ? input : (input && input.url ? input.url : '');
     if (url && url.includes('generativelanguage.googleapis.com/v1beta/models/')) {
         const match = url.match(/models\/([^:]+)(?::generateContent|:streamGenerateContent)/);
@@ -1174,14 +1206,17 @@ global.fetch = async (input, init) => {
 
 // ==========================================
 // ЭНДПОИНТ ПРИЁМА АРТЕФАКТОВ ОТ ANTIGRAVITY
+// Узкоскоупный: умеет ТОЛЬКО класть файл в /tmp/artifacts/ (+ опц. push в GitHub).
+// Не даёт exec/прокси/чат. Токен ARTIFACT_TOKEN != PROXY_SECRET.
 // ==========================================
 app.post('/artifact', (req, res) => {
     if (!ARTIFACT_TOKEN) return res.status(500).json({ ok: false, error: "ARTIFACT_TOKEN not set on server" });
     if (req.query.token !== ARTIFACT_TOKEN) return res.status(403).json({ ok: false, error: "Auth failed" });
 
+    // Имя только из basename, без путей и точек-точек
     let rawName = String(req.get('x-filename') || req.query.name || 'artifact.bin');
     let safeName = path.basename(rawName).replace(/[^a-zA-Z0-9.\-_]/g, '_') || 'artifact.bin';
-    const savePath = path.join(ARTIFACT_DIR, safeName);
+    const savePath = path.join(ARTIFACT_DIR, safeName); // всегда внутри ARTIFACT_DIR
     let bytes = 0; let aborted = false;
     const writer = fs.createWriteStream(savePath);
 
@@ -1198,6 +1233,7 @@ app.post('/artifact', (req, res) => {
     writer.on('finish', async () => {
         if (aborted) return res.status(413).json({ ok: false, error: "File too large" });
         console.log(`[ARTIFACT] Принят файл: ${savePath} (${(bytes/1024).toFixed(1)} KB)`);
+        // Push в GitHub (агент GITHUB_TOKEN не видит). MinIO для Antigravity отключён намеренно.
         let github = { ok: false, skipped: true, reason: "GitHub не настроен" };
         if (GITHUB_ENABLED) {
             github = await pushArtifactToGitHub(savePath, safeName);
@@ -1213,8 +1249,15 @@ app.post('/artifact', (req, res) => {
 
 // ==========================================
 // FILE UPLOAD (raw binary, без base64) — FM / APK
+// POST /file-upload?token=PROXY_SECRET
+// Headers:
+//   X-Filename: оригинальное имя
+//   X-Dest: fs | minio
+//   X-Path: полный путь FS (/tmp/a.bin) или ключ MinIO (folder/a.bin)
+//   Content-Type: application/octet-stream
+// Body: сырые байты файла
 // ==========================================
-const FILE_UPLOAD_MAX = parseInt(process.env.FILE_UPLOAD_MAX || String(512 * 1024 * 1024), 10);
+const FILE_UPLOAD_MAX = parseInt(process.env.FILE_UPLOAD_MAX || String(512 * 1024 * 1024), 10); // 512 МБ по умолчанию
 
 function sanitizeUploadName(raw) {
     let name = path.basename(String(raw || 'upload.bin'));
@@ -1240,6 +1283,7 @@ app.post('/file-upload', (req, res) => {
     let filename = sanitizeUploadName(req.get('x-filename') || req.query.name || 'upload.bin');
     let targetPath = String(req.get('x-path') || req.query.path || '').trim();
 
+    // FS: если X-Path — директория или пусто → /tmp/filename; если путь с именем — используем его
     let savePath;
     let minioKey = '';
 
@@ -1247,9 +1291,11 @@ app.post('/file-upload', (req, res) => {
         if (!MINIO_ENABLED) return res.status(503).json({ ok: false, error: 'MinIO disabled' });
         minioKey = targetPath.replace(/^\/+/, '');
         if (!minioKey || minioKey.endsWith('/')) minioKey = (minioKey || '') + filename;
+        // временный файл на диск, потом в MinIO
         savePath = path.join(TMP_DIR, 'up_' + Date.now() + '_' + filename.replace(/[^\w.\-]+/g, '_'));
     } else {
         if (targetPath && !targetPath.endsWith('/')) {
+            // полный путь к файлу
             savePath = path.resolve(targetPath);
             filename = path.basename(savePath);
         } else {
@@ -1257,6 +1303,7 @@ app.post('/file-upload', (req, res) => {
             const resolvedDir = path.resolve(dir || TMP_DIR);
             savePath = path.join(resolvedDir, filename);
         }
+        // не даём выйти совсем в произвольные места через .. — мягкая проверка
         if (savePath.indexOf('\0') >= 0) {
             return res.status(400).json({ ok: false, error: 'bad path' });
         }
@@ -1326,6 +1373,8 @@ app.post('/file-upload', (req, res) => {
 // ==========================================
 // MINIO API ENDPOINTS
 // ==========================================
+// --- MinIO HTTP: тонкая обёртка над minioStorage (логика ключей/PREFIX только там) ---
+
 app.get('/minio/status', async (req, res) => {
     if (req.query.token !== PROXY_SECRET && req.query.token !== ARTIFACT_TOKEN) {
         return res.status(403).json({ ok: false, error: 'Forbidden' });
@@ -1391,6 +1440,7 @@ app.post('/minio/upload', async (req, res) => {
 
     writer.on('finish', async () => {
         if (aborted) return res.status(413).json({ ok: false, error: 'File too large' });
+        // имя: query.key / body не используется (raw stream); сохраняем оригинальное имя
         const objectKey = String(req.query.key || req.get('x-object-key') || safeName).replace(/^\/+/, '');
         const result = await minioStorage.uploadFile(tmpPath, objectKey, {
             contentType: req.get('content-type') || 'application/octet-stream'
@@ -1427,8 +1477,12 @@ app.post('/minio', async (req, res) => {
 });
 
 // ==========================================
+// МАРШРУТ УПРАВЛЕНИЯ И GEMINI
+// ==========================================
+// ==========================================
 // GitHub FS — файловый менеджер (Contents API)
 // ==========================================
+// Скачивание файла из GitHub с принудительным attachment (не открывать как текст в браузере)
 app.get('/github-fs/download', async (req, res) => {
     if (req.query.token !== PROXY_SECRET && req.query.token !== ARTIFACT_TOKEN) {
         return res.status(403).send('Forbidden');
@@ -1455,6 +1509,7 @@ app.get('/github-fs/download', async (req, res) => {
                 headers: {
                     'User-Agent': 'northflank-github-fs',
                     'Accept': 'application/octet-stream',
+                    // для private repo download_url уже с token; для public достаточно
                     ...(GITHUB_TOKEN ? { 'Authorization': `Bearer ${GITHUB_TOKEN}` } : {})
                 },
                 timeout: 180000,
@@ -1515,6 +1570,7 @@ app.post('/github-fs', async (req, res) => {
                 sha: it.sha,
                 html_url: it.html_url
             }));
+            // если list вернул одиночный item
             if (!data.items && data.item) {
                 items.push({
                     name: data.item.name,
@@ -1531,6 +1587,7 @@ app.post('/github-fs', async (req, res) => {
             const raw = await githubOps({ action: 'get', path: pathInRepo, branch });
             const data = typeof raw === 'string' ? JSON.parse(raw) : raw;
             if (!data.ok) return res.json(data);
+            // если content уже text — отдаём; иначе тянем download_url
             let b64 = null;
             if (data.content == null && data.download_url) {
                 try {
@@ -1574,6 +1631,7 @@ app.post('/github-fs', async (req, res) => {
             } else {
                 return res.json({ ok: false, error: 'Нужен content, b64 или local_path' });
             }
+            // если sha не передан — попробуем получить для update
             if (!args.sha && args.path) {
                 try {
                     const existRaw = await githubOps({ action: 'get', path: args.path, branch });
@@ -1608,6 +1666,7 @@ app.post('/github-fs', async (req, res) => {
         }
 
         if (op === 'mkdir') {
+            // GitHub не имеет папок — создаём .gitkeep
             const dir = pathInRepo.replace(/\/+$/, '');
             const keep = dir ? `${dir}/.gitkeep` : '.gitkeep';
             const raw = await githubOps({
@@ -1624,6 +1683,7 @@ app.post('/github-fs', async (req, res) => {
         if (op === 'rename') {
             const newPath = normalizeRepoPath(req.body.new_path || '');
             if (!pathInRepo || !newPath) return res.json({ ok: false, error: 'path и new_path обязательны' });
+            // get content
             const getRaw = await githubOps({ action: 'get', path: pathInRepo, branch });
             const getData = typeof getRaw === 'string' ? JSON.parse(getRaw) : getRaw;
             if (!getData.ok) return res.json(getData);
@@ -1662,6 +1722,7 @@ app.post('/github-fs', async (req, res) => {
         }
 
         if (op === 'presign') {
+            // Прокси через наш сервер — Content-Disposition: attachment (иначе Chrome открывает raw как текст)
             if (!pathInRepo) return res.json({ ok: false, error: 'path обязателен' });
             const baseUrl = (PUBLIC_URL || '').replace(/\/+$/, '') || `${req.protocol}://${req.get('host')}`;
             const url = `${baseUrl}/github-fs/download?token=${encodeURIComponent(PROXY_SECRET)}&path=${encodeURIComponent(pathInRepo)}`;
@@ -1678,11 +1739,30 @@ app.post('/github-fs', async (req, res) => {
     }
 });
 
-// ==========================================
-// МАРШРУТ УПРАВЛЕНИЯ И GEMINI
-// ==========================================
+// fallback action на /gemini
 app.post('/gemini', async (req, res) => {
     if (req.query.token !== PROXY_SECRET) return res.status(403).json({ok: false, error: "Auth failed"});
+
+    // === OPENROUTER: Маршрутизация к OpenRouter API ===
+    if (openrouter.isOpenRouterModel(req.body.model)) {
+        return openrouter.handleOpenRouterMessage(req, res, {
+            OPENROUTER_API_KEY,
+            TAVILY_API_KEY,
+            TMP_DIR,
+            PUBLIC_URL,
+            adminMode,
+            adminSystemPrompt,
+            githubSystemPrompt,
+            githubOps,
+            maskSecrets,
+            messageInbox,
+            getKyivTime,
+            escapeHtml,
+            useProxy,
+            SOCKS5_PROXY,
+            getBrowserHeaders
+        });
+    }
 
     // MinIO ops from FileManager (тот же payload, что и POST /minio)
     if (req.body.action === 'minio') {
@@ -1716,8 +1796,7 @@ app.post('/gemini', async (req, res) => {
     // Проверяем входящие накопленные ответы от отработавших cron-задач
     let cronNotificationsHtml = "";
     if (messageInbox.length > 0) {
-        cronNotificationsHtml = '<div style="background:#fff3cd; border-left:5px solid #ffc107; padding:12px; margin-bottom:15px; border-radius:6px; font-size:12px; color:#856404; max-height: 400px; overflow-y: auto;"><b>🔔 Результаты фоновых задач планировщика:</b><br>' +
-            messageInbox.map(m => `⏰ [${m.time} Kyiv]: ${m.text}`).join('<hr style="border:0; border-top:1px solid #ffeeba; margin:10px 0;">') + '</div>';
+        cronNotificationsHtml = '<div style="background:#fff3cd; border-left:5px solid #ffc107; padding:12px; margin-bottom:15px; border-radius:6px; font-size:12px; color:#856404; max-height: 400px; overflow-y: auto;"><b>🔔 Результаты фоновых задач планировщика:</b><br>' + messageInbox.map(m => `⏰ [${m.time} Kyiv]: ${m.text}`).join('<hr style="border:0; border-top:1px solid #ffeeba; margin:10px 0;">') + '</div>';
         messageInbox = [];
         fs.writeFileSync(MESSAGES_FILE, '[]');
     }
@@ -1725,6 +1804,7 @@ app.post('/gemini', async (req, res) => {
     if (req.body.action === 'upload') {
         try {
             let filename = path.basename(String(req.body.filename || 'upload.bin'));
+            // сохраняем оригинал: только убираем path-separators и управляющие
             filename = filename.replace(/[\x00-\x1f\/<>:"|?*]/g, ' ').replace(/\s+/g, ' ').trim() || 'upload.bin';
             if (filename === '.' || filename === '..') filename = 'upload.bin';
             const savePath = path.join(TMP_DIR, filename);
@@ -1749,7 +1829,6 @@ app.post('/gemini', async (req, res) => {
         });
     }
 
-    // === GET_MODELS: Добавляем бесплатные модели OpenRouter ===
     if (req.body.action === 'get_models') {
         try {
             console.log("[MODELS] Запрос списка доступных моделей...");
@@ -1766,28 +1845,9 @@ app.post('/gemini', async (req, res) => {
                     });
             }
 
-            // === OPENROUTER: Добавляем основную модель и бесплатные модели ===
+            // === OPENROUTER: Добавляем OpenRouter модели, если ключ задан ===
             if (OPENROUTER_API_KEY) {
                 models.push({ id: "stealth/ox-alpha", name: "Ox Alpha (OpenRouter)" });
-
-                // Получаем бесплатные модели из OpenRouter API
-                try {
-                    const orRes = await axios.get('https://openrouter.ai/api/v1/models', {
-                        headers: { 'Authorization': `Bearer ${OPENROUTER_API_KEY}` },
-                        timeout: 10000
-                    });
-                    const orModels = orRes.data.data || [];
-                    for (const m of orModels) {
-                        const isFree = (m.pricing && m.pricing.prompt === "0" && m.pricing.completion === "0") ||
-                                       (m.id && m.id.toLowerCase().includes('free')) ||
-                                       (m.name && m.name.toLowerCase().includes('free'));
-                        if (isFree && m.id !== "stealth/ox-alpha") {
-                            models.push({ id: m.id, name: m.name + ' (OpenRouter Free)' });
-                        }
-                    }
-                } catch (orErr) {
-                    console.warn("[MODELS] OpenRouter free models fetch error:", orErr.message);
-                }
             }
 
             console.log(`[MODELS] Успешно загружено ${models.length} моделей.`);
@@ -2021,7 +2081,6 @@ ${deliveryHint}
         return res.json({ ok: true, text: statusText });
     }
 
-    // === ТЕРМИНАЛ: !команды (обработка ДО маршрутизации к OpenRouter) ===
     if (userText.startsWith('!')) {
         const cmd = userText.substring(1).trim();
         if (!cmd) return res.json({ ok: true, text: "⚠️ Введите команду." });
@@ -2031,6 +2090,7 @@ ${deliveryHint}
             let output = stdout;
             if (stderr) output += `\n[STDERR]:\n${stderr}`;
             if (!output) output = "[Выполнено успешно]";
+            // лимит + маркер; экранирование обязательно (!cat server.js содержит </div> и ломает HTML/скролл)
             if (output.length > 300000) output = output.substring(0, 300000) + "\n\n...[ОБРЕЗАН: вывод больше 300000 символов]...";
             const safeOut = escapeHtml(output);
             const safeCmd = escapeHtml(cmd);
@@ -2102,17 +2162,16 @@ ${deliveryHint}
 
     if (!GEMINI_API_KEY) return res.status(500).json({ok: false, error: "Отсутствует GEMINI_API_KEY"});
 
-    // === CLEAR: Очистка истории (включая OpenRouter) ===
     if (req.body.clear === 'true') {
         geminiHistory = [];
         geminiAntigravityPrevId = null;
         geminiAntigravityEnvId = null;
         adminAntigravityPrevId = null;
         adminAntigravityEnvId = null;
-
+        
         // === OPENROUTER: Очистка истории OpenRouter ===
         openrouter.clearHistory();
-
+        
         if (adminMode) {
             adminHistory = [
                 { role: "user", parts: [{ text: "Инструкции администратора" }] },
@@ -2134,6 +2193,7 @@ ${deliveryHint}
             console.log("[GEMINI] /github → auto adminMode=true");
         }
         const ghTask = userText.replace(/^\/github\s*/i, '').trim();
+        // Сброс сессии GitHub
         if (/^(clear|reset|новый|сброс)$/i.test(ghTask)) {
             githubHistory = [];
             githubSessionActive = false;
@@ -2155,29 +2215,9 @@ ${deliveryHint}
                 `• <code>/github clear</code> — сбросить сессию<br><br>` +
                 `Лимит: 50 вызовов инструментов за ход; прогресс сохраняется.`, admin_mode: true });
         }
+        // «продолжай» без доп. текста — модель сама подхватит историю
         const taskForModel = /^(продолжай|continue|далее|продолжить)$/i.test(ghTask) ? 'Продолжи выполнение предыдущей задачи с того места, где остановился. Не начинай заново — используй уже сделанный прогресс из истории. Если всё уже сделано — кратко сообщи итог.' : ghTask;
         return handleAdminMessage(taskForModel, req, res, (autoAdminNote || '') + (cronNotificationsHtml || ''), { withGithub: true });
-    }
-
-    // === OPENROUTER: Маршрутизация к OpenRouter API (ПОСЛЕ всех команд и специальных действий) ===
-    if (openrouter.isOpenRouterModel(req.body.model)) {
-        return openrouter.handleOpenRouterMessage(req, res, {
-            OPENROUTER_API_KEY,
-            TAVILY_API_KEY,
-            TMP_DIR,
-            PUBLIC_URL,
-            adminMode,
-            adminSystemPrompt,
-            githubSystemPrompt,
-            githubOps,
-            maskSecrets,
-            messageInbox,
-            getKyivTime,
-            escapeHtml,
-            useProxy,
-            SOCKS5_PROXY,
-            getBrowserHeaders
-        });
     }
 
     // Передаем cronNotificationsHtml в функцию администратора
@@ -2200,6 +2240,7 @@ ${deliveryHint}
             ];
         }
 
+        // НЕБЛОКИРУЮЩИЙ режим: мгновенная заглушка, задача в фоне
         if (antigravityNonBlocking) {
             runAntigravityInBackground({
                 mode: 'chat',
@@ -2211,6 +2252,7 @@ ${deliveryHint}
             return res.json({ ok: true, text: stub });
         }
 
+        // БЛОКИРУЮЩИЙ режим: ждём завершения и возвращаем в пузыре
         try {
             const ag = await callAntigravityAgent({
                 input: agInput,
@@ -2260,12 +2302,15 @@ ${deliveryHint}
 // ANTIGRAVITY В РЕЖИМЕ АДМИНИСТРАТОРА
 // ==========================================
 async function handleAntigravityAdmin(userText, req, res, cronNotificationsHtml = "", withGithub = false) {
+    // Antigravity не имеет инструмента github_ops (он доступен только обычным Gemini-моделям в admin).
+    // При /github просто добавляем текстовые инструкции; для полноценного GitHub лучше выбрать Gemini Flash.
     let basePrompt = adminSystemPrompt || "Ты — автономный агент-администратор. Выполняй задачу и возвращай краткий результат.";
     if (withGithub && githubSystemPrompt) {
         basePrompt += "\n\n=== РЕЖИМ GITHUB ===\n" + githubSystemPrompt + "\n\nВАЖНО: инструмент github_ops доступен только в обычном admin-режиме (модели Gemini Flash / Lite, НЕ Antigravity). " +
             "В Antigravity токен GitHub тебе недоступен — не пытайся его искать. Если нужна запись в репозиторий, попроси пользователя выбрать модель без Antigravity.";
     }
 
+    // НЕБЛОКИРУЮЩИЙ режим: мгновенная заглушка, задача в фоне
     if (antigravityNonBlocking) {
         runAntigravityInBackground({
             mode: 'admin',
@@ -2280,6 +2325,7 @@ async function handleAntigravityAdmin(userText, req, res, cronNotificationsHtml 
         return res.json({ ok: true, text: stub });
     }
 
+    // БЛОКИРУЮЩИЙ режим: ждём завершения и возвращаем в пузыре
     try {
         const ag = await callAntigravityAgent({
             input: userText,
@@ -2308,6 +2354,7 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
     const preferredModel = req.body.model || "gemini-2.0-flash";
     const withGithub = !!(options && options.withGithub);
 
+    // --- Antigravity: агент работает через Interactions API со своими инструментами ---
     if (isAntigravityModel(preferredModel)) {
         return handleAntigravityAdmin(userText, req, res, cronNotificationsHtml, withGithub);
     }
@@ -2436,6 +2483,7 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
         ]
     }];
 
+    // /github: продолжаем сохранённую сессию, если она есть; иначе стартуем с github.md
     let historyForChat;
     if (withGithub) {
         if (githubHistory && githubHistory.length > 0) {
@@ -2454,7 +2502,7 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
     const chat = model.startChat({ history: historyForChat, tools: tools });
     const executedCommands = [];
     let iterations = 0;
-    const maxIterations = withGithub ? 50 : 50;
+    const maxIterations = withGithub ? 50 : 50; // admin / github: до 50 вызовов инструментов за один ход
 
     try {
         let result = await chat.sendMessage(userText);
@@ -2664,6 +2712,7 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                     } catch (err) {
                         ghResult = JSON.stringify({ ok: false, error: err.message });
                     }
+                    // не светим токен даже если модель вдруг попросила env
                     ghResult = maskSecrets(ghResult);
                     console.log(`[ADMIN] github_ops result: ${String(ghResult).substring(0, 300)}`);
                     const funcResponse = { name: call.name, response: { result: ghResult } };
@@ -2683,11 +2732,12 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                     finalText += `\n</details>`;
                 }
 
+                // Сохраняем историю: admin → adminHistory; github → githubHistory (для /github continue)
                 try {
                     const hist = await chat.getHistory();
                     if (withGithub) {
                         githubHistory = hist;
-                        githubSessionActive = false;
+                        githubSessionActive = false; // задача штатно завершена
                     } else {
                         adminHistory = hist;
                     }
@@ -2702,6 +2752,7 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
 
             iterations++;
             if (iterations >= maxIterations) {
+                // Сохраняем точку остановки — следующий /github продолжит с этой истории
                 try {
                     const hist = await chat.getHistory();
                     if (withGithub) {
@@ -2790,7 +2841,7 @@ app.get('/', async (req, res) => {
 
     const parsedTarget = new URL.URL(targetUrl);
     const nfFileId = parsedTarget.searchParams.get('nf_fileId');
-    const nfPartName = parsedTarget.searchParams.get('nf_partName');
+    const nfPartName = parsedTarget.searchParams.get('nfPartName');
     if (nfFileId && nfPartName) {
         const partPath = path.join(TMP_DIR, nfFileId, nfPartName);
         if (!fs.existsSync(partPath)) return res.status(404).send("Кэш истек.");
@@ -3022,7 +3073,7 @@ app.get('/', async (req, res) => {
                 let totalCompressedBytes = 0;
                 archiveParts.forEach((partName) => {
                     parsedTarget.searchParams.set('nf_fileId', fileId);
-                    parsedTarget.searchParams.set('nf_partName', partName);
+                    parsedTarget.searchParams.set('nfPartName', partName);
                     const stat = fs.statSync(path.join(fileDir, partName));
                     totalCompressedBytes += stat.size;
                     buttonsHtml += `<a href="${parsedTarget.toString()}" target="_blank" style="display:block; margin-bottom:10px; padding:12px; background:#1a73e8; color:white; text-decoration:none; border-radius:5px; font-weight:bold;">📥 Скачать ${partName} <span style="font-weight:normal; font-size:12px;">(${(stat.size/1024/1024).toFixed(1)} МБ)</span></a>`;
@@ -3084,7 +3135,7 @@ async function startServer() {
     const PORT = process.env.PORT || 8080;
     app.listen(PORT, () => {
         console.log(`[SYSTEM] Сервер успешно запущен на порту ${PORT}`);
-        console.log(`[SYSTEM] Доставка артефактов: ${ARTIFACT_DELIVERY_ENABLED ? 'ВКЛ' : 'ВЫКЛ'} | GitHub: ${GITHUB_ENABLED ? 'ВКЛ (' + GITHUB_REPO + ')' : 'ВЫКЛ'} | MinIO: ${MINIO_ENABLED ? 'ВКЛ' : 'ВЫКЛ'} | OpenRouter: ${OPENROUTER_API_KEY ? 'ВКЛ' : 'ВЫКЛ'}`);
+        console.log(`[SYSTEM] Доставка артефактов: ${ARTIFACT_DELIVERY_ENABLED ? 'ВКЛ' : 'ВЫКЛ'} | GitHub: ${GITHUB_ENABLED ? 'ВКЛ (' + GITHUB_REPO + ')' : 'ВЫКЛ'} | MinIO: ${MINIO_ENABLED ? 'ВКЛ' : 'ВЫКЛ'}`);
         initAllCronJobs();
     });
 }
