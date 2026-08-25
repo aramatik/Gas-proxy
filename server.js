@@ -1794,7 +1794,7 @@ app.post('/gemini', async (req, res) => {
                         if (m && !addedIds.has(m.id)) {
                             models.push({ 
                                 id: m.id, 
-                                name: `🆓 ${m.name} (Free)` 
+                                name: `🆓 ${m.name}` 
                             });
                             addedIds.add(m.id);
                         }
@@ -1813,7 +1813,7 @@ app.post('/gemini', async (req, res) => {
                         if ((isFree || hasFreeLabel) && m.id !== "stealth/ox-alpha") {
                             models.push({ 
                                 id: m.id, 
-                                name: `🆓 ${m.name} (Free)` 
+                                name: `🆓 ${m.name}` 
                             });
                             addedIds.add(m.id);
                         }
