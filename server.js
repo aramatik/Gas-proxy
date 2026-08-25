@@ -1778,8 +1778,8 @@ app.post('/gemini', async (req, res) => {
                     });
                     const orModels = orRes.data.data || [];
                     const addedIds = new Set(["stealth/ox-alpha"]);
-                    
-                    // Топ бесплатых моделей с приоритетом
+
+                    // Топ бесплатных моделей с приоритетом (только с :free в id)
                     const priorityModels = [
                         "meta-llama/llama-3.3-70b-instruct:free",
                         "google/gemini-2.0-flash-exp:free",
@@ -1787,34 +1787,24 @@ app.post('/gemini', async (req, res) => {
                         "qwen/qwen-2.5-72b-instruct:free",
                         "mistralai/mistral-small-3.2-24b-instruct:free"
                     ];
-                    
+
                     // Добавляем приоритетные модели первыми
                     for (const pid of priorityModels) {
                         const m = orModels.find(x => x.id === pid);
                         if (m && !addedIds.has(m.id)) {
-                            models.push({ 
-                                id: m.id, 
-                                name: `🆓 ${m.name}` 
-                            });
+                            models.push({ id: m.id, name: m.name });
                             addedIds.add(m.id);
                         }
                     }
-                    
-                    // Добавляем остальные бесплатные
+
+                    // Добавляем остальные бесплатные: только id с ":free" или openrouter/free
+                    // (без фильтра по имени — иначе попадают модели вроде Lyria без :free)
                     for (const m of orModels) {
                         if (addedIds.has(m.id)) continue;
-                        
-                        const isFree = m.pricing && 
-                                       (m.pricing.prompt === "0" || m.pricing.prompt === 0) && 
-                                       (m.pricing.completion === "0" || m.pricing.completion === 0);
-                        const hasFreeLabel = (m.id && m.id.toLowerCase().includes(':free')) ||
-                                             (m.name && m.name.toLowerCase().includes('free'));
-                        
-                        if ((isFree || hasFreeLabel) && m.id !== "stealth/ox-alpha") {
-                            models.push({ 
-                                id: m.id, 
-                                name: `🆓 ${m.name}` 
-                            });
+                        const idLower = String(m.id || '').toLowerCase();
+                        const hasFreeSuffix = idLower.includes(':free') || idLower === 'openrouter/free';
+                        if (hasFreeSuffix) {
+                            models.push({ id: m.id, name: m.name });
                             addedIds.add(m.id);
                         }
                     }
