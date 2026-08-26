@@ -65,22 +65,8 @@ async function handleOpenRouterMessage(req, res, options = {}) {
         escapeHtml,
         useProxy,
         SOCKS5_PROXY,
-        getBrowserHeaders,
-        progressId,
-        setProgress,
-        finishProgress
+        getBrowserHeaders
     } = options;
-
-    const prog = (msg) => {
-        try {
-            if (typeof setProgress === 'function' && progressId) setProgress(progressId, msg);
-        } catch (e) {}
-    };
-    const doneProg = () => {
-        try {
-            if (typeof finishProgress === 'function' && progressId) finishProgress(progressId);
-        } catch (e) {}
-    };
 
     if (!OPENROUTER_API_KEY) {
         return res.status(500).json({ ok: false, error: "OPENROUTER_API_KEY не задан на сервере" });
@@ -219,7 +205,6 @@ async function handleOpenRouterMessage(req, res, options = {}) {
         const maxIterations = 30;
         let finalText = "";
         const executedCommands = [];
-        prog('OpenRouter: старт…');
 
         while (iterations < maxIterations) {
             const payload = {
@@ -233,7 +218,6 @@ async function handleOpenRouterMessage(req, res, options = {}) {
                 payload.tools = tools;
             }
 
-            prog('модель думает… (шаг ' + (iterations + 1) + ')');
             console.log(`[OPENROUTER] Запрос к модели: ${model} (итерация ${iterations + 1})`);
 
             let response;
@@ -252,14 +236,12 @@ async function handleOpenRouterMessage(req, res, options = {}) {
                 const errData = apiErr.response?.data?.error;
                 if (apiErr.response?.status === 429) {
                     const remedy = errData?.metadata?.remedy_hint || 'Попробуйте позже или выберите другую модель';
-                    doneProg();
                     return res.status(429).json({ 
                         ok: false, 
                         error: `⏱ <b>Rate limit (429)</b><br>Модель <code>${model}</code> временно перегружена.<br><i>${remedy}</i>` 
                     });
                 }
                 if (apiErr.response?.status === 400) {
-                    doneProg();
                     return res.status(400).json({ 
                         ok: false, 
                         error: `❌ <b>Ошибка 400</b><br>${errData?.message || 'Модель не поддерживает запрошенные параметры'}` 
@@ -270,7 +252,6 @@ async function handleOpenRouterMessage(req, res, options = {}) {
 
             const choice = response.data.choices[0];
             if (!choice) {
-                doneProg();
                 return res.status(500).json({ ok: false, error: "OpenRouter не вернул ответ" });
             }
             
@@ -287,7 +268,6 @@ async function handleOpenRouterMessage(req, res, options = {}) {
 
                         if (toolCall.function.name === 'exec_command') {
                             const cmd = args.command;
-                            prog('exec: ' + String(cmd).substring(0, 120));
                             console.log(`[OPENROUTER ADMIN] Executing: ${cmd}`);
                             let execResult;
                             try {
@@ -302,7 +282,6 @@ async function handleOpenRouterMessage(req, res, options = {}) {
                             toolResult = JSON.stringify({ result: execResult });
 
                         } else if (toolCall.function.name === 'search_web') {
-                            prog('search_web: ' + String(args.action || '') + (args.query ? ' — ' + String(args.query).substring(0, 80) : (args.url ? ' — ' + String(args.url).substring(0, 80) : '')));
                             let searchResult = "";
                             if (args.action === 'search') {
                                 if (!TAVILY_API_KEY) throw new Error("TAVILY_API_KEY не задан");
@@ -328,7 +307,6 @@ async function handleOpenRouterMessage(req, res, options = {}) {
                             toolResult = JSON.stringify({ result: searchResult });
 
                         } else if (toolCall.function.name === 'github_ops') {
-                            prog('github: ' + String(args.action || ''));
                             let ghResult;
                             try {
                                 ghResult = await githubOps(args);
@@ -382,8 +360,6 @@ async function handleOpenRouterMessage(req, res, options = {}) {
             }
         }
 
-        prog('формирую ответ…');
-        doneProg();
         return res.json({
             ok: true,
             text: cronNotificationsHtml ? cronNotificationsHtml + '<br>' + finalText : finalText,
@@ -391,7 +367,6 @@ async function handleOpenRouterMessage(req, res, options = {}) {
         });
 
     } catch (err) {
-        doneProg();
         console.error("[OPENROUTER ERROR]", err.response ? err.response.data : err.message);
         const errData = err.response?.data?.error;
         const errMsg = errData?.message || err.message;
