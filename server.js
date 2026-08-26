@@ -89,49 +89,6 @@ let githubHistory = [];
 let githubSessionActive = false;
 
 // ==========================================
-// PROGRESS: статус текущей операции для клиента (poll_progress)
-// ==========================================
-const progressMap = new Map(); // id -> { status, updated, done }
-
-function setProgress(id, status) {
-    if (!id) return;
-    const key = String(id);
-    progressMap.set(key, {
-        status: String(status == null ? '' : status).substring(0, 200),
-        updated: Date.now(),
-        done: false
-    });
-}
-
-function finishProgress(id) {
-    if (!id) return;
-    const key = String(id);
-    const prev = progressMap.get(key);
-    progressMap.set(key, {
-        status: (prev && prev.status) || '',
-        updated: Date.now(),
-        done: true
-    });
-    setTimeout(function () {
-        try { progressMap.delete(key); } catch (e) {}
-    }, 15000);
-}
-
-function getProgress(id) {
-    if (!id) return null;
-    return progressMap.get(String(id)) || null;
-}
-
-// периодическая уборка зависших записей (> 30 мин)
-setInterval(function () {
-    const now = Date.now();
-    for (const [k, v] of progressMap.entries()) {
-        if (!v || (now - (v.updated || 0)) > 30 * 60 * 1000) progressMap.delete(k);
-    }
-}, 5 * 60 * 1000);
-
-
-// ==========================================
 // ANTIGRAVITY: состояние multi-turn + режим выполнения
 // ==========================================
 let geminiAntigravityPrevId = null;
@@ -1756,18 +1713,6 @@ app.post('/gemini', async (req, res) => {
         });
     }
 
-    // Статус текущей операции ИИ (для подсказки «Думаю…» на клиенте)
-    if (req.body.action === 'poll_progress') {
-        const pid = req.body.progressId || req.body.id || '';
-        const p = getProgress(pid);
-        return res.json({
-            ok: true,
-            status: p ? (p.status || '') : '',
-            done: p ? !!p.done : true,
-            admin_mode: adminMode
-        });
-    }
-
     // Проверяем входящие накопленные ответы от отработавших cron-задач
     let cronNotificationsHtml = "";
     if (messageInbox.length > 0) {
@@ -2240,7 +2185,6 @@ ${deliveryHint}
 
     // === OPENROUTER: Маршрутизация к OpenRouter API (ПОСЛЕ всех команд и специальных действий) ===
     if (openrouter.isOpenRouterModel(req.body.model)) {
-        const progressId = req.body.progressId ? String(req.body.progressId) : '';
         return openrouter.handleOpenRouterMessage(req, res, {
             OPENROUTER_API_KEY,
             TAVILY_API_KEY,
@@ -2256,10 +2200,7 @@ ${deliveryHint}
             escapeHtml,
             useProxy,
             SOCKS5_PROXY,
-            getBrowserHeaders,
-            progressId,
-            setProgress,
-            finishProgress
+            getBrowserHeaders
         });
     }
 
@@ -2323,8 +2264,6 @@ ${deliveryHint}
 
     console.log(`[GEMINI] Запрос к ИИ. Модель: [${modelName}]. Контекст в памяти: [${geminiHistory.length} сообщений]`);
 
-    const progressIdChat = req.body.progressId ? String(req.body.progressId) : '';
-    setProgress(progressIdChat, 'Gemini: генерация…');
     try {
         const isGemma = modelName.toLowerCase().includes('gemma');
         const modelConfig = { model: modelName };
@@ -2334,10 +2273,8 @@ ${deliveryHint}
         const result = await chat.sendMessage(msgParts);
         geminiHistory = await chat.getHistory();
         const aiText = result.response.text();
-        finishProgress(progressIdChat);
         return res.json({ ok: true, text: cronNotificationsHtml ? cronNotificationsHtml + '<br>' + aiText : aiText });
     } catch (err) {
-        finishProgress(progressIdChat);
         console.error("[GEMINI ERROR]", err.message);
         return res.status(500).json({ ok: false, error: err.message });
     }
@@ -2394,18 +2331,10 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
     if (!GEMINI_API_KEY) return res.status(500).json({ok: false, error: "Отсутствует GEMINI_API_KEY"});
     const preferredModel = req.body.model || "gemini-2.0-flash";
     const withGithub = !!(options && options.withGithub);
-    const progressId = req.body.progressId ? String(req.body.progressId) : '';
-    const prog = (msg) => setProgress(progressId, msg);
 
     if (isAntigravityModel(preferredModel)) {
-        prog('Antigravity…');
-        try {
-            return await handleAntigravityAdmin(userText, req, res, cronNotificationsHtml, withGithub);
-        } finally {
-            finishProgress(progressId);
-        }
+        return handleAntigravityAdmin(userText, req, res, cronNotificationsHtml, withGithub);
     }
-    prog('Gemini Admin: старт…');
 
     const isGemma = preferredModel.toLowerCase().includes('gemma');
     const modelConfig = { model: preferredModel };
@@ -2552,8 +2481,7 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
     const maxIterations = withGithub ? 50 : 50;
 
     try {
-        let result = prog('запрос к модели…');
-                    await chat.sendMessage(userText);
+        let result = await chat.sendMessage(userText);
 
         while (result.response && result.response.candidates && result.response.candidates[0]) {
             const candidate = result.response.candidates[0];
@@ -2565,7 +2493,6 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
 
                 if (call.name === "exec_command") {
                     const cmd = call.args.command;
-                    prog('exec: ' + String(cmd).substring(0, 120));
                     console.log(`[ADMIN] Выполнение команды: ${cmd}`);
                     let execResult;
                     try {
@@ -2583,7 +2510,6 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
 
                 } else if (call.name === "search_web") {
                     const action = call.args.action;
-                    prog('search_web: ' + String(action || '') + (call.args.query ? ' — ' + String(call.args.query).substring(0, 80) : (call.args.url ? ' — ' + String(call.args.url).substring(0, 80) : '')));
                     console.log(`[ADMIN] Поиск/загрузка: action=${action}`);
                     let searchResult = "";
                     try {
@@ -2755,7 +2681,6 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                     result = await chat.sendMessage([{ functionResponse: funcResponse }]);
 
                 } else if (call.name === "github_ops") {
-                    prog('github: ' + String((call.args && call.args.action) || ''));
                     console.log(`[ADMIN] github_ops: action=${call.args && call.args.action}`);
                     let ghResult;
                     try {
@@ -2796,12 +2721,9 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                 if (cronNotificationsHtml) {
                     finalResponseText = cronNotificationsHtml + '<br>' + finalResponseText;
                 }
-                finishProgress(progressId);
-
                 return res.json({ ok: true, text: finalResponseText });
             }
 
-            prog('модель думает… (шаг ' + (iterations + 1) + ')');
             iterations++;
             if (iterations >= maxIterations) {
                 try {
@@ -2828,9 +2750,6 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                     limitText += `\n</details>`;
                 }
 
-                finishProgress(progressId);
-
-
                 return res.json({ ok: true, text: limitText });
             }
         }
@@ -2843,9 +2762,6 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                 adminHistory = hist;
             }
         } catch (_) {}
-
-        finishProgress(progressId);
-
 
         return res.json({ ok: true, text: "Не удалось получить ответ от ИИ." });
     } catch (err) {
@@ -2868,8 +2784,6 @@ async function handleAdminMessage(userText, req, res, cronNotificationsHtml = ""
                 adminHistory = hist;
             }
         } catch (e) {}
-        finishProgress(progressId);
-
         return res.status(500).json({ ok: false, error: errorText });
     }
 }
@@ -2976,8 +2890,6 @@ app.get('/', async (req, res) => {
                     htmlBytes += chunk.length;
                     if (htmlBytes > 20 * 1024 * 1024) {
                         response.data.destroy();
-                        finishProgress(progressId);
-
                         return res.status(400).send("Слишком тяжелая страница.");
                     }
                 }
@@ -2990,8 +2902,6 @@ app.get('/', async (req, res) => {
 
         if ([401, 403, 406, 429, 503].includes(responseStatus)) {
             console.warn(`[PROXY WARNING] Сайт заблокировал запрос. HTTP Код: ${responseStatus}`);
-            finishProgress(progressId);
-
             return res.status(200).send(`<!DOCTYPE html>
 <html>
 <body style="font-family:sans-serif; text-align:center; padding:40px; background:#f8d7da; color:#721c24; border-radius:10px; margin:20px;">
@@ -3003,8 +2913,6 @@ app.get('/', async (req, res) => {
 
         if (isHtml && (htmlContent.includes('<title>Just a moment...</title>') || htmlContent.includes('Enable JavaScript and cookies to continue'))) {
             console.warn(`[PROXY WARNING] Обнаружена JS-капча Cloudflare (Код ${responseStatus})`);
-            finishProgress(progressId);
-
             return res.status(200).send(`<!DOCTYPE html>
 <html>
 <body style="font-family:sans-serif; text-align:center; padding:40px; background:#fff3cd; color:#856404; border-radius:10px; margin:20px;">
@@ -3081,8 +2989,6 @@ app.get('/', async (req, res) => {
                 if (downloadedBytes > MAX_FILE_SIZE) {
                     console.warn(`[PROXY] Ошибка: Файл превысил лимит ${MAX_FILE_SIZE/1024/1024} МБ`);
                     fs.unlinkSync(downloadFilePath);
-                    finishProgress(progressId);
-
                     return res.status(200).send(`<h2>🐘 Файл больше ${MAX_FILE_SIZE/1024/1024} МБ.</h2>`);
                 }
                 fs.renameSync(downloadFilePath, filePath);
@@ -3107,8 +3013,6 @@ app.get('/', async (req, res) => {
 
                 if (isTooLarge) {
                     fs.rmSync(fileDir, { recursive: true, force: true });
-                    finishProgress(progressId);
-
                     return res.status(200).send(`<h2>🐘 Файл больше ${MAX_FILE_SIZE/1024/1024} МБ.</h2>`);
                 }
             }
@@ -3131,8 +3035,6 @@ app.get('/', async (req, res) => {
                     await execPromise(`cd "${fileDir}" && zip -s ${CHUNK_SIZE_MB}m "${zipBaseName}" "${safeName}"`);
                 } catch (zipErr) {
                     console.error(`[PROXY ERROR] Ошибка создания ZIP:`, zipErr.message);
-                    finishProgress(progressId);
-
                     return res.status(500).send("Ошибка архивации");
                 }
                 fs.unlinkSync(filePath);
@@ -3157,8 +3059,6 @@ app.get('/', async (req, res) => {
                     : `Размер: ${compMB} МБ`;
 
                 res.set('Content-Type', 'text/html; charset=utf-8');
-                finishProgress(progressId);
-
                 return res.status(200).send(`<!DOCTYPE html>
 <html>
 <body style="background:#f0f2f5; display:flex; justify-content:center; padding:20px; font-family:sans-serif;">
