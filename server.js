@@ -44,8 +44,9 @@ const SOCKS5_PROXY = process.env.SOCKS5_PROXY || "";
 const TG_TOKEN = process.env.TG_TOKEN || "";
 const TG_CHAT_ID = process.env.TG_CHAT_ID || "";
 
-// === OPENROUTER: API ключ для OpenRouter ===
+// === OPENROUTER / GROQ: API ключи ===
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || "";
+const GROQ_API_KEY = process.env.GROQ_API_KEY || "";
 
 // ==========================================
 // ГИБРИД ДОСТАВКИ АРТЕФАКТОВ (Antigravity -> сервер -> /download + GitHub)
@@ -1766,18 +1767,73 @@ app.post('/gemini', async (req, res) => {
                     });
             }
 
-            // === OPENROUTER: Добавляем основную модель и бесплатные модели ===
-            if (OPENROUTER_API_KEY) {
-                models.push({ id: "stealth/ox-alpha", name: "🌟 Ox Alpha (OpenRouter Premium)" });
+            // === GROQ: модели через собственный API (префикс groq/ в UI) ===
+            if (GROQ_API_KEY) {
+                try {
+                    const groqRes = await axios.get('https://api.groq.com/openai/v1/models', {
+                        headers: { 'Authorization': `Bearer ${GROQ_API_KEY}` },
+                        timeout: 15000
+                    });
+                    const groqModels = (groqRes.data && groqRes.data.data) || [];
+                    // Приоритетные chat-модели Groq (если есть в каталоге)
+                    const groqPriority = [
+                        'llama-3.3-70b-versatile',
+                        'llama-3.1-8b-instant',
+                        'openai/gpt-oss-120b',
+                        'openai/gpt-oss-20b',
+                        'meta-llama/llama-4-scout-17b-16e-instruct',
+                        'gemma2-9b-it',
+                        'qwen/qwen3-32b',
+                        'moonshotai/kimi-k2-instruct'
+                    ];
+                    const addedGroq = new Set();
+                    for (const pid of groqPriority) {
+                        const m = groqModels.find(x => x.id === pid);
+                        if (m && !addedGroq.has(m.id)) {
+                            models.push({
+                                id: `groq/${m.id}`,
+                                name: `⚡ ${m.id} (Groq)`
+                            });
+                            addedGroq.add(m.id);
+                        }
+                    }
+                    // Остальные активные модели (без whisper / guard / tts)
+                    for (const m of groqModels) {
+                        if (!m || !m.id || addedGroq.has(m.id)) continue;
+                        const id = String(m.id).toLowerCase();
+                        if (id.includes('whisper') || id.includes('guard') || id.includes('tts') || id.includes('prompt-guard')) continue;
+                        if (m.active === false) continue;
+                        models.push({
+                            id: `groq/${m.id}`,
+                            name: `⚡ ${m.id} (Groq)`
+                        });
+                        addedGroq.add(m.id);
+                    }
+                    console.log(`[MODELS] Groq: добавлено ${addedGroq.size} моделей`);
+                } catch (groqErr) {
+                    console.warn("[MODELS] Groq models fetch error:", groqErr.message);
+                    // Fallback: несколько известных моделей
+                    const fallback = [
+                        'llama-3.3-70b-versatile',
+                        'llama-3.1-8b-instant',
+                        'openai/gpt-oss-120b',
+                        'gemma2-9b-it'
+                    ];
+                    for (const id of fallback) {
+                        models.push({ id: `groq/${id}`, name: `⚡ ${id} (Groq)` });
+                    }
+                }
+            }
 
-                // Получаем бесплатные модели из OpenRouter API
+            // === OPENROUTER: бесплатные модели ===
+            if (OPENROUTER_API_KEY) {
                 try {
                     const orRes = await axios.get('https://openrouter.ai/api/v1/models', {
                         headers: { 'Authorization': `Bearer ${OPENROUTER_API_KEY}` },
                         timeout: 15000
                     });
                     const orModels = orRes.data.data || [];
-                    const addedIds = new Set(["stealth/ox-alpha"]);
+                    const addedIds = new Set();
 
                     // Топ бесплатных моделей с приоритетом (только с :free в id)
                     const priorityModels = [
@@ -1788,7 +1844,6 @@ app.post('/gemini', async (req, res) => {
                         "mistralai/mistral-small-3.2-24b-instruct:free"
                     ];
 
-                    // Добавляем приоритетные модели первыми
                     for (const pid of priorityModels) {
                         const m = orModels.find(x => x.id === pid);
                         if (m && !addedIds.has(m.id)) {
@@ -1797,8 +1852,6 @@ app.post('/gemini', async (req, res) => {
                         }
                     }
 
-                    // Добавляем остальные бесплатные: только id с ":free" или openrouter/free
-                    // (без фильтра по имени — иначе попадают модели вроде Lyria без :free)
                     for (const m of orModels) {
                         if (addedIds.has(m.id)) continue;
                         const idLower = String(m.id || '').toLowerCase();
@@ -1808,7 +1861,7 @@ app.post('/gemini', async (req, res) => {
                             addedIds.add(m.id);
                         }
                     }
-                    console.log(`[MODELS] OpenRouter: добавлено ${addedIds.size - 1} бесплатных моделей`);
+                    console.log(`[MODELS] OpenRouter: добавлено ${addedIds.size} бесплатных моделей`);
                 } catch (orErr) {
                     console.warn("[MODELS] OpenRouter free models fetch error:", orErr.message);
                 }
@@ -1818,9 +1871,15 @@ app.post('/gemini', async (req, res) => {
             return res.json({ ok: true, models: models });
         } catch (err) {
             console.error("[MODELS ERROR] Сбой загрузки списка моделей:", err.message);
-            if (OPENROUTER_API_KEY) {
-                return res.json({ ok: true, models: [{ id: "stealth/ox-alpha", name: "🌟 Ox Alpha (OpenRouter Premium)" }] });
+            const fallback = [];
+            if (GROQ_API_KEY) {
+                fallback.push({ id: "groq/llama-3.3-70b-versatile", name: "⚡ llama-3.3-70b-versatile (Groq)" });
+                fallback.push({ id: "groq/llama-3.1-8b-instant", name: "⚡ llama-3.1-8b-instant (Groq)" });
             }
+            if (OPENROUTER_API_KEY) {
+                fallback.push({ id: "meta-llama/llama-3.3-70b-instruct:free", name: "Llama 3.3 70B (OpenRouter free)" });
+            }
+            if (fallback.length) return res.json({ ok: true, models: fallback });
             return res.status(500).json({ ok: false, error: err.message });
         }
     }
@@ -2183,10 +2242,11 @@ ${deliveryHint}
         return handleAdminMessage(taskForModel, req, res, (autoAdminNote || '') + (cronNotificationsHtml || ''), { withGithub: true });
     }
 
-    // === OPENROUTER: Маршрутизация к OpenRouter API (ПОСЛЕ всех команд и специальных действий) ===
-    if (openrouter.isOpenRouterModel(req.body.model)) {
+    // === OPENROUTER / GROQ: Маршрутизация к внешним OpenAI-compatible API ===
+    if (openrouter.isOpenAICompatibleExternalModel(req.body.model)) {
         return openrouter.handleOpenRouterMessage(req, res, {
             OPENROUTER_API_KEY,
+            GROQ_API_KEY,
             TAVILY_API_KEY,
             TMP_DIR,
             PUBLIC_URL,
@@ -2994,7 +3054,7 @@ app.get('/', async (req, res) => {
                 fs.renameSync(downloadFilePath, filePath);
             } else if (downloadStream) {
                 const writer = fs.createWriteStream(filePath);
-                await new Promise((resolve, reject) => {
+                await new Promise((resolve, reject) => {    
                     downloadStream.pipe(writer);
                     downloadStream.on('data', (chunk) => {
                         downloadedBytes += chunk.length;
@@ -3108,7 +3168,7 @@ async function startServer() {
     const PORT = process.env.PORT || 8080;
     app.listen(PORT, () => {
         console.log(`[SYSTEM] Сервер успешно запущен на порту ${PORT}`);
-        console.log(`[SYSTEM] Доставка артефактов: ${ARTIFACT_DELIVERY_ENABLED ? 'ВКЛ' : 'ВЫКЛ'} | GitHub: ${GITHUB_ENABLED ? 'ВКЛ (' + GITHUB_REPO + ')' : 'ВЫКЛ'} | MinIO: ${MINIO_ENABLED ? 'ВКЛ' : 'ВЫКЛ'} | OpenRouter: ${OPENROUTER_API_KEY ? 'ВКЛ' : 'ВЫКЛ'}`);
+        console.log(`[SYSTEM] Доставка артефактов: ${ARTIFACT_DELIVERY_ENABLED ? 'ВКЛ' : 'ВЫКЛ'} | GitHub: ${GITHUB_ENABLED ? 'ВКЛ (' + GITHUB_REPO + ')' : 'ВЫКЛ'} | MinIO: ${MINIO_ENABLED ? 'ВКЛ' : 'ВЫКЛ'} | OpenRouter: ${OPENROUTER_API_KEY ? 'ВКЛ' : 'ВЫКЛ'} | Groq: ${GROQ_API_KEY ? 'ВКЛ' : 'ВЫКЛ'}`);
         initAllCronJobs();
     });
 }
