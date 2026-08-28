@@ -1,4 +1,4 @@
-// openrouter.js — модуль для работы с OpenRouter API
+// openrouter.js — модуль для работы с OpenRouter и Groq API
 const axios = require('axios');
 const { exec } = require('child_process');
 const util = require('util');
@@ -11,27 +11,45 @@ const execPromise = util.promisify(exec);
 let openRouterHistory = [];
 
 /**
+ * Groq-модели в UI имеют префикс "groq/" (например groq/llama-3.3-70b-versatile).
+ * При вызове API префикс снимается.
+ */
+function isGroqModel(modelName) {
+    if (!modelName) return false;
+    return String(modelName).toLowerCase().startsWith('groq/');
+}
+
+/**
  * Проверяет, является ли модель OpenRouter моделью.
  * OpenRouter модели имеют формат "provider/model" (содержат "/"),
  * а Gemini модели — "gemini-X.X-..." или "gemma-..." (без "/").
+ * Модели groq/* обрабатываются отдельно через Groq API.
  */
 function isOpenRouterModel(modelName) {
     if (!modelName) return false;
     const name = String(modelName).toLowerCase();
-    
+
     // Antigravity обрабатывается отдельным путём
     if (name.includes('antigravity')) return false;
-    
+
+    // Groq — отдельный провайдер
+    if (name.startsWith('groq/')) return false;
+
     // Gemini/Gemma модели НЕ содержат '/' в названии
     if (name.startsWith('gemini-') || name.startsWith('gemma-') || name.startsWith('aqa')) {
         return false;
     }
-    
+
     // Все остальные модели с '/' — это OpenRouter
-    // Примеры: stealth/ox-alpha, minimax/minimax-m2.7:free, meta-llama/llama-3.1, z-ai/glm-5.2:free
+    // Примеры: minimax/minimax-m2.7:free, meta-llama/llama-3.1, z-ai/glm-5.2:free
     if (name.includes('/')) return true;
-    
+
     return false;
+}
+
+/** OpenRouter или Groq — оба идут через handleOpenRouterMessage */
+function isOpenAICompatibleExternalModel(modelName) {
+    return isOpenRouterModel(modelName) || isGroqModel(modelName);
 }
 
 function clearHistory() {
@@ -47,11 +65,12 @@ function setHistory(history) {
 }
 
 /**
- * Основной обработчик запросов к OpenRouter
+ * Основной обработчик запросов к OpenRouter / Groq
  */
 async function handleOpenRouterMessage(req, res, options = {}) {
     const {
         OPENROUTER_API_KEY,
+        GROQ_API_KEY,
         TAVILY_API_KEY,
         TMP_DIR,
         PUBLIC_URL,
@@ -68,11 +87,29 @@ async function handleOpenRouterMessage(req, res, options = {}) {
         getBrowserHeaders
     } = options;
 
-    if (!OPENROUTER_API_KEY) {
-        return res.status(500).json({ ok: false, error: "OPENROUTER_API_KEY не задан на сервере" });
+    const rawModel = req.body.model || '';
+    const isGroq = isGroqModel(rawModel);
+    // Для Groq: UI-id "groq/llama-3.3-70b-versatile" → API-id "llama-3.3-70b-versatile"
+    const model = isGroq
+        ? String(rawModel).replace(/^groq\//i, '')
+        : (rawModel || 'meta-llama/llama-3.3-70b-instruct:free');
+
+    if (isGroq) {
+        if (!GROQ_API_KEY) {
+            return res.status(500).json({ ok: false, error: "GROQ_API_KEY не задан на сервере" });
+        }
+    } else {
+        if (!OPENROUTER_API_KEY) {
+            return res.status(500).json({ ok: false, error: "OPENROUTER_API_KEY не задан на сервере" });
+        }
     }
 
-    const model = req.body.model || 'stealth/ox-alpha';
+    const apiUrl = isGroq
+        ? 'https://api.groq.com/openai/v1/chat/completions'
+        : 'https://openrouter.ai/api/v1/chat/completions';
+    const apiKey = isGroq ? GROQ_API_KEY : OPENROUTER_API_KEY;
+    const providerLabel = isGroq ? 'GROQ' : 'OPENROUTER';
+
     const userText = req.body.text ? req.body.text.trim() : "";
 
     // === ВАЖНО: Обработка команд терминала (!) ДО OpenRouter ===
@@ -81,7 +118,7 @@ async function handleOpenRouterMessage(req, res, options = {}) {
         const cmd = userText.substring(1).trim();
         if (!cmd) return res.json({ ok: true, text: "⚠️ Введите команду." });
         try {
-            console.log(`[OPENROUTER CHATOPS] Выполнение: ${cmd}`);
+            console.log(`[${providerLabel} CHATOPS] Выполнение: ${cmd}`);
             const { stdout, stderr } = await execPromise(cmd, { timeout: 15000 });
             let output = stdout;
             if (stderr) output += `\n[STDERR]:\n${stderr}`;
@@ -218,33 +255,41 @@ async function handleOpenRouterMessage(req, res, options = {}) {
                 payload.tools = tools;
             }
 
-            console.log(`[OPENROUTER] Запрос к модели: ${model} (итерация ${iterations + 1})`);
+            console.log(`[${providerLabel}] Запрос к модели: ${model} (итерация ${iterations + 1})`);
 
             let response;
             try {
-                response = await axios.post('https://openrouter.ai/api/v1/chat/completions', payload, {
-                    headers: {
-                        'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
-                        'Content-Type': 'application/json',
-                        'HTTP-Referer': PUBLIC_URL || 'http://localhost',
-                        'X-Title': 'MiniVPS'
-                    },
+                const headers = {
+                    'Authorization': `Bearer ${apiKey}`,
+                    'Content-Type': 'application/json'
+                };
+                if (!isGroq) {
+                    headers['HTTP-Referer'] = PUBLIC_URL || 'http://localhost';
+                    headers['X-Title'] = 'MiniVPS';
+                }
+                response = await axios.post(apiUrl, payload, {
+                    headers,
                     timeout: 600000
                 });
             } catch (apiErr) {
-                // Обработка специфичных ошибок OpenRouter
                 const errData = apiErr.response?.data?.error;
                 if (apiErr.response?.status === 429) {
-                    const remedy = errData?.metadata?.remedy_hint || 'Попробуйте позже или выберите другую модель';
-                    return res.status(429).json({ 
-                        ok: false, 
-                        error: `⏱ <b>Rate limit (429)</b><br>Модель <code>${model}</code> временно перегружена.<br><i>${remedy}</i>` 
+                    const remedy = errData?.metadata?.remedy_hint || errData?.message || 'Попробуйте позже или выберите другую модель';
+                    return res.status(429).json({
+                        ok: false,
+                        error: `⏱ <b>Rate limit (429)</b><br>Модель <code>${escapeHtml(model)}</code> (${providerLabel}) временно перегружена.<br><i>${escapeHtml(String(remedy))}</i>`
                     });
                 }
                 if (apiErr.response?.status === 400) {
-                    return res.status(400).json({ 
-                        ok: false, 
-                        error: `❌ <b>Ошибка 400</b><br>${errData?.message || 'Модель не поддерживает запрошенные параметры'}` 
+                    return res.status(400).json({
+                        ok: false,
+                        error: `❌ <b>Ошибка 400</b><br>${escapeHtml(errData?.message || 'Модель не поддерживает запрошенные параметры')}`
+                    });
+                }
+                if (apiErr.response?.status === 401) {
+                    return res.status(401).json({
+                        ok: false,
+                        error: `🔑 <b>Ошибка авторизации</b><br>Проверьте ${isGroq ? 'GROQ_API_KEY' : 'OPENROUTER_API_KEY'}.`
                     });
                 }
                 throw apiErr;
@@ -268,7 +313,7 @@ async function handleOpenRouterMessage(req, res, options = {}) {
 
                         if (toolCall.function.name === 'exec_command') {
                             const cmd = args.command;
-                            console.log(`[OPENROUTER ADMIN] Executing: ${cmd}`);
+                            console.log(`[${providerLabel} ADMIN] Executing: ${cmd}`);
                             let execResult;
                             try {
                                 const { stdout, stderr } = await execPromise(cmd, { timeout: 15000 });
@@ -367,28 +412,34 @@ async function handleOpenRouterMessage(req, res, options = {}) {
         });
 
     } catch (err) {
-        console.error("[OPENROUTER ERROR]", err.response ? err.response.data : err.message);
+        console.error(`[${providerLabel} ERROR]`, err.response ? err.response.data : err.message);
         const errData = err.response?.data?.error;
         const errMsg = errData?.message || err.message;
         const errCode = err.response?.status || 500;
-        
-        let userFriendlyError = `OpenRouter: ${errMsg}`;
+
+        let userFriendlyError = `${providerLabel}: ${errMsg}`;
         if (errCode === 429) {
-            userFriendlyError = `⏱ <b>Rate limit</b><br>Модель <code>${model}</code> временно перегружена. Попробуйте другую модель.`;
+            userFriendlyError = `⏱ <b>Rate limit</b><br>Модель <code>${escapeHtml(model)}</code> временно перегружена. Попробуйте другую модель.`;
         } else if (errCode === 400) {
-            userFriendlyError = `❌ <b>Ошибка 400</b><br>Модель <code>${model}</code> не поддерживает запрошенные параметры.`;
+            userFriendlyError = `❌ <b>Ошибка 400</b><br>Модель <code>${escapeHtml(model)}</code> не поддерживает запрошенные параметры.`;
+        } else if (errCode === 401) {
+            userFriendlyError = `🔑 <b>Ошибка авторизации</b><br>Проверьте ${isGroq ? 'GROQ_API_KEY' : 'OPENROUTER_API_KEY'}.`;
         } else if (errCode === 402) {
-            userFriendlyError = `💳 <b>Недостаточно кредитов</b><br>Пополните баланс на OpenRouter.`;
-        } else if (errCode === 502) {
-            userFriendlyError = `🌐 <b>Ошибка 502</b><br>Провайдер модели <code>${model}</code> временно недоступен.`;
+            userFriendlyError = isGroq
+                ? `💳 <b>Лимит / квота Groq</b><br>Проверьте лимиты на console.groq.com.`
+                : `💳 <b>Недостаточно кредитов</b><br>Пополните баланс на OpenRouter.`;
+        } else if (errCode === 502 || errCode === 503) {
+            userFriendlyError = `🌐 <b>Ошибка ${errCode}</b><br>Провайдер модели <code>${escapeHtml(model)}</code> временно недоступен.`;
         }
-        
+
         return res.status(errCode).json({ ok: false, error: userFriendlyError });
     }
 }
 
 module.exports = {
     isOpenRouterModel,
+    isGroqModel,
+    isOpenAICompatibleExternalModel,
     handleOpenRouterMessage,
     clearHistory,
     getHistory,
