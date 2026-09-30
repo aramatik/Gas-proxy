@@ -2037,6 +2037,8 @@ app.post('/gemini', async (req, res) => {
 <code>/logs</code> — Логи Northflank<br>
 <code>/proxy on</code> | <code>/proxy off</code> — Ghost Proxy (curl-impersonate локальный)<br>
 <code>/ag_async on</code> | <code>/ag_async off</code> — Antigravity: фон (async) / ожидание (sync)<br>
+<code>/ag_list</code> — Список sandbox environments Antigravity (size / files)<br>
+<code>/ag_clear</code> — Удалить все environments (освободить storage quota)<br>
 ${deliveryHint}
 <code>/download [путь]</code> — Скачать файл (до 15 МБ)<br>
 <code>/upload</code> — Загрузить файл на сервер<br>
@@ -2087,6 +2089,97 @@ ${deliveryHint}
 
     if (userText === '/ag_async') {
         return res.json({ ok: true, text:`⚡ Режим Antigravity сейчас: <b>${antigravityNonBlocking ? 'НЕБЛОКИРУЮЩИЙ (async, фон)' : 'БЛОКИРУЮЩИЙ (sync, ожидание)'}</b><br>Переключение: <code>/ag_async on</code> | <code>/ag_async off</code>`});
+    }
+
+    // /ag_list — список sandbox environments Antigravity
+    if (userText === '/ag_list') {
+        try {
+            const resp = await axios.get('https://generativelanguage.googleapis.com/v1beta/environments', {
+                headers: { 'x-goog-api-key': GEMINI_API_KEY },
+                timeout: 30000
+            });
+            const envs = (resp.data && resp.data.environments) || [];
+            if (!envs.length) {
+                return res.json({ ok: true, text: '📦 <b>Antigravity environments:</b> пусто (квота storage свободна).' });
+            }
+            let totalBytes = 0;
+            let lines = envs.map((e, i) => {
+                const size = parseInt(e.size_bytes || 0, 10) || 0;
+                totalBytes += size;
+                const mb = (size / (1024 * 1024)).toFixed(1);
+                const files = e.file_count != null ? e.file_count : '?';
+                const last = e.last_accessed || e.updated || e.created || '—';
+                const st = e.status || '?';
+                return `${i + 1}. <code>${e.id}</code><br>` +
+                    `&nbsp;&nbsp;status=<b>${st}</b> · files=${files} · size=<b>${mb} MB</b><br>` +
+                    `&nbsp;&nbsp;last: ${last}`;
+            });
+            const totalMb = (totalBytes / (1024 * 1024)).toFixed(1);
+            return res.json({
+                ok: true,
+                text: `📦 <b>Antigravity environments:</b> ${envs.length} шт., суммарно <b>${totalMb} MB</b><br><br>` +
+                    lines.join('<hr>') +
+                    `<br><br>Удалить все: <code>/ag_clear</code>`
+            });
+        } catch (err) {
+            const detail = (err.response && err.response.data)
+                ? JSON.stringify(err.response.data)
+                : err.message;
+            return res.status(500).json({ ok: false, error: ` /ag_list: ${detail}` });
+        }
+    }
+
+    // /ag_clear — удалить все sandbox environments
+    if (userText === '/ag_clear') {
+        try {
+            const resp = await axios.get('https://generativelanguage.googleapis.com/v1beta/environments', {
+                headers: { 'x-goog-api-key': GEMINI_API_KEY },
+                timeout: 30000
+            });
+            const envs = (resp.data && resp.data.environments) || [];
+            if (!envs.length) {
+                geminiAntigravityPrevId = null;
+                geminiAntigravityEnvId = null;
+                adminAntigravityPrevId = null;
+                adminAntigravityEnvId = null;
+                return res.json({ ok: true, text: '📦 Environments уже пусты. Локальные prev/env id сброшены.' });
+            }
+            const results = [];
+            let okCount = 0;
+            let errCount = 0;
+            for (const e of envs) {
+                const eid = e.id;
+                try {
+                    await axios.delete(
+                        `https://generativelanguage.googleapis.com/v1beta/environments/${encodeURIComponent(eid)}`,
+                        { headers: { 'x-goog-api-key': GEMINI_API_KEY }, timeout: 30000 }
+                    );
+                    okCount++;
+                    results.push(`✅ <code>${eid}</code>`);
+                } catch (delErr) {
+                    errCount++;
+                    const d = (delErr.response && delErr.response.data)
+                        ? JSON.stringify(delErr.response.data)
+                        : delErr.message;
+                    results.push(`❌ <code>${eid}</code>: ${d}`);
+                }
+            }
+            geminiAntigravityPrevId = null;
+            geminiAntigravityEnvId = null;
+            adminAntigravityPrevId = null;
+            adminAntigravityEnvId = null;
+            return res.json({
+                ok: true,
+                text: `🗑 <b>/ag_clear</b>: удалено ${okCount}, ошибок ${errCount} (из ${envs.length})<br><br>` +
+                    results.join('<br>') +
+                    `<br><br>Локальные Antigravity prev/env id сброшены.`
+            });
+        } catch (err) {
+            const detail = (err.response && err.response.data)
+                ? JSON.stringify(err.response.data)
+                : err.message;
+            return res.status(500).json({ ok: false, error: `/ag_clear: ${detail}` });
+        }
     }
 
     if (userText === '/proxy on') {
@@ -2243,9 +2336,10 @@ ${deliveryHint}
 
     if (!GEMINI_API_KEY) return res.status(500).json({ok: false, error: "Отсутствует GEMINI_API_KEY"});
 
-    // === CLEAR: Очистка истории (включая OpenRouter) ===
+    // === CLEAR: Очистка истории (включая OpenRouter + сессии Antigravity) ===
     if (req.body.clear === 'true') {
         geminiHistory = [];
+        // Сброс multi-turn Antigravity (не продолжать старые interaction / environment)
         geminiAntigravityPrevId = null;
         geminiAntigravityEnvId = null;
         adminAntigravityPrevId = null;
@@ -2253,6 +2347,10 @@ ${deliveryHint}
 
         // === OPENROUTER: Очистка истории OpenRouter ===
         openrouter.clearHistory();
+
+        // Сессия GitHub-агента
+        githubHistory = [];
+        githubSessionActive = false;
 
         if (adminMode) {
             adminHistory = [
@@ -2262,8 +2360,18 @@ ${deliveryHint}
         } else {
             adminHistory = [];
         }
-        console.log("[GEMINI] Память контекста нейросети очищена.");
-        if (userText === 'clear') return res.json({ok: true, text: "История очищена"});
+        console.log("[GEMINI] Память контекста + сессии Antigravity/GitHub очищены.");
+        if (userText === 'clear') {
+            return res.json({
+                ok: true,
+                text: "✅ <b>Память ИИ очищена.</b><br>" +
+                      "• История чата (Gemini)<br>" +
+                      "• Сессия Antigravity (previous_interaction / environment)<br>" +
+                      "• Сессия GitHub-агента<br>" +
+                      "• OpenRouter<br><br>" +
+                      "<i>⚠️ Это сбрасывает только состояние на сервере. Квота Google «Project environment storage» от старых sandbox не освобождается — при ошибке storage quota нужен другой проект/ключ или ожидание сброса у Google.</i>"
+            });
+        }
     }
 
     // /github — автоматически включает admin-режим и подключает инструкции github.md
