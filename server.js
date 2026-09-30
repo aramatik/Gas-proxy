@@ -721,21 +721,61 @@ async function callAntigravityAgent(opts) {
     const headers = { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_API_KEY };
     const background = opts.background !== false;
     const onProgress = typeof opts.onProgress === 'function' ? opts.onProgress : null;
-    const body = {
-        agent: 'antigravity-preview-05-2026',
-        input: opts.input,
-        environment: opts.environmentId || 'remote'
-    };
-    if (opts.previousInteractionId) body.previous_interaction_id = opts.previousInteractionId;
-    if (opts.systemInstruction) body.system_instruction = opts.systemInstruction;
-    if (background) body.background = true;
 
-    console.log(`[ANTIGRAVITY] Отправка задачи агенту (background=${background})...`);
-    let resp = await axios.post(url, body, { headers, timeout: 120000 });
+    // Актуальный harness (майский preview-05 устаревает; с 05.10.2026 редирект)
+    const agentName = (opts.agent && String(opts.agent).trim()) || 'antigravity-preview-09-2026';
+
+    const body = {
+        agent: agentName,
+        input: opts.input,
+        // Всегда объект { type: "remote" }. НЕ подставлять environmentId строкой.
+        environment: { type: 'remote' },
+        agent_config: {
+            type: 'antigravity'
+            // При желании:
+            // model: 'gemini-3.5-flash-lite',
+            // max_total_tokens: 50000
+        }
+    };
+
+    // Multi-turn: только previous_interaction_id (sandbox продолжается через него)
+    if (opts.previousInteractionId) {
+        body.previous_interaction_id = opts.previousInteractionId;
+    }
+    if (opts.systemInstruction) {
+        body.system_instruction = opts.systemInstruction;
+    }
+    if (background) {
+        body.background = true;
+    }
+
+    console.log(`[ANTIGRAVITY] Отправка задачи агенту agent=${agentName} background=${background} prev=${opts.previousInteractionId || '—'}...`);
+
+    let resp;
+    try {
+        resp = await axios.post(url, body, { headers, timeout: 120000 });
+    } catch (postErr) {
+        const status = postErr.response && postErr.response.status;
+        const data = postErr.response && postErr.response.data;
+        const detail = data
+            ? (typeof data === 'string' ? data : JSON.stringify(data))
+            : (postErr.message || String(postErr));
+        console.error('[ANTIGRAVITY POST ERROR]', status, detail);
+        if (status === 429) {
+            throw new Error(
+                `Request failed with status code 429. ` +
+                `Квота/rate-limit Antigravity (Interactions API). ` +
+                `Детали: ${detail}`
+            );
+        }
+        throw new Error(`Antigravity HTTP ${status || '?'}: ${detail}`);
+    }
+
     let interaction = resp.data;
     if (onProgress) {
         try { onProgress('🚀 <b>Antigravity:</b> задача принята, агент запущен…'); } catch (_) {}
     }
+
     if (background) {
         const maxWaitMs = 10 * 60 * 1000;
         const intervalMs = 3000;
@@ -745,8 +785,11 @@ async function callAntigravityAgent(opts) {
         let consecutiveErrors = 0;
         const maxConsecutiveErrors = 5;
         let processedSteps = 0;
+
         while (interaction && (interaction.status === 'in_progress' || interaction.status === 'queued')) {
-            if (Date.now() - start > maxWaitMs) throw new Error('Antigravity: превышено время ожидания (10 минут)');
+            if (Date.now() - start > maxWaitMs) {
+                throw new Error('Antigravity: превышено время ожидания (10 минут)');
+            }
             await new Promise(r => setTimeout(r, intervalMs));
             try {
                 const poll = await axios.get(`${url}/${interaction.id}`, { headers, timeout: 60000 });
@@ -768,13 +811,22 @@ async function callAntigravityAgent(opts) {
                     lastActivityTime = Date.now();
                 }
             } catch (pollErr) {
+                const pStatus = pollErr.response && pollErr.response.status;
+                const pData = pollErr.response && pollErr.response.data;
+                const pDetail = pData
+                    ? (typeof pData === 'string' ? pData : JSON.stringify(pData))
+                    : (pollErr.message || String(pollErr));
                 consecutiveErrors++;
-                console.warn(`[ANTIGRAVITY] Polling ошибка (${consecutiveErrors}/${maxConsecutiveErrors}): ${pollErr.message}`);
+                console.warn(`[ANTIGRAVITY] Polling ошибка (${consecutiveErrors}/${maxConsecutiveErrors}): ${pStatus || ''} ${pDetail}`);
+                if (pStatus === 429) {
+                    throw new Error(`Antigravity polling 429: ${pDetail}`);
+                }
                 if (consecutiveErrors >= maxConsecutiveErrors) {
-                    throw new Error(`Antigravity: polling не удался ${maxConsecutiveErrors} раз подряд: ${pollErr.message}`);
+                    throw new Error(`Antigravity: polling не удался ${maxConsecutiveErrors} раз подряд: ${pDetail}`);
                 }
             }
         }
+
         if (interaction) {
             const steps = Array.isArray(interaction.steps) ? interaction.steps : [];
             if (steps.length > processedSteps) {
@@ -788,13 +840,15 @@ async function callAntigravityAgent(opts) {
             }
         }
     }
+
     if (interaction && interaction.status === 'failed') {
         const msg = (interaction.error && interaction.error.message) || 'Antigravity: задача завершилась с ошибкой';
         throw new Error(msg);
     }
+
     return {
         id: interaction ? interaction.id : null,
-        environmentId: (interaction && (interaction.environment_id || (interaction.environment && interaction.environment.id))) || opts.environmentId || null,
+        environmentId: (interaction && (interaction.environment_id || (interaction.environment && interaction.environment.id))) || null,
         status: interaction ? interaction.status : 'unknown',
         text: extractAntigravityText(interaction)
     };
@@ -808,17 +862,21 @@ function runAntigravityInBackground(opts) {
     (async () => {
         try {
             const prevId = (mode === 'admin') ? adminAntigravityPrevId : geminiAntigravityPrevId;
-            const envId = (mode === 'admin') ? adminAntigravityEnvId : geminiAntigravityEnvId;
+            // environmentId больше не уходит в body.environment — только previous_interaction_id
             const ag = await callAntigravityAgent({
                 input: opts.input,
                 previousInteractionId: prevId,
-                environmentId: envId,
                 systemInstruction: opts.systemInstruction,
                 background: true,
                 onProgress: (h) => pushProgressToInbox(h)
             });
-            if (mode === 'admin') { adminAntigravityPrevId = ag.id; adminAntigravityEnvId = ag.environmentId; }
-            else { geminiAntigravityPrevId = ag.id; geminiAntigravityEnvId = ag.environmentId; }
+            if (mode === 'admin') {
+                adminAntigravityPrevId = ag.id;
+                adminAntigravityEnvId = ag.environmentId;
+            } else {
+                geminiAntigravityPrevId = ag.id;
+                geminiAntigravityEnvId = ag.environmentId;
+            }
 
             let finalText = ag.text + buildAntigravityFooter();
             const head = (mode === 'admin')
